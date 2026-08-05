@@ -1,0 +1,6 @@
+# Session-local working context, not shared state
+.context/
+.scratch/
+
+# Machine-local Claude Code settings
+.claude/settings.local.json
