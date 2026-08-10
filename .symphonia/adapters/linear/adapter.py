@@ -50,7 +50,10 @@ from .client import LinearClient, LinearError
 
 
 class PatchError(LinearError):
-    """An anchored patch could not be applied; nothing was written."""
+    """An anchored patch failed, in one of two distinct ways: an anchor did
+    not match exactly once (the patch aborted with nothing written), or the
+    post-write read-back diverged from what was written (the write happened
+    and a concurrent edit landed on top — re-read and re-patch)."""
 
 
 _CLOSED_STATE_TYPES = {"completed", "canceled", "duplicate"}
@@ -279,12 +282,23 @@ class LinearTracker:
             self._issue(id, relations=with_relations), with_relations=with_relations
         )
 
+    @staticmethod
+    def _one_page(connection: dict, what: str) -> list[dict]:
+        """No silent caps: a listing that overflows its page raises rather
+        than returning a truncated result that reads as complete."""
+        if connection["pageInfo"]["hasNextPage"]:
+            raise LinearError(
+                f"more {what} than one page holds; refusing to truncate silently"
+            )
+        return connection["nodes"]
+
     def _children(self, map_id: str, *, relations: bool, extra_filter: str = "") -> list[Item]:
         parent = self._issue(map_id)
         fields = _FIELDS + ("\n" + _RELATIONS if relations else "")
         data = self._c.query(
             """query($parent: ID!%s) {
               issues(first: 250, filter: {parent: {id: {eq: $parent}}%s}) {
+                pageInfo { hasNextPage }
                 nodes { %s } } }"""
             % (
                 ", $label: String!" if extra_filter else "",
@@ -295,7 +309,7 @@ class LinearTracker:
         )
         return [
             self._hydrate(node, with_relations=relations)
-            for node in data["issues"]["nodes"]
+            for node in self._one_page(data["issues"], "children")
         ]
 
     def list_children(self, map_id: str, *, with_relations: bool = False) -> list[Item]:
@@ -311,36 +325,56 @@ class LinearTracker:
         node = self._issue(id)
         data = self._c.query(
             """query($id: String!) { issue(id: $id) {
-              comments(first: 100) { nodes { id body user { id } } } } }""",
+              comments(first: 100) { pageInfo { hasNextPage } nodes { id body user { id } } } } }""",
             {"id": node["id"]},
         )
         return [
             Comment(id=c["id"], body=c["body"], author=(c["user"] or {}).get("id", ""))
-            for c in data["issue"]["comments"]["nodes"]
+            for c in self._one_page(data["issue"]["comments"], "comments")
         ]
 
     def list_artifacts(self, id: str) -> list[Artifact]:
         node = self._issue(id)
         data = self._c.query(
             """query($id: String!) { issue(id: $id) {
-              attachments { nodes { id title url } } } }""",
+              attachments(first: 100) { pageInfo { hasNextPage } nodes { id title url } } } }""",
             {"id": node["id"]},
         )
         return [
             Artifact(id=a["id"], title=a["title"], url=a["url"])
-            for a in data["issue"]["attachments"]["nodes"]
+            for a in self._one_page(data["issue"]["attachments"], "attachments")
         ]
 
     def read_artifact(self, artifact: Artifact) -> str:
         """Documents read back through the API; repo files (whose ``id`` is
         their repo path) read from the working tree. Uploaded file attachments
-        are unreadable on this provider — that is why nothing writes them."""
+        are unreadable on this provider — that is why nothing writes them.
+
+        For a document the id is resolved from the URL, never from
+        ``artifact.id``: artifacts listed off an issue are attachments, and an
+        attachment's UUID is not the document's."""
         if "/document/" in artifact.url:
-            data = self._c.query(
-                "query($id: String!) { document(id: $id) { content } }",
-                {"id": artifact.id},
+            slug = artifact.url.rstrip("/").rsplit("/", 1)[-1]
+            if not slug:
+                raise LinearError(
+                    f"cannot resolve a document id from url {artifact.url!r}"
+                )
+            # The URL segment is `<title-slug>-<slugId>`; the API resolves the
+            # full slug or the bare slugId, so try the former then the latter.
+            candidates = [slug] + ([slug.rsplit("-", 1)[-1]] if "-" in slug else [])
+            for candidate in candidates:
+                try:
+                    data = self._c.query(
+                        "query($id: String!) { document(id: $id) { content } }",
+                        {"id": candidate},
+                    )
+                except LinearError:
+                    continue  # an unresolvable id may be a GraphQL error, not null
+                if data["document"] is not None:
+                    return data["document"]["content"] or ""
+            raise LinearError(
+                f"no document found for {artifact.url!r} (tried ids {candidates!r})"
             )
-            return data["document"]["content"] or ""
         path = Path(artifact.id)
         if path.is_file():
             return path.read_text()
@@ -421,10 +455,16 @@ class LinearTracker:
     # --- ownership and delivery state ----------------------------------------
 
     def claim(self, id: str, actor: ActorId) -> ClaimResult:
-        """Write, then re-read, then answer — never optimistic. The provider
-        accepts every assignee write silently, so the re-read is the only way
-        to learn a concurrent claimant got there last."""
+        """Pre-read, write, re-read, answer — never optimistic. The pre-read
+        keeps a claim from stealing an established one: an issue already held
+        by someone else is refused without writing. The provider accepts every
+        assignee write silently, so the post-write re-read is the only way to
+        learn a concurrent claimant got there last; the residual write/re-read
+        window is inherent to the provider."""
         node = self._issue(id)
+        holder = node["assignee"]["id"] if node["assignee"] else None
+        if holder is not None and holder != actor:
+            return ClaimResult(held=False, holder=holder)
         self._c.query(_M_UPDATE, {"id": node["id"], "input": {"assigneeId": actor}})
         read_back = self._issue(node["id"])["assignee"]
         holder = read_back["id"] if read_back else None
