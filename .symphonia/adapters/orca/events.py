@@ -46,7 +46,7 @@ def _first(record: dict, *keys: str, default: str = "") -> Any:
 
 
 def _payload_of(record: dict) -> dict:
-    raw = _first(record, "payload", default={})
+    raw = _first(record, "payload", default=None)
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)

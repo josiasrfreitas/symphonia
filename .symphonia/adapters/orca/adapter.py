@@ -5,6 +5,13 @@ TLDR: implements the ``RuntimeAdapter`` contract by shelling out to the
 runner is injectable so the conformance suite can drive the exact same
 adapter against a scripted CLI. The Capability Tier translation table lives
 here — roles declare a tier, only this file knows model names.
+
+Known limitation (GRE-175 review, M3): ``RoleSpec.briefing`` is not yet
+delivered to the agent — ``launch_role`` starts the bare model command and
+``dispatch`` sends only the work body, so the briefing is silently
+discarded today. How the briefing reaches the agent (launch prompt vs
+first dispatch) is a user decision deferred to the merge gate; do not wire
+it here without that decision.
 """
 from __future__ import annotations
 
@@ -41,6 +48,16 @@ from .events import parse_check_output
 Runner = Callable[[Sequence[str]], str]
 """Runs one ``orca`` argv, returns stdout. Production uses subprocess; the
 conformance suite injects ``fake.ScriptedOrcaCli``."""
+
+
+def _required(value: str, what: str) -> str:
+    """An id the CLI must return. An empty one fails here, loudly, instead
+    of surfacing calls later as a workspace with no path or an attempt
+    keyed by the empty string."""
+
+    if not value:
+        raise RuntimeError(f"orca returned no {what}; refusing to continue with an empty id")
+    return value
 
 
 def subprocess_runner(argv: Sequence[str]) -> str:
@@ -114,6 +131,7 @@ class OrcaRuntimeAdapter:
     _attempts: dict[str, _AttemptRecord] = field(default_factory=dict)
     _pending_questions: set[str] = field(default_factory=set)
     _local_events: list[RuntimeEvent] = field(default_factory=list)
+    _delivered_locals: list[RuntimeEvent] = field(default_factory=list)
     _seq: int = 0
 
     @property
@@ -155,7 +173,7 @@ class OrcaRuntimeAdapter:
         if self.repo:
             argv += ["--repo", self.repo]
         created = self._orca(*argv)
-        path = str(created.get("path", created.get("worktreePath", "")))
+        path = _required(str(created.get("path", created.get("worktreePath", ""))), "worktree path")
         return WorkspaceRef(ticket_key=ticket_key, path=path, branch=branch)
 
     def destroy_workspace(self, workspace: WorkspaceRef) -> None:
@@ -203,7 +221,7 @@ class OrcaRuntimeAdapter:
             "--command",
             TIER_COMMANDS[spec.tier],
         )
-        terminal = str(created.get("terminal", created.get("handle", "")))
+        terminal = _required(str(created.get("terminal", created.get("handle", ""))), "terminal handle")
         ref = ContextRef(id=context_id, role=spec.role, workspace=workspace)
         self._contexts[context_id] = _ContextRecord(
             ref=ref, terminal=terminal, access=spec.access, requested_tier=spec.tier
@@ -239,12 +257,14 @@ class OrcaRuntimeAdapter:
             "orchestration", "task-create", "--spec", work,
             "--task-title", f"{ticket}/{context.role.value}", "--from", self.coordinator,
         )
-        task_id = str(task.get("taskId", task.get("task_id", "")))
+        task_id = _required(str(task.get("taskId", task.get("task_id", ""))), "task id")
         dispatched = self._orca(
             "orchestration", "dispatch", "--task", task_id,
             "--to", record.terminal, "--from", self.coordinator,
         )
-        attempt_id = str(dispatched.get("dispatchId", dispatched.get("dispatch_id", "")))
+        attempt_id = _required(
+            str(dispatched.get("dispatchId", dispatched.get("dispatch_id", ""))), "dispatch id"
+        )
         ref = AttemptRef(attempt_id=attempt_id, ticket_key=ticket, context=context)
         self._attempts[attempt_id] = _AttemptRecord(ref=ref, task_id=task_id)
         return ref
@@ -281,9 +301,11 @@ class OrcaRuntimeAdapter:
         batch = parse_check_output(
             self.runner(["orca", "orchestration", "check", "--terminal", self.coordinator, "--peek", "--json"])
         )
-        events: list[RuntimeEvent] = [
-            e for e in self._local_events if e.kind in kinds
-        ]
+        # Only local events that made it into this batch may be consumed by
+        # the matching ack; a control-lost filtered out by `kinds` must
+        # survive until a drain actually delivers it (review M1).
+        self._delivered_locals = [e for e in self._local_events if e.kind in kinds]
+        events: list[RuntimeEvent] = list(self._delivered_locals)
         for message in batch.messages:
             event = self._to_event(message, kinds)
             if event is None:
@@ -296,7 +318,9 @@ class OrcaRuntimeAdapter:
         return EventBatch(events=tuple(events), receipt=batch.delivery_id or f"local-{self._seq}")
 
     def ack(self, receipt: str) -> None:
-        self._local_events.clear()
+        delivered = self._delivered_locals
+        self._local_events = [e for e in self._local_events if not any(e is d for d in delivered)]
+        self._delivered_locals = []
         if receipt.startswith("local-"):
             return
         self._orca("orchestration", "check", "--terminal", self.coordinator, "--ack", receipt)
@@ -347,7 +371,9 @@ class OrcaRuntimeAdapter:
             raise MessageWorkerRefused(dispatch_id, "unknown")
         shown = self._orca("orchestration", "dispatch-show", "--task", record.task_id)
         status = str(shown.get("status", ""))
-        if status in ("completed", "failed"):
+        # "stopped" is a killed worker (review M2): just as dead as
+        # completed/failed — a send would sit in the mailbox forever.
+        if status in ("completed", "failed", "stopped"):
             raise MessageWorkerRefused(dispatch_id, status)
         self._orca(
             "orchestration", "send", "--from", self.coordinator,

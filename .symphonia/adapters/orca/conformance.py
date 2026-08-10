@@ -179,6 +179,23 @@ class ConformanceMixin:
             a.destroy_workspace(ws)
             self.assertTrue(rig.workspace_gone("GRE-201"))
 
+    def test_local_event_survives_a_drain_that_filtered_it(self):
+        # Review M1: a control-lost queued by _ensure_control must not be
+        # consumed by the ack of a drain whose kinds filtered it out —
+        # nothing is consumed until it was actually delivered and acked.
+        a, rig = self.adapter, self.rig
+        ws = a.create_workspace("GRE-211", branch="gre-211-control")
+        planner = a.launch_role(ws, _spec(RoleName.PLANNER, CapabilityTier.STANDARD, Access.WRITE))
+        a.dispatch(planner.context, "Work.")
+        rig.steal_control("some-other-pane")
+        filtered = a.drain(["result"])  # control-lost not requested
+        self.assertEqual(filtered.events, ())
+        a.ack(filtered.receipt)
+        delivered = a.drain(ALL_KINDS)
+        self.assertIn("control-lost", [e.kind for e in delivered.events])
+        a.ack(delivered.receipt)
+        self.assertEqual(a.drain(ALL_KINDS).events, ())
+
     def test_question_token_is_single_use(self):
         a, rig = self.adapter, self.rig
         ws = a.create_workspace("GRE-210", branch="gre-210-question")
@@ -235,6 +252,16 @@ class OrcaConformance(ConformanceMixin, unittest.TestCase):
 
         with self.assertRaises(MessageWorkerRefused):
             a.message_worker("disp-nonexistent", "hello?")
+
+        # Review M2: a killed worker's dispatch is "stopped" — just as dead
+        # as completed/failed, and just as refused.
+        impl2 = a.launch_role(ws, _spec(RoleName.STANDARDS_REVIEWER, CapabilityTier.FAST, Access.READ))
+        killed = a.dispatch(impl2.context, "Doomed work.")
+        a.kill(killed)
+        with self.assertRaises(MessageWorkerRefused) as caught:
+            a.message_worker(killed.attempt_id, "still there?")
+        self.assertIs(caught.exception.attention.code, AttentionCode.TICKET_WITHOUT_WORKER)
+        self.assertEqual(len(self.rt.sent), 1)  # still nothing new sent
 
 
 class GateEventReading(unittest.TestCase):

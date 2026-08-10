@@ -217,6 +217,7 @@ class FakeRuntimeAdapter:
         self._ws_ids: dict[str, str] = {}
         self._pending_questions: set[str] = set()
         self._local_events: list[RuntimeEvent] = []
+        self._delivered_locals: list[RuntimeEvent] = []
         if rt.control_holder is None:
             rt.control_holder = coordinator
 
@@ -339,7 +340,10 @@ class FakeRuntimeAdapter:
 
     def drain(self, kinds: list[EventKind]) -> EventBatch:
         self._ensure_control()
-        events: list[RuntimeEvent] = [e for e in self._local_events if e.kind in kinds]
+        # Only local events delivered in this batch may be consumed by the
+        # matching ack; one filtered out by `kinds` survives (review M1).
+        self._delivered_locals = [e for e in self._local_events if e.kind in kinds]
+        events: list[RuntimeEvent] = list(self._delivered_locals)
         delivery_id, messages = self.rt.check_peek()
         for message in messages:
             record = self._attempts.get(str(message["payload"].get("dispatchId", "")))
@@ -359,7 +363,9 @@ class FakeRuntimeAdapter:
         return EventBatch(events=tuple(events), receipt=delivery_id or f"local-{self.rt.seq}")
 
     def ack(self, receipt: str) -> None:
-        self._local_events.clear()
+        delivered = self._delivered_locals
+        self._local_events = [e for e in self._local_events if not any(e is d for d in delivered)]
+        self._delivered_locals = []
         if not receipt.startswith("local-"):
             self.rt.ack(receipt)
 
