@@ -99,3 +99,11 @@ _Avoid_: Token limit, window, model memory
 **Review Budget**:
 How much change a person can review in one pass.
 _Avoid_: Ticket size, story points
+
+**Orchestrator**:
+The single session that drives delivery — it creates Workspaces, opens Role Contexts, observes what they produce, and keeps the tracker as the readable picture of progress. It writes no code and decides nothing for the user.
+_Avoid_: Coordinator, supervisor, main agent
+
+**Reconciliation**:
+Comparing what the tracker says about an Implementation Ticket with what the runtime says is running for it, and acting on the difference.
+_Avoid_: Sync, refresh, healing
