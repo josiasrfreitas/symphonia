@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -44,6 +45,7 @@ from ..runtime_adapter import (
     WorkspaceRef,
 )
 from .events import parse_check_output
+from .launcher import LaunchPlan, TIER_MODELS, build_launch, observed_models, tier_matches
 
 Runner = Callable[[Sequence[str]], str]
 """Runs one ``orca`` argv, returns stdout. Production uses subprocess; the
@@ -67,13 +69,9 @@ def subprocess_runner(argv: Sequence[str]) -> str:
     return proc.stdout
 
 
-# The (tier -> launch command) table GRE-161 put behind this boundary. Roles
-# never see these strings; changing a model is an edit here only.
-TIER_COMMANDS: dict[CapabilityTier, str] = {
-    CapabilityTier.HIGH: "claude --model claude-opus-5",
-    CapabilityTier.STANDARD: "claude --model claude-sonnet-5",
-    CapabilityTier.FAST: "claude --model claude-haiku-4-5",
-}
+# The (tier -> launch command) table GRE-161 put behind this boundary now
+# lives in launcher.py, so the adapter and the `spawn` CLI cannot drift into
+# two different command lines for the same tier (GRE-179).
 
 VALID_PATHS_AFTER_DONE = (
     "orca orchestration dispatch --inject (new task into the terminal)",
@@ -104,6 +102,7 @@ class _ContextRecord:
     terminal: str
     access: Access
     requested_tier: CapabilityTier
+    plan: LaunchPlan | None = None
 
 
 @dataclass
@@ -227,6 +226,13 @@ class OrcaRuntimeAdapter:
         # Ticket Key and context identity travel in the title: no process id
         # is exposed to correlate on.
         title = f"{workspace.ticket_key}/{spec.role.value}/{context_id}"
+        plan = build_launch(
+            spec.role,
+            session_id=str(uuid.uuid4()),
+            workspace=workspace.path,
+            tier=spec.tier,
+            access=spec.access,
+        )
         created = self._orca(
             "terminal",
             "create",
@@ -235,23 +241,53 @@ class OrcaRuntimeAdapter:
             "--title",
             title,
             "--command",
-            TIER_COMMANDS[spec.tier],
+            plan.command,
         )
         terminal = _required(str(created.get("terminal", created.get("handle", ""))), "terminal handle")
         ref = ContextRef(id=context_id, role=spec.role, workspace=workspace)
         self._contexts[context_id] = _ContextRecord(
-            ref=ref, terminal=terminal, access=spec.access, requested_tier=spec.tier
+            ref=ref, terminal=terminal, access=spec.access, requested_tier=spec.tier, plan=plan
         )
         return LaunchResult(context=ref, tier_evidence=self.verify_tier(ref))
 
     def verify_tier(self, context: ContextRef) -> TierEvidence:
+        """Orca records the launch command only, but the CLI writes a session
+        transcript that names the model on every answer. Pinning the session
+        id at launch makes that file addressable, so a tier is `observed`
+        once the context has answered at least once (GRE-179)."""
+
         record = self._contexts.get(context.id)
         if record is None:
             return TierEvidence(kind="unverifiable", detail="no such context")
+        transcript = record.plan.transcript if record.plan else None
+        if transcript is None:
+            return TierEvidence(
+                kind="requested",
+                tier=record.requested_tier,
+                detail=f"provider {record.plan.provider if record.plan else '?'} exposes no transcript",
+            )
+        models = observed_models(transcript)
+        if not models:
+            # No answer yet is not a wrong tier: the session may still be
+            # starting. Downgrade to what was asked for, never guess.
+            return TierEvidence(
+                kind="requested",
+                tier=record.requested_tier,
+                detail="session has not answered yet; transcript is empty",
+            )
+        if tier_matches(record.requested_tier, models):
+            return TierEvidence(
+                kind="observed",
+                tier=record.requested_tier,
+                detail=f"transcript reports {', '.join(models)}",
+            )
         return TierEvidence(
-            kind="requested",
-            tier=record.requested_tier,
-            detail="Orca records the launch command only; the answering model is unobservable",
+            kind="observed",
+            tier=None,
+            detail=(
+                f"tier mismatch: requested {record.requested_tier.value} "
+                f"({TIER_MODELS[record.requested_tier]}), transcript reports {', '.join(models)}"
+            ),
         )
 
     def close_role(self, context: ContextRef) -> None:
