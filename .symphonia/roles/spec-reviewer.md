@@ -1,6 +1,6 @@
 ---
 role: spec-reviewer
-capability_tier: standard
+capability_tier: high
 ---
 
 # Spec Reviewer

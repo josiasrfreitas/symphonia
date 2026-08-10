@@ -1,6 +1,6 @@
 ---
 role: planner
-capability_tier: high
+capability_tier: frontier
 ---
 
 # Planner

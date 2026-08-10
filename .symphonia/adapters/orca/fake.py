@@ -44,7 +44,7 @@ from ..runtime_adapter import (
     TierEvidence,
     WorkspaceRef,
 )
-from .adapter import TIER_COMMANDS
+from .launcher import TIER_MODELS
 
 
 @dataclass
@@ -403,7 +403,25 @@ class FakeRuntimeAdapter:
 
 # --- the scripted orca CLI ---------------------------------------------------
 
-_REVERSE_TIER = {command: tier for tier, command in TIER_COMMANDS.items()}
+_MODEL_TIERS = {model: tier for tier, model in TIER_MODELS.items()}
+
+
+def _requested_tier(command: str):
+    """Which tier a launch command asks for, read out of its `--model`.
+
+    Matched on the model rather than the whole string because the command
+    also carries effort, permission and session flags (GRE-179) — a fake
+    that compared the entire line would break every time the launcher
+    gained a flag, which is exactly the drift it exists to catch.
+    """
+
+    parts = command.split()
+    if "--model" not in parts:
+        raise AssertionError(f"launch command names no model: {command!r}")
+    model = parts[parts.index("--model") + 1]
+    if model not in _MODEL_TIERS:
+        raise AssertionError(f"launch command names unknown model {model!r}")
+    return _MODEL_TIERS[model]
 
 
 class ScriptedOrcaCli:
@@ -474,7 +492,7 @@ class ScriptedOrcaCli:
 
     def _terminal_create(self, selector: str, title: str, command: str) -> dict:
         ws_id = self._ws_by_path[selector.removeprefix("path:")]
-        requested = _REVERSE_TIER[command]
+        requested = _requested_tier(command)
         role_name = title.split("/")[1]
         serving = self.rt.staging.get(role_name, requested)
         pid = self.rt.spawn(ws_id, command, title, requested=requested, serving=serving)

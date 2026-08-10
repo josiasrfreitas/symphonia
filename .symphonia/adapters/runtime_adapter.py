@@ -26,6 +26,7 @@ class CapabilityTier(enum.Enum):
     """Abstract level of model capability a role declares. The adapter —
     never the role — translates it into a concrete model and effort."""
 
+    FRONTIER = "frontier"
     HIGH = "high"
     STANDARD = "standard"
     FAST = "fast"
