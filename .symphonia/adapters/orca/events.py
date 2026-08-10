@@ -7,6 +7,14 @@ reading a screen. ``record_gate`` (GRE-174) and the small piece in
 ``.symphonia/hooks/`` consume ``gate_events``; the hook itself is outside
 this ticket.
 
+Mailbox asymmetry (know before wiring a gate recorder): the coordinator's
+reply to an ``ask`` is delivered to the inbox of the WORKER that asked —
+a ``check`` on the coordinator's own terminal never sees a ``reply``
+message. ``ApprovalReply`` is therefore only observable from the worker's
+side of the conversation; a coordinator-side reader will see the
+``PlanQuestion`` and the eventual ``WorkerDone``, but not the reply it
+itself sent.
+
 Run standalone to print gate events as JSON lines:
 
     python3 events.py --terminal <handle>
@@ -56,12 +64,18 @@ def _payload_of(record: dict) -> dict:
 
 
 def parse_check_output(text: str) -> CheckBatch:
-    """Parse ``check --peek --json`` output. Tolerates the two shapes the
-    CLI emits: a bare message list, or ``{deliveryId, messages}``."""
+    """Parse ``check --peek --json`` output. The real CLI wraps everything
+    in an envelope ``{id, ok, result, _meta}`` — the batch lives under
+    ``result`` and the envelope's top-level ``id`` is the request id, NOT a
+    delivery id. Also tolerates an unwrapped dict or a bare message list."""
 
     data = json.loads(text) if text.strip() else []
+    if isinstance(data, dict) and "ok" in data:
+        if not data.get("ok"):
+            raise ValueError(f"orca check failed: {json.dumps(data.get('error'))}")
+        data = _first(data, "result", default={})
     if isinstance(data, dict):
-        delivery = str(_first(data, "deliveryId", "delivery_id", "id"))
+        delivery = str(_first(data, "deliveryId", "delivery_id"))
         raw_messages = _first(data, "messages", default=[])
     else:
         delivery, raw_messages = "", data

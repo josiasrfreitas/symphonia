@@ -409,7 +409,13 @@ _REVERSE_TIER = {command: tier for tier, command in TIER_COMMANDS.items()}
 class ScriptedOrcaCli:
     """A callable with the ``Runner`` signature: the subset of the ``orca``
     CLI the adapter uses, answered from a ``FakeRuntime``. Deterministic —
-    every stdout is a pure function of runtime state."""
+    every stdout is a pure function of runtime state.
+
+    Faithful to the real CLI's response contract: every response is wrapped
+    in the ``{id, ok, result, _meta}`` envelope, and ``dispatch-show`` nests
+    its record under ``result.dispatch``. The suite failed to catch the
+    envelope bug precisely because an earlier version of this class returned
+    bare payloads — keep this in sync with observed real output."""
 
     def __init__(self, rt: FakeRuntime):
         self.rt = rt
@@ -427,7 +433,9 @@ class ScriptedOrcaCli:
             ("worktree", "rm"): lambda: self._worktree_rm(flag("--worktree")),
             ("terminal", "create"): lambda: self._terminal_create(flag("--worktree"), flag("--title"), flag("--command")),
             ("terminal", "close"): lambda: self._terminal_close(flag("--terminal")),
-            ("orchestration", "run-current"): lambda: {"terminal": self.rt.control_holder},
+            ("orchestration", "run-current"): lambda: {
+                "run": {"terminal": self.rt.control_holder} if self.rt.control_holder else None
+            },
             ("orchestration", "run-use"): lambda: self._run_use(flag("--from")),
             ("orchestration", "task-create"): lambda: {"taskId": self.rt.create_task(flag("--spec"))},
             ("orchestration", "dispatch"): lambda: self._dispatch(flag("--task"), flag("--to")),
@@ -440,7 +448,14 @@ class ScriptedOrcaCli:
         }
         if command not in handlers:
             raise RuntimeError(f"scripted CLI does not know: {' '.join(argv)}")
-        return json.dumps(handlers[command]())
+        return json.dumps(
+            {
+                "id": self.rt._next("req"),
+                "ok": True,
+                "result": handlers[command](),
+                "_meta": {"runtimeId": "scripted"},
+            }
+        )
 
     def _worktree_create(self, name: str, ticket_key: str) -> dict:
         ws_id = self.rt.create_workspace(ticket_key)
@@ -499,10 +514,11 @@ class ScriptedOrcaCli:
         return {}
 
     def _dispatch_show(self, task_id: str) -> dict:
-        for record in self.rt.dispatches.values():
+        # Like the real CLI: the record is nested under result.dispatch.
+        for dispatch_id, record in self.rt.dispatches.items():
             if record["task_id"] == task_id:
-                return {"status": record["status"]}
-        return {"status": "unknown"}
+                return {"dispatch": {"id": dispatch_id, "task_id": task_id, "status": record["status"]}}
+        return {"dispatch": None}
 
 
 # --- the staging rig ---------------------------------------------------------

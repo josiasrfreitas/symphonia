@@ -23,7 +23,8 @@ from ..runtime_adapter import (
     RoleName,
     RoleSpec,
 )
-from .adapter import MessageWorkerRefused, OrcaRuntimeAdapter
+from ..runtime_adapter import AttemptRef, ContextRef, WorkspaceRef
+from .adapter import MessageWorkerRefused, OrcaRuntimeAdapter, _AttemptRecord
 from .events import gate_events, parse_check_output
 from .fake import FakeRuntime, FakeRuntimeAdapter, Rig, ScriptedOrcaCli
 
@@ -293,6 +294,93 @@ class GateEventReading(unittest.TestCase):
         batch = parse_check_output('[{"id": 5, "type": "worker_done", "body": "ok", "payload": "{\\"outcome\\": \\"failed\\"}"}]')
         (done,) = gate_events(batch.messages)
         self.assertEqual((done.message_id, done.outcome), ("5", "failed"))
+
+
+class RealCliContract(unittest.TestCase):
+    """Frozen samples captured from the REAL orca CLI (2026-08-10, ad hoc
+    test after the envelope bug). If the CLI's response contract changes,
+    these fixtures — not the scripted fake — are what must disagree."""
+
+    # orca orchestration dispatch-show --task task_75ed1fd7b0b9 --json
+    REAL_DISPATCH_SHOW = """
+    {
+      "id": "c960bf36-0e1f-4c0c-bd15-3291781a3e8c",
+      "ok": true,
+      "result": {
+        "dispatch": {
+          "id": "ctx_9c7251a58edd",
+          "run_id": "run_e3af18d66a3f",
+          "task_id": "task_75ed1fd7b0b9",
+          "contract_version": 1,
+          "assignee_handle": "term_2930bf3f-05a0-464f-b891-ca3911247955",
+          "status": "completed",
+          "failure_count": 0,
+          "last_failure": null,
+          "dispatched_at": "2026-08-10 18:50:10",
+          "completed_at": "2026-08-10 18:53:12",
+          "created_at": "2026-08-10 18:50:10",
+          "last_heartbeat_at": null
+        }
+      },
+      "_meta": {"runtimeId": "01b52095-c4bf-4029-8931-9d8cdd8beb96"}
+    }
+    """
+
+    # orca orchestration check --terminal term_2930bf3f-... --peek --json
+    REAL_CHECK_PEEK = """
+    {
+      "id": "a0de4d0e-9b44-483b-85db-91b7f209e704",
+      "ok": true,
+      "result": {
+        "runId": "run_e3af18d66a3f",
+        "dispatchId": "ctx_e3d829a0b350",
+        "messages": [],
+        "count": 0
+      },
+      "_meta": {"runtimeId": "01b52095-c4bf-4029-8931-9d8cdd8beb96"}
+    }
+    """
+
+    # orca orchestration worker-show --dispatch ctx_9c7251a58edd --json
+    REAL_ERROR = """
+    {
+      "id": "b33bd19c-ba46-4f7f-abb2-547ff9e44eaa",
+      "ok": false,
+      "error": {"code": "dispatch_not_found", "message": "Worker Dispatch ctx_9c7251a58edd was not found."},
+      "_meta": {"runtimeId": "01b52095-c4bf-4029-8931-9d8cdd8beb96"}
+    }
+    """
+
+    def _adapter_answering(self, fixture: str) -> OrcaRuntimeAdapter:
+        return OrcaRuntimeAdapter(coordinator="orchestrator", run_id="run-1", runner=lambda argv: fixture)
+
+    def test_check_peek_unwraps_envelope(self):
+        batch = parse_check_output(self.REAL_CHECK_PEEK)
+        # The envelope's top-level id is the request id, never a delivery id.
+        self.assertEqual(batch.delivery_id, "")
+        self.assertEqual(batch.messages, ())
+
+    def test_error_envelope_raises_in_parser(self):
+        with self.assertRaisesRegex(ValueError, "dispatch_not_found"):
+            parse_check_output(self.REAL_ERROR)
+
+    def test_error_envelope_raises_in_adapter(self):
+        adapter = self._adapter_answering(self.REAL_ERROR)
+        with self.assertRaisesRegex(RuntimeError, "dispatch_not_found"):
+            adapter._orca("orchestration", "worker-show", "--dispatch", "ctx_9c7251a58edd")
+
+    def test_message_worker_guard_fires_on_real_dispatch_show(self):
+        # The bug this task fixes: reading status off the envelope gave ""
+        # and the guard never fired — a raw send went to a dead worker.
+        adapter = self._adapter_answering(self.REAL_DISPATCH_SHOW)
+        workspace = WorkspaceRef(ticket_key="GRE-175", path="/workspaces/gre-175", branch="b")
+        context = ContextRef(id="ctx-1", role=RoleName.IMPLEMENTER, workspace=workspace)
+        ref = AttemptRef(attempt_id="ctx_9c7251a58edd", ticket_key="GRE-175", context=context)
+        adapter._attempts["ctx_9c7251a58edd"] = _AttemptRecord(ref=ref, task_id="task_75ed1fd7b0b9")
+        with self.assertRaises(MessageWorkerRefused) as caught:
+            adapter.message_worker("ctx_9c7251a58edd", "are you there?")
+        self.assertIs(caught.exception.attention.code, AttentionCode.TICKET_WITHOUT_WORKER)
+        self.assertIn("completed", caught.exception.attention.reason)
 
 
 if __name__ == "__main__":  # pragma: no cover

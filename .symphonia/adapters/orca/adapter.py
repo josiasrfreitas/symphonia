@@ -141,6 +141,21 @@ class OrcaRuntimeAdapter:
     def _orca(self, *argv: str) -> dict:
         out = self.runner(["orca", *argv, "--json"])
         data = json.loads(out) if out.strip() else {}
+        # The orca CLI wraps every --json response in an envelope
+        # {id, ok, result, _meta}; the payload lives under "result"
+        # (proved against the real CLI in the GRE-175 ad hoc test).
+        if isinstance(data, dict) and "ok" in data:
+            if not data.get("ok"):
+                error = data.get("error")
+                if not isinstance(error, dict):
+                    error = {"message": str(error)}
+                raise RuntimeError(
+                    f"orca {' '.join(argv)} failed: "
+                    f"{error.get('code', 'unknown')}: {error.get('message', '')}"
+                )
+            data = data.get("result")
+        if data is None:
+            return {}
         return data if isinstance(data, dict) else {"items": data}
 
     def _last_open_attempt(self) -> AttemptRef | None:
@@ -155,7 +170,8 @@ class OrcaRuntimeAdapter:
         open attempt, the work most at risk while control was lost."""
 
         current = self._orca("orchestration", "run-current")
-        holder = str(current.get("terminal", current.get("coordinator", "")))
+        run = current.get("run") if isinstance(current.get("run"), dict) else {}
+        holder = str(run.get("terminal", current.get("terminal", current.get("coordinator", ""))))
         if holder == self.coordinator:
             return
         self._orca("orchestration", "run-use", "--run", self.run_id, "--from", self.coordinator)
@@ -370,7 +386,15 @@ class OrcaRuntimeAdapter:
         if record is None:
             raise MessageWorkerRefused(dispatch_id, "unknown")
         shown = self._orca("orchestration", "dispatch-show", "--task", record.task_id)
-        status = str(shown.get("status", ""))
+        # dispatch-show nests the record under result.dispatch. A missing
+        # status is a loud failure, never a pass-through: reading "" here
+        # once let every send through to dead workers (ad hoc test).
+        dispatch = shown.get("dispatch")
+        if not isinstance(dispatch, dict) or not dispatch.get("status"):
+            raise RuntimeError(
+                f"dispatch-show for task {record.task_id} returned no dispatch status; refusing to send blind"
+            )
+        status = str(dispatch["status"])
         # "stopped" is a killed worker (review M2): just as dead as
         # completed/failed — a send would sit in the mailbox forever.
         if status in ("completed", "failed", "stopped"):
