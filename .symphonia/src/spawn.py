@@ -28,11 +28,12 @@ PR. Roles are Orca dispatches (attached), not child worktrees: they report
 `worker_done` to the Orchestrator's Run.
 
 `wait` is the one loop that hears back from every role — it also drives the
-plan gate: it turns mailbox messages into typed events (`adapters/orca/events.py`),
-runs each through `adapters/plan_gate.py`, and executes what comes back
-(label the ticket, retire the planner, flag a divergence). `verdict` is how
-the human's decision reaches the planner: it never comes from an agent
-typing `APPROVED`/`REVISE` into a reply by hand.
+plan gate: it turns mailbox messages into typed events (`adapters/orca/events.py`)
+and hands them to `workflow.gate_loop.run`, which runs each through
+`adapters/plan_gate.py` and executes what comes back (label the ticket,
+retire the planner, flag a divergence). `verdict` is how the human's
+decision reaches the planner: it never comes from an agent typing
+`APPROVED`/`REVISE` into a reply by hand.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from adapters import plan_gate as _gate
 from adapters import reports as _reports
@@ -87,6 +89,11 @@ asking a second time."""
 # Writers: `spawn`, `wait`, `verdict`, `retire` — all Orchestrator-side. The
 # role-side verbs (`submit`, `done`) only ever read, so two processes in two
 # checkouts never race for this file.
+#
+# The record shape below (`ticket`, `dispatch`, `task`, `gate_state`, ...) is
+# internal to this package, not a public contract: nothing outside `spawn.py`
+# and `workflow/gate_loop.py` is entitled to depend on it, and it can change
+# shape between versions without notice.
 RUNTIME_DIR = Path(os.environ.get("SYMPHONIA_RUNTIME", "~/.symphonia/runtime")).expanduser()
 STATE = RUNTIME_DIR / "spawns.json"
 # A sibling, not `STATE` itself: `state_write` swaps the inode via
@@ -188,7 +195,7 @@ def state_write(data: dict) -> None:
 
 
 @contextlib.contextmanager
-def state_lock():
+def state_lock() -> Iterator[None]:
     """Serializes a read-modify-write cycle of the registry across
     processes: `wait` can sit on a snapshot for up to 15 minutes while a
     concurrent `verdict` writes `gate_state` elsewhere, and without this the
@@ -781,8 +788,6 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     ticket = ticket.upper()
     if decision not in ("approved", "revise"):
         raise SystemExit(f"unknown decision {decision!r}; use 'approved' or 'revise'")
-    if decision == "revise" and not notes.strip():
-        raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
 
     key = f"{ticket}/{GATE_ROLE.value}"
     token = "APPROVED" if decision == "approved" else "REVISE"
@@ -797,6 +802,8 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
                 f"no pending plan submission recorded for {ticket}; "
                 f"`spawn wait` must observe the submission before a verdict can be given"
             )
+        if decision == "revise" and not notes.strip():
+            raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
 
         # Recorded BEFORE the reply goes out. The reply unblocks the planner,
         # which may run `spawn done` immediately; a registry that still said
