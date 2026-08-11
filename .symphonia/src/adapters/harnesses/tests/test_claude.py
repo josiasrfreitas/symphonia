@@ -1,15 +1,17 @@
-"""Conformance tests for the launch interface (GRE-179).
+"""Tests for the Claude launch interface (GRE-179) and its `HarnessAdapter`
+wrapper, `ClaudeHarness` (GRE-186 S2).
 
-TLDR: locks the two things that are silent when they break — a worker
-launched in a mode that can stop at a permission prompt, and a read-only
-role launched somewhere it could write. What tier/access a role launches at
-is no longer a second table here to drift from the role files (GRE-186 S1):
-these tests read the same `RolePolicy` catalog `spawn.py` does, via
-`workflow.roles.load_policies`, and pass it to `build_launch` explicitly.
+TLDR: `build_launch` still locks the two things that are silent when they
+break — a worker launched in a mode that can stop at a permission prompt,
+and a read-only role launched somewhere it could write. `ClaudeHarness`
+wraps the same argv behind the neutral Protocol; its own tests check the
+argv it produces matches `build_launch` byte for byte, that `observe()`
+reports all three `TierEvidence` kinds, and that a harness which cannot
+enforce read-only refuses rather than silently launching with write access.
 Run either way:
 
-    cd .symphonia/src && python3 -m unittest adapters.orca.tests.test_launcher
-    python3 .symphonia/src/adapters/orca/tests/test_launcher.py
+    cd .symphonia/src && python3 -m unittest adapters.harnesses.tests.test_claude
+    python3 .symphonia/src/adapters/harnesses/tests/test_claude.py
 """
 from __future__ import annotations
 
@@ -21,18 +23,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from adapters.orca.launcher import (
+from adapters.harness_adapter import HarnessCapabilities, HarnessRefusal
+from adapters.harnesses.claude import (
     DEFAULT_PROVIDER,
     PROVIDERS,
+    ClaudeHarness,
     build_launch,
     observed_models,
     tier_matches,
 )
-from adapters.runtime_adapter import Access, CapabilityTier, RoleName
+from adapters.runtime_adapter import Access, CapabilityTier, RoleName, WorkspaceRef
 from workflow.roles import load_policies
 
 ROLES_DIR = Path(__file__).resolve().parents[4] / "roles"
 POLICIES = load_policies(ROLES_DIR)
+
+WORKSPACE = WorkspaceRef(ticket_key="GRE-1", id="wt-1", path="/tmp/w", branch="b")
 
 
 class TestNothingLaunchesIntoAPrompt(unittest.TestCase):
@@ -133,6 +139,103 @@ class TestArgvIsShellSafe(unittest.TestCase):
             tier=policy.tier, access=policy.access,
         )
         self.assertIn("'Edit Write NotebookEdit'", plan.command)
+
+
+class TestClaudeHarnessCapabilities(unittest.TestCase):
+    def test_claude_can_enforce_read_only_and_observe_the_answering_model(self):
+        harness = ClaudeHarness()
+        self.assertEqual(
+            harness.capabilities, HarnessCapabilities(read_only=True, tier_evidence="observed")
+        )
+
+
+class TestClaudeHarnessPrepare(unittest.TestCase):
+    """`prepare()` wraps `build_launch` behind the Protocol — same argv,
+    unjoined (joining into a shell string is the caller's job, not the
+    harness's), keyed to a session id `prepare()` mints itself."""
+
+    def test_prepare_matches_build_launch_byte_for_byte(self):
+        for role, policy in POLICIES.items():
+            with self.subTest(role=role.value):
+                plan = build_launch(
+                    role, session_id="fixed", workspace=WORKSPACE.path,
+                    tier=policy.tier, access=policy.access,
+                )
+                prepared = ClaudeHarness().prepare(workspace=WORKSPACE, policy=policy)
+                # The session id `prepare()` mints is its own, not "fixed" —
+                # compare argv with that one slot substituted.
+                argv = tuple(
+                    prepared.session.id if part == "fixed" else part for part in plan.argv
+                )
+                self.assertEqual(prepared.command, argv)
+
+    def test_prepare_refuses_read_when_the_harness_cannot_enforce_it(self):
+        """Condition 3 of the GRE-186 PR-A verdict: `HarnessRefusal` is
+        exercised, not dead code. A one-line stub over this one instance —
+        never a second harness implementation — claims it cannot deny write
+        tools, and a READ policy must be refused rather than silently
+        launched with write access."""
+
+        harness = ClaudeHarness(capabilities=HarnessCapabilities(read_only=False, tier_evidence="unverifiable"))
+        read_policy = next(p for p in POLICIES.values() if p.access is Access.READ)
+        with self.assertRaises(HarnessRefusal):
+            harness.prepare(workspace=WORKSPACE, policy=read_policy)
+
+    def test_prepare_still_allows_write_when_the_harness_cannot_enforce_read_only(self):
+        harness = ClaudeHarness(capabilities=HarnessCapabilities(read_only=False, tier_evidence="unverifiable"))
+        write_policy = next(p for p in POLICIES.values() if p.access is Access.WRITE)
+        prepared = harness.prepare(workspace=WORKSPACE, policy=write_policy)
+        self.assertNotIn("--disallowedTools", prepared.command)
+
+
+class TestClaudeHarnessObserve(unittest.TestCase):
+    """The three kinds `observe()` must report (condition 4 of the GRE-186
+    PR-A verdict): no/empty transcript -> requested; the requested tier
+    answered -> observed; a different tier answered -> observed, with the
+    mismatch named in the detail."""
+
+    def _session(self, path):
+        from adapters.harness_adapter import HarnessSession
+        return HarnessSession(id="s", observation_ref=str(path))
+
+    def test_no_transcript_is_requested(self):
+        harness = ClaudeHarness()
+        evidence = harness.observe(self._session("/nonexistent/none.jsonl"), CapabilityTier.STANDARD)
+        self.assertEqual(evidence.kind, "requested")
+        self.assertEqual(evidence.tier, CapabilityTier.STANDARD)
+
+    def test_empty_transcript_is_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.jsonl"
+            path.write_text("")
+            harness = ClaudeHarness()
+            evidence = harness.observe(self._session(path), CapabilityTier.STANDARD)
+            self.assertEqual(evidence.kind, "requested")
+
+    def test_matching_model_is_observed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            path.write_text(json.dumps({"message": {"model": "claude-sonnet-5"}}) + "\n")
+            harness = ClaudeHarness()
+            evidence = harness.observe(self._session(path), CapabilityTier.STANDARD)
+            self.assertEqual(evidence.kind, "observed")
+            self.assertEqual(evidence.tier, CapabilityTier.STANDARD)
+
+    def test_diverging_model_is_observed_with_the_mismatch_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            path.write_text(json.dumps({"message": {"model": "claude-opus-5"}}) + "\n")
+            harness = ClaudeHarness()
+            evidence = harness.observe(self._session(path), CapabilityTier.STANDARD)
+            self.assertEqual(evidence.kind, "observed")
+            self.assertIsNone(evidence.tier)
+            self.assertIn("mismatch", evidence.detail)
+            self.assertIn("claude-opus-5", evidence.detail)
+
+
+class TestClaudeHarnessHandoffHint(unittest.TestCase):
+    def test_names_the_handoff_skill(self):
+        self.assertIn("handoff/SKILL.md", ClaudeHarness().handoff_hint())
 
 
 if __name__ == "__main__":

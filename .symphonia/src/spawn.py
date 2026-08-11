@@ -64,7 +64,7 @@ from adapters.linear import adapter as _linear
 from adapters.linear import client as _linear_client
 from adapters.orca import adapter as _cli
 from adapters.orca import events as _events
-from adapters.orca import launcher as _launcher
+from adapters.harnesses import claude as _launcher
 import setup_worktree as _setup_worktree
 from workflow import gate_loop as _gate_loop
 from workflow import roles as _roles

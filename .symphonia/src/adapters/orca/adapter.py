@@ -46,7 +46,7 @@ from ..runtime_adapter import (
     WorkspaceRef,
 )
 from .events import parse_check_output
-from .launcher import LaunchPlan, TIER_MODELS, build_launch, observed_models, tier_matches
+from ..harnesses.claude import LaunchPlan, TIER_MODELS, build_launch, observed_models, tier_matches
 
 
 @dataclass(frozen=True)
