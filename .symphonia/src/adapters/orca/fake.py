@@ -44,7 +44,7 @@ from ..runtime_adapter import (
     TierEvidence,
     WorkspaceRef,
 )
-from .adapter import RunResult
+from .adapter import ROLE_BADGE, RunResult
 from .launcher import TIER_MODELS
 
 
@@ -69,6 +69,8 @@ class FakeWorkspace:
     id: str
     ticket_key: TicketKey
     setup_done: bool = False
+    display_name: str = ""
+    workspace_status: str = ""
 
 
 @dataclass
@@ -434,6 +436,16 @@ def _requested_tier(command: str):
     return _MODEL_TIERS[model]
 
 
+# Which role a title names, read out of its badge prefix (GRE-184 M3): the
+# real-CLI-shaped title (`f"{emoji} {phase} · {ticket}"`) carries no context
+# id, only the badge — the same table `adapter.launch_role` built it from.
+_BADGE_PREFIX_TO_ROLE = {f"{emoji} {phase}": role for role, (emoji, phase, _) in ROLE_BADGE.items()}
+
+
+def _role_of(title: str) -> RoleName | None:
+    return next((role for prefix, role in _BADGE_PREFIX_TO_ROLE.items() if title.startswith(prefix)), None)
+
+
 class ScriptedOrcaCli:
     """A callable with the ``Runner`` signature: the subset of the ``orca``
     CLI the adapter uses, answered from a ``FakeRuntime``. Deterministic —
@@ -459,16 +471,21 @@ class ScriptedOrcaCli:
         handlers = {
             ("worktree", "create"): lambda: self._worktree_create(flag("--name"), flag("--linear-issue")),
             ("worktree", "list"): lambda: self._worktree_list(),
+            ("worktree", "set"): lambda: self._worktree_set(
+                flag("--worktree"), flag("--display-name"), flag("--workspace-status")
+            ),
             ("worktree", "rm"): lambda: self._worktree_rm(flag("--worktree")),
             ("terminal", "create"): lambda: self._terminal_create(flag("--worktree"), flag("--title"), flag("--command")),
             ("terminal", "list"): lambda: self._terminal_list(flag("--worktree")),
+            ("terminal", "wait"): lambda: {},
             ("terminal", "close"): lambda: self._terminal_close(flag("--terminal")),
             ("orchestration", "run-current"): lambda: {
                 "run": {"terminal": self.rt.control_holder} if self.rt.control_holder else None
             },
             ("orchestration", "run-use"): lambda: self._run_use(flag("--from")),
-            ("orchestration", "task-create"): lambda: {"taskId": self.rt.create_task(flag("--spec"))},
+            ("orchestration", "task-create"): lambda: {"task": {"id": self.rt.create_task(flag("--spec"))}},
             ("orchestration", "dispatch"): lambda: self._dispatch(flag("--task"), flag("--to")),
+            ("orchestration", "task-update"): lambda: {},
             ("orchestration", "worker-stop"): lambda: self._worker_stop(flag("--dispatch")),
             ("orchestration", "worker-show"): lambda: self._worker_show(flag("--dispatch")),
             ("orchestration", "check"): lambda: self._check(flag("--ack"), "--peek" in argv),
@@ -507,6 +524,14 @@ class ScriptedOrcaCli:
             items.append({"id": ws_id, "path": path})
         return {"worktrees": items}
 
+    def _worktree_set(self, selector: str, display_name: str, status: str) -> dict:
+        ws_id = selector.removeprefix("id:")
+        ws = self.rt.workspaces.get(ws_id)
+        if ws is not None:
+            ws.display_name = display_name
+            ws.workspace_status = status
+        return {}
+
     def _worktree_rm(self, selector: str) -> dict:
         path = selector.removeprefix("path:")
         ws_id = self._ws_by_path.pop(path, "")
@@ -514,12 +539,12 @@ class ScriptedOrcaCli:
         return {}
 
     def _terminal_create(self, selector: str, title: str, command: str) -> dict:
-        ws_id = self._ws_by_path[selector.removeprefix("path:")]
+        ws_id = selector.removeprefix("id:")
         requested = _requested_tier(command)
-        role_name = title.split("/")[1]
-        serving = self.rt.staging.get(role_name, requested)
+        role = _role_of(title)
+        serving = self.rt.staging.get(role.value, requested) if role else requested
         pid = self.rt.spawn(ws_id, command, title, requested=requested, serving=serving)
-        return {"terminal": pid}
+        return {"terminal": {"handle": pid}}
 
     def _terminal_list(self, selector: str) -> dict:
         ws_id = selector.removeprefix("id:")
@@ -544,7 +569,14 @@ class ScriptedOrcaCli:
 
     def _dispatch(self, task_id: str, terminal: str) -> dict:
         self.rt.go_quiet(terminal, 0)
-        return {"dispatchId": self.rt.create_dispatch(task_id, terminal)}
+        dispatch_id = self.rt.create_dispatch(task_id, terminal)
+        # Real shape (GRE-184 M3): the id nests under "dispatch", and
+        # `--return-preamble` is what actually carries the capability token
+        # — there is no separate field for it on the envelope.
+        return {
+            "dispatch": {"id": dispatch_id},
+            "preamble": f"orca orchestration send --dispatch-capability dcap_{dispatch_id} --type worker_done",
+        }
 
     def _worker_stop(self, dispatch_id: str) -> dict:
         record = self.rt.dispatches[dispatch_id]
@@ -589,7 +621,16 @@ class Rig:
 
     def _proc_for(self, context: ContextRef) -> FakeProcess:
         marker = f"/{context.id}"
-        return next(p for p in self.rt.processes.values() if p.display_name.endswith(marker))
+        for p in self.rt.processes.values():
+            if p.display_name.endswith(marker):
+                return p
+        # Real-CLI-shaped titles (GRE-184 M3, OrcaRuntimeAdapter.launch_role)
+        # carry no context id, only the role's badge — good enough because
+        # the walkthrough never keeps two live contexts of the same role
+        # alive at once.
+        emoji, phase, _board = ROLE_BADGE[context.role]
+        prefix = f"{emoji} {phase}"
+        return next(p for p in self.rt.processes.values() if p.alive and p.display_name.startswith(prefix))
 
     def answer(self, context: ContextRef) -> None:
         self.rt.answer(self._proc_for(context).id, self.records_answers)

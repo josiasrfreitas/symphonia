@@ -6,16 +6,14 @@ runner is injectable so the conformance suite can drive the exact same
 adapter against a scripted CLI. The Capability Tier translation table lives
 here — roles declare a tier, only this file knows model names.
 
-Known limitation (GRE-175 review, M3): ``RoleSpec.briefing`` is not yet
-delivered to the agent — ``launch_role`` starts the bare model command and
-``dispatch`` sends only the work body, so the briefing is silently
-discarded today. How the briefing reaches the agent (launch prompt vs
-first dispatch) is a user decision deferred to the merge gate; do not wire
-it here without that decision.
+``RoleSpec.briefing`` (GRE-175 M3, closed by GRE-184 M3): the brief IS the
+body of the first ``dispatch`` — the caller passes it as ``work``, same as
+every later correction. There is no second channel to wire.
 """
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import uuid
@@ -39,6 +37,7 @@ from ..runtime_adapter import (
     Liveness,
     QuestionEvent,
     ResultEvent,
+    RoleName,
     RoleSpec,
     RuntimeCapabilities,
     RuntimeEvent,
@@ -154,6 +153,32 @@ def unwrap_envelope(
 # lives in launcher.py, so the adapter and the `spawn` CLI cannot drift into
 # two different command lines for the same tier (GRE-179).
 
+# What the phase looks like in the Orca sidebar (GRE-184 M3, retroported
+# from `spawn.ROLE_BADGE` unedited). Orca exposes no per-worktree colour, so
+# the phase is carried by the three labels it does expose: the worktree
+# display name, the terminal title, and the board column.
+ROLE_BADGE = {
+    RoleName.PLANNER: ("🧭", "planning", "in-progress"),
+    RoleName.IMPLEMENTER: ("🔨", "implementing", "in-progress"),
+    RoleName.SPEC_REVIEWER: ("🔍", "spec review", "in-review"),
+    RoleName.STANDARDS_REVIEWER: ("📐", "standards review", "in-review"),
+}
+
+_CAPABILITY = re.compile(r"--dispatch-capability\s+(\S+)")
+
+
+def _capability_of(preamble: str) -> str | None:
+    """The Dispatch capability token Orca mints for an injected dispatch
+    (GRE-184 M3, retroported from `spawn._capability_of` unedited). It
+    exists only as text inside the preamble (the dispatch row's
+    ``capability_hash`` comes back null), so it is read with a regex — the
+    preamble repeats it once per lifecycle command and they are the same
+    token."""
+
+    found = _CAPABILITY.search(preamble)
+    return found.group(1) if found else None
+
+
 VALID_PATHS_AFTER_DONE = (
     "orca orchestration dispatch --inject (new task into the terminal)",
     "orca terminal send (direct prompt to the pane)",
@@ -190,6 +215,7 @@ class _ContextRecord:
 class _AttemptRecord:
     ref: AttemptRef
     task_id: str
+    capability: str = ""
     open: bool = True
     fenced: bool = False
 
@@ -352,6 +378,22 @@ class OrcaRuntimeAdapter:
 
     # --- role contexts ---
 
+    def set_phase(self, workspace: WorkspaceRef, role: RoleName) -> None:
+        """The phase badge in the Orca sidebar (GRE-184 M3, retroported from
+        ``spawn.spawn`` unedited). Orca-specific, like ``message_worker`` —
+        not part of the neutral Protocol, and not called by ``launch_role``
+        itself: the caller sets the badge, then launches, same order the
+        measured argv freezes."""
+
+        self._ensure_control()
+        emoji, phase, board = ROLE_BADGE[role]
+        self._orca(
+            "worktree", "set",
+            "--worktree", f"id:{workspace.id}",
+            "--display-name", f"{emoji} {workspace.ticket_key} · {phase}",
+            "--workspace-status", board,
+        )
+
     def launch_role(self, workspace: WorkspaceRef, spec: RoleSpec) -> LaunchResult:
         self._ensure_control()
         if spec.access is Access.WRITE:
@@ -372,9 +414,11 @@ class OrcaRuntimeAdapter:
 
         self._seq += 1
         context_id = f"ctx-{self._seq}"
-        # Ticket Key and context identity travel in the title: no process id
-        # is exposed to correlate on.
-        title = f"{workspace.ticket_key}/{spec.role.value}/{context_id}"
+        emoji, phase, _board = ROLE_BADGE[spec.role]
+        # The argv measured from `spawn.spawn` (GRE-184 M3): title carries
+        # phase and ticket, not context identity — Rig._proc_for falls back
+        # to a role+liveness match for exactly this reason.
+        title = f"{emoji} {phase} · {workspace.ticket_key}"
         plan = build_launch(
             spec.role,
             session_id=str(uuid.uuid4()),
@@ -383,16 +427,19 @@ class OrcaRuntimeAdapter:
             access=spec.access,
         )
         created = self._orca(
-            "terminal",
-            "create",
-            "--worktree",
-            f"path:{workspace.path}",
-            "--title",
-            title,
-            "--command",
-            plan.command,
+            "terminal", "create",
+            "--worktree", f"id:{workspace.id}",
+            "--title", title,
+            "--command", plan.command,
         )
-        terminal = _required(str(created.get("terminal", created.get("handle", ""))), "terminal handle")
+        # Real shape, matching `spawn.spawn`'s `orca(...)["terminal"]["handle"]`
+        # (GRE-184 M3) — the old flat `created["terminal"]` this replaced was
+        # never exercised against anything but the adapter's own dead-code fake.
+        term = created.get("terminal", created)
+        terminal = _required(str(term.get("handle", term.get("terminal", ""))), "terminal handle")
+        # Losing the first prompt costs a whole spawn, so readiness is
+        # waited on, never assumed.
+        self._orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle", "--timeout-ms", "120000")
         ref = ContextRef(id=context_id, role=spec.role, workspace=workspace)
         self._contexts[context_id] = _ContextRecord(
             ref=ref, terminal=terminal, access=spec.access, requested_tier=spec.tier, plan=plan
@@ -448,27 +495,70 @@ class OrcaRuntimeAdapter:
 
     # --- attempts ---
 
+    def _roll_back_uncapabilitied_dispatch(self, task_id: str, terminal: str) -> None:
+        """A dispatch that minted no capability, undone (GRE-184 M3,
+        retroported from ``spawn._require_capability`` unedited): the task
+        and terminal are rolled back so a retry starts clean, rather than
+        leaving a role launched but never able to report."""
+
+        self._orca(
+            "orchestration", "task-update", "--id", task_id, "--status", "failed",
+            "--result", json.dumps({"reason": "no dispatch capability in the preamble"}),
+        )
+        try:
+            self._orca("terminal", "close", "--terminal", terminal, "--tab")
+        except OrcaCliError as exc:
+            print(f"note: terminal not closed ({exc})", file=sys.stderr)
+
     def dispatch(self, context: ContextRef, work: str) -> AttemptRef:
         self._ensure_control()
         record = self._contexts.get(context.id)
         if record is None:
             raise RuntimeError(f"context {context.id} is gone; dispatch has nowhere to land")
         ticket = context.workspace.ticket_key
-        task = self._orca(
-            "orchestration", "task-create", "--spec", work,
-            "--task-title", f"{ticket}/{context.role.value}", "--from", self.coordinator,
-        )
-        task_id = _required(str(task.get("taskId", task.get("task_id", ""))), "task id")
+        task = self._orca("orchestration", "task-create", "--spec", work)
+        # Real shape, matching `spawn.spawn`'s `orca(...)["task"]["id"]`
+        # (GRE-184 M3) — the old flat `taskId`/`task_id` this replaced was
+        # never exercised against anything but the adapter's own dead-code fake.
+        task_row = task.get("task", task)
+        task_id = _required(str(task_row.get("id", "")), "task id")
         dispatched = self._orca(
             "orchestration", "dispatch", "--task", task_id,
-            "--to", record.terminal, "--from", self.coordinator,
+            "--to", record.terminal, "--inject", "--return-preamble",
         )
-        attempt_id = _required(
-            str(dispatched.get("dispatchId", dispatched.get("dispatch_id", ""))), "dispatch id"
-        )
+        dispatch_row = dispatched.get("dispatch") or {}
+        attempt_id = _required(str(dispatch_row.get("id", "")), "dispatch id")
+        capability = _capability_of(dispatched.get("preamble") or "")
+        if capability is None:
+            self._roll_back_uncapabilitied_dispatch(task_id, record.terminal)
+            raise OrcaCliError(
+                f"dispatch for {ticket}/{context.role.value} minted no capability, so the role "
+                f"could never report; the terminal and task were rolled back. Retry the spawn."
+            )
         ref = AttemptRef(attempt_id=attempt_id, ticket_key=ticket, context=context)
-        self._attempts[attempt_id] = _AttemptRecord(ref=ref, task_id=task_id)
+        self._attempts[attempt_id] = _AttemptRecord(ref=ref, task_id=task_id, capability=capability)
         return ref
+
+    def snapshot(self, attempt: AttemptRef) -> dict:
+        """Everything a caller needs to persist about one dispatch, read
+        back from the adapter's own records (GRE-184 M3) rather than
+        reconstructed by hand: terminal, task, dispatch, capability, tier,
+        access, session id, transcript, launch command."""
+
+        attempt_record = self._attempts[attempt.attempt_id]
+        context_record = self._contexts[attempt.context.id]
+        plan = context_record.plan
+        return {
+            "terminal": context_record.terminal,
+            "task": attempt_record.task_id,
+            "dispatch": attempt.attempt_id,
+            "capability": attempt_record.capability,
+            "tier": context_record.requested_tier.value,
+            "access": context_record.access.value,
+            "session_id": plan.session_id if plan else None,
+            "transcript": str(plan.transcript) if plan and plan.transcript else None,
+            "command": plan.command if plan else None,
+        }
 
     def kill(self, attempt: AttemptRef) -> KillReceipt:
         self._ensure_control()
