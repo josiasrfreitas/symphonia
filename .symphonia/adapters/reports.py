@@ -186,16 +186,27 @@ def parse_planner_done(body: str) -> PlannerReport:
     return PlannerReport(plan_pointer=plan_pointer.strip(), deviations=deviations)
 
 
-def format_planner_done(
-    plan_pointer: str, approval_rounds: int, deviations: tuple[str, ...] | list[str] = ()
-) -> str:
-    """The one place that writes the shape ``parse_planner_done`` reads.
+def set_approval_rounds(body: str, approval_rounds: int) -> str:
+    """Rewrite only the ``## Approval`` section, in place, from the round
+    count the gate observed.
 
-    ``## Approval`` is written from the round count the gate observed, not
-    from what the role remembers — same reason ``format_approval_reply``
-    exists on the other side of the conversation."""
+    Only that section: the rest of the body is the role's, and a report may
+    carry sections this module never heard of (``## Risks``, ``## Handoff``).
+    Rebuilding the whole body from the parsed fields would drop them, and a
+    dispatch grants exactly one ``worker_done``, so nothing dropped here can
+    be sent again."""
 
     rounds = f"{approval_rounds} rodada." if approval_rounds == 1 else f"{approval_rounds} rodadas."
-    listed = [line.strip() for line in deviations if line.strip()]
-    body = "\n".join(f"- {line}" for line in listed) if listed else "None."
-    return f"## Plan\n{plan_pointer.strip()}\n\n## Approval\n{rounds}\n\n## Deviations\n{body}"
+    lines = body.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "## Approval")
+    except StopIteration:
+        raise MalformedReport("planner worker_done: missing required section '## Approval'")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines)
+    )
+    # Blank lines before the next heading are separators, not content.
+    tail = lines[end:]
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[: start + 1] + [rounds] + [""] * bool(tail) + tail)

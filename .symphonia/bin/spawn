@@ -181,24 +181,36 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
 
 
 def state_read() -> dict:
-    """The live registry. Read from the shared runtime, falling back to the
-    per-checkout `.runtime/` a pre-GRE-178 install left behind."""
+    """The live registry: the shared runtime, with any per-checkout
+    `.runtime/` left by a pre-GRE-178 install merged UNDER it.
 
-    if not STATE.exists():
-        if LEGACY_STATE.exists():
-            return json.loads(LEGACY_STATE.read_text())
-        return {}
-    return json.loads(STATE.read_text())
+    Merged rather than used as a fallback: each checkout got its own legacy
+    file, so "read the legacy one only when the shared one is missing" loses
+    every other checkout's records the moment any verb writes. The shared
+    file always wins on a key collision — it is the one both sides update.
+    """
+
+    merged = {}
+    if LEGACY_STATE.exists():
+        merged.update(json.loads(LEGACY_STATE.read_text()))
+    if STATE.exists():
+        merged.update(json.loads(STATE.read_text()))
+    return merged
 
 
 def state_write(data: dict) -> None:
-    """Atomic, and 0600: the registry now carries Dispatch capability tokens,
-    which are what authorizes a `worker_done`."""
+    """Atomic, and 0600 from the moment the bytes exist — the registry holds
+    Dispatch capability tokens, and a token is what authorizes a
+    `worker_done` on someone else's dispatch. Both the directory and the temp
+    file are created narrow rather than widened afterwards: a chmod after the
+    write leaves a window at the default umask."""
 
-    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE.parent, 0o700)  # a directory that already existed
     tmp = STATE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    tmp.chmod(0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, STATE)
 
 
@@ -431,6 +443,39 @@ def _capability_of(preamble: str) -> str | None:
     return found.group(1) if found else None
 
 
+def _require_capability(preamble: str, ticket: str, role_value: str, *, task: str, terminal: str) -> str:
+    """The capability, or no spawn at all.
+
+    Measured on Orca 1.4.168: an injected dispatch mints a capability and
+    every lifecycle message is checked against it — a `worker_done` sent
+    without it comes back `dispatch_capability_invalid` and the dispatch
+    stays open forever. The token is printed only inside the preamble text
+    (`capability_hash` on the dispatch row is null), so this is the one
+    moment it can be captured.
+
+    Fatal rather than a warning: a role launched without it would work for
+    hours and only then be unable to report. Failing here costs a spawn;
+    failing there costs the work. The task and terminal are rolled back so a
+    retry starts clean.
+    """
+
+    capability = _capability_of(preamble)
+    if capability:
+        return capability
+    orca(
+        "orchestration", "task-update", "--id", task, "--status", "failed",
+        "--result", json.dumps({"reason": "no dispatch capability in the preamble"}),
+    )
+    try:
+        orca("terminal", "close", "--terminal", terminal, "--tab")
+    except SystemExit as exc:
+        print(f"note: terminal not closed ({exc})", file=sys.stderr)
+    raise SystemExit(
+        f"dispatch for {ticket}/{role_value} minted no capability, so the role could "
+        f"never report; the terminal and task were rolled back. Retry the spawn."
+    )
+
+
 def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     """The record of the role calling this, from inside its own terminal.
 
@@ -540,19 +585,9 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "--return-preamble",
     )
     dispatch = dispatched["dispatch"]["id"]
-    capability = _capability_of(dispatched.get("preamble") or "")
-    if not capability:
-        # Measured on Orca 1.4.168: an injected dispatch mints a capability
-        # and every lifecycle message is checked against it — a `worker_done`
-        # sent without it comes back `dispatch_capability_invalid` and the
-        # dispatch stays open forever. The token is printed only inside the
-        # preamble text (`capability_hash` on the dispatch row is null), so
-        # this is the one moment it can be captured.
-        print(
-            f"note: no dispatch capability found in the preamble for {ticket}/{role.value}; "
-            f"`spawn done` will not be able to complete this dispatch",
-            file=sys.stderr,
-        )
+    capability = _require_capability(
+        dispatched.get("preamble") or "", ticket, role.value, task=task, terminal=terminal
+    )
 
     record = {
         "ticket": ticket,
@@ -736,9 +771,11 @@ def _apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str 
             rec["last_question_id"] = result.question_id
             rec["plan_pointer"] = submission.pointer
             rec["plan_decisions"] = list(submission.decisions)
-            # Counted here, so `spawn done` never has to ask the planner how
-            # many rounds it took.
-            rec["approval_rounds"] = int(rec.get("approval_rounds", 0)) + 1
+            if result.state == _gate.SUBMITTED and state != _gate.SUBMITTED:
+                # A round is a plan put in front of the human, counted here
+                # so `spawn done` never asks the planner how many there were.
+                # Re-asking the same pending question is not a new round.
+                rec["approval_rounds"] = int(rec.get("approval_rounds", 0)) + 1
     elif event.kind == "worker-done":
         report_ok = True
         try:
@@ -802,6 +839,11 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
 
     data = state_read()
     by_dispatch = {rec["dispatch"]: key for key, rec in data.items()}
+    # Attribution falls back to the task id because a REFUSED lifecycle
+    # message is exactly the one whose `dispatchId` may be missing — that is
+    # what it was refused for. Measured: the refusal keeps the rest of the
+    # payload, `taskId` included, so it can still be traced to its role.
+    by_task = {rec["task"]: key for key, rec in data.items()}
     actions_taken = []
 
     _tracker: list = []
@@ -814,14 +856,14 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     unattributed = []
     for event in events:
         dispatch_id = getattr(event, "dispatch_id", None)
-        key = by_dispatch.get(dispatch_id)
+        key = by_dispatch.get(dispatch_id) or by_task.get(getattr(event, "task_id", None))
         if key is None:
-            # A lifecycle message whose dispatch this package does not know:
-            # it completes nothing and would otherwise vanish. Reported, not
-            # swallowed — a `worker_done` that lost its `dispatchId` lands
-            # here.
-            if event.kind == "worker-done":
-                unattributed.append({"message": event.message_id, "dispatch": dispatch_id})
+            # Neither id maps to a spawn this package started: it completes
+            # nothing and would otherwise vanish. Reported, never swallowed.
+            unattributed.append({
+                "message": event.message_id, "kind": event.kind,
+                "dispatch": dispatch_id, "task": getattr(event, "task_id", None),
+            })
             continue
         if not key.endswith(f"/{GATE_ROLE.value}"):
             continue  # the gate governs only the planner's own dispatch
@@ -834,6 +876,10 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
                 tracker().set_gate(ticket, False)
             elif action == _gate.RETIRE_PLANNER:
                 retire(ticket, GATE_ROLE.value)
+                # `retire` re-reads and rewrites the registry; without this
+                # the `state_write` at the end of the loop would put this
+                # stale copy back and resurrect the planner.
+                rec["retired"] = True
             elif action == _gate.FLAG_MALFORMED:
                 _flag_malformed(tracker(), ticket, reason or "malformed gate report")
             actions_taken.append({"ticket": ticket, "action": action})
@@ -851,7 +897,7 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
             for m in batch.messages
         ],
         "actions": actions_taken,
-        "unattributed_worker_done": unattributed,
+        "unattributed": unattributed,
     }
 
 
@@ -883,15 +929,29 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
     body = _reports.format_approval_reply(token, note_lines)
 
-    orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
-    _linear.LinearTracker().set_gate(ticket, False)
-
+    # Recorded BEFORE the reply goes out. The reply unblocks the planner,
+    # which may run `spawn done` immediately; a registry that still said
+    # `submitted` would refuse the very report the human just authorized.
+    # `question_id` is kept until the reply lands, so a failed reply can be
+    # retried instead of stranding the planner in its `ask`.
     rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
     rec["last_event_at"] = _now()
+    data[key] = rec
+    state_write(data)
+
+    orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
     rec.pop("question_id", None)
     data[key] = rec
     state_write(data)
-    return {"ticket": ticket, "decision": token}
+
+    # The label is cosmetic next to the verdict; losing Linear must not make
+    # a delivered verdict look like a failure.
+    label = "cleared"
+    try:
+        _linear.LinearTracker().set_gate(ticket, False)
+    except Exception as exc:  # noqa: BLE001 - any tracker failure, reported not raised
+        label = f"NOT cleared ({exc}); clear the human-gate label by hand"
+    return {"ticket": ticket, "decision": token, "label": label}
 
 
 # --- the role's own two verbs ---------------------------------------------
@@ -980,7 +1040,15 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
                 f"connectionLost={result.get('connectionLost')}); question {message_id} is pending"
             )
 
-    parsed = _reports.parse_approval_reply(str(answer))
+    try:
+        parsed = _reports.parse_approval_reply(str(answer))
+    except _reports.MalformedReport as exc:
+        raise SystemExit(
+            f"the verdict on question {message_id} does not follow the approval format "
+            f"({exc}). It was answered by hand instead of by `spawn verdict`. Do NOT "
+            f"submit again — that files a second question and costs another verdict; "
+            f"escalate and ask for the verdict to be re-sent. Raw answer:\n{answer}"
+        )
     return {
         "ticket": ticket,
         "question_id": message_id,
@@ -1011,11 +1079,13 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
                 f"the plan for {ticket} is not approved (gate state {state!r}); a planner's "
                 f"worker_done is only valid after APPROVED, and you get exactly one"
             )
-        report = _reports.parse_planner_done(body)  # loud, before the shot is spent
+        _reports.parse_planner_done(body)  # loud, before the shot is spent
         rounds = int(rec.get("approval_rounds", 1)) or 1
-        # The body is rewritten from the record: `## Approval` states what the
-        # gate counted, not what the planner remembers.
-        body = _reports.format_planner_done(report.plan_pointer, rounds, report.deviations)
+        # Only `## Approval` is rewritten, and only to state what the gate
+        # counted. Everything else in the body is the planner's and is passed
+        # through untouched — a report may carry sections this package does
+        # not know about, and there is no second worker_done to resend them.
+        body = _reports.set_approval_rounds(body, rounds)
         extra = {"planApproved": True, "approvalRounds": rounds}
 
     argv = [

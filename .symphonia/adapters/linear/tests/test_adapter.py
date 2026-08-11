@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from adapters.attention import Attention, AttentionCode
 from adapters.linear.adapter import LinearTracker, PatchError, _apply_ops
-from adapters.linear.client import LinearError
+from adapters.linear.client import LinearClient, LinearError
 from adapters.tracker_adapter import (
     Artifact,
     BodyOp,
@@ -383,6 +383,48 @@ class TestCommunication(AdapterTest):
         art = Artifact(id="a-1", title="D", url="https://linear.app/x/document/nope-xyz")
         with self.assertRaises(LinearError):
             self.tracker.read_artifact(art)
+
+
+
+
+class TestApiKeyComesFromTheEnvironmentOrAFile(unittest.TestCase):
+    """The key is read from the environment; a `.env` only fills the gap. The
+    wiring is here, not just in `adapters/env.py`: without it a machine with a
+    perfectly good `.env` still cannot build a Brief."""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        self.os = os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.previous = os.environ.pop("LINEAR_API_KEY", None)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("LINEAR_API_KEY", self.previous)
+            if self.previous is not None else None
+        )
+        self.addCleanup(os.environ.pop, "SYMPHONIA_ENV", None)
+
+    def env_file(self, text: str) -> str:
+        path = Path(self.tmp.name) / ".env"
+        path.write_text(text)
+        return str(path)
+
+    def test_a_dotenv_supplies_a_missing_key(self):
+        self.os.environ["SYMPHONIA_ENV"] = self.env_file('LINEAR_API_KEY="lin_api_file"\n')
+        self.assertEqual(LinearClient().api_key, "lin_api_file")
+
+    def test_the_environment_still_wins(self):
+        self.os.environ["SYMPHONIA_ENV"] = self.env_file("LINEAR_API_KEY=lin_api_file\n")
+        self.os.environ["LINEAR_API_KEY"] = "lin_api_shell"
+        self.assertEqual(LinearClient().api_key, "lin_api_shell")
+
+    def test_with_neither_the_error_says_where_to_put_it(self):
+        self.os.environ["SYMPHONIA_ENV"] = str(Path(self.tmp.name) / "absent.env")
+        with self.assertRaises(LinearError) as ctx:
+            LinearClient()
+        self.assertIn(".symphonia/.env", str(ctx.exception))
 
 
 if __name__ == "__main__":

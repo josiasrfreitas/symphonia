@@ -85,11 +85,16 @@ def transition(
         if event.message_id == last_question_id:
             # The same submission, replayed by an unacked Delivery.
             return Transition(state, ())
-        if state in (SUBMITTED, RETIRED):
-            # SUBMITTED: a second, distinct question before any verdict —
-            # ignored, the planner is still waiting on the first one.
-            # RETIRED: a dead planner cannot reopen the gate.
-            return Transition(state, ())
+        if state == RETIRED:
+            return Transition(state, ())  # a dead planner cannot reopen the gate
+        if state == SUBMITTED:
+            # A second, distinct question before any verdict: the planner
+            # abandoned the first `ask` (its `submit` died, or timed out past
+            # `--max-wait-ms`) and is now blocked on this one. The label is
+            # already on and no new round has been decided, so nothing to do
+            # — but the pending question id must follow the planner, or the
+            # verdict is replied into a thread nobody is listening to.
+            return Transition(state, (), question_id=event.message_id)
         return Transition(SUBMITTED, (LABEL_ON,), question_id=event.message_id)
 
     if kind == "worker-done":

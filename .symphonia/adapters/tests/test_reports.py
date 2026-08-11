@@ -23,7 +23,7 @@ from adapters.reports import (
     is_plan_submission,
     parse_approval_reply,
     parse_plan_submission,
-    format_planner_done,
+    set_approval_rounds,
     parse_planner_done,
 )
 
@@ -85,15 +85,31 @@ class TestPlannerDoneGolden(unittest.TestCase):
         self.assertFalse(hasattr(report, "plan_approved"))
         self.assertFalse(hasattr(report, "approval_rounds"))
 
-    def test_round_trips_through_the_formatter(self):
-        written = format_planner_done("GRE-181 — comment abc", 2, ["escopo ampliado"])
-        report = parse_planner_done(written)
-        self.assertEqual(report.plan_pointer, "GRE-181 — comment abc")
-        self.assertEqual(report.deviations, ("escopo ampliado",))
+    def test_the_round_count_is_rewritten_in_place(self):
+        written = set_approval_rounds(_example("md io:example-done"), 2)
         self.assertIn("2 rodadas.", written)
+        report = parse_planner_done(written)
+        self.assertIn("85dfe356-d077-436c-895c-ffc8f4bf1264", report.plan_pointer)
 
     def test_one_round_is_singular(self):
-        self.assertIn("1 rodada.", format_planner_done("p", 1))
+        self.assertIn("1 rodada.", set_approval_rounds(_example("md io:example-done"), 1))
+
+    def test_sections_the_package_does_not_know_survive(self):
+        """A dispatch grants one worker_done, so anything dropped here can
+        never be sent again — only `## Approval` may be touched."""
+
+        body = (
+            "## Plan\nGRE-1 — p\n\n## Approval\n9 rodadas.\n\n"
+            "## Deviations\nNone.\n\n## Risks\n- o retry pode duplicar\n"
+        )
+        written = set_approval_rounds(body, 2)
+        self.assertIn("## Risks\n- o retry pode duplicar", written)
+        self.assertIn("2 rodadas.", written)
+        self.assertNotIn("9 rodadas.", written)
+
+    def test_a_body_without_the_section_is_refused(self):
+        with self.assertRaises(MalformedReport):
+            set_approval_rounds("## Plan\np\n\n## Deviations\nNone.\n", 1)
 
 
 class TestIsPlanSubmission(unittest.TestCase):

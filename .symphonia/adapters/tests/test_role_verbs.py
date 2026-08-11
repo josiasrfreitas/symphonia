@@ -185,11 +185,31 @@ class TestDone(RoleVerbCase):
         body = self.argv_of()[self.argv_of().index("--body") + 1]
         self.assertIn("3 rodadas.", body)
 
+    def test_sections_the_package_does_not_know_are_passed_through(self):
+        """Only `## Approval` is the gate's to rewrite. Anything else the
+        planner wrote has to reach the ticket — there is no second
+        worker_done to send it in."""
+
+        body = REPORT.rstrip() + "\n\n## Risks\n- o retry pode duplicar\n"
+        self.spawn.done("GRE-1", self.body_file(body), outcome="succeeded", files_modified="")
+        sent = self.argv_of()[self.argv_of().index("--body") + 1]
+        self.assertIn("## Risks\n- o retry pode duplicar", sent)
+
     def test_a_body_that_does_not_parse_sends_nothing(self):
         broken = "## Plan\npointer\n\n## Deviations\nNone.\n"  # no Approval
         with self.assertRaises(Exception):
             self.spawn.done("GRE-1", self.body_file(broken), outcome="succeeded", files_modified="")
         self.assertEqual(self.calls, [], "the one allowed worker_done must not be spent")
+
+    def test_a_body_missing_a_section_the_rewriter_ignores_sends_nothing(self):
+        """`set_approval_rounds` only needs `## Approval`, so a body missing
+        `## Deviations` would sail past it — the parse is what catches it, and
+        it has to run before the one allowed worker_done is spent."""
+
+        half = "## Plan\nGRE-1 — c\n\n## Approval\n1 rodada.\n"
+        with self.assertRaises(Exception):
+            self.spawn.done("GRE-1", self.body_file(half), outcome="succeeded", files_modified="")
+        self.assertEqual(self.calls, [])
 
     def test_an_unknown_outcome_sends_nothing(self):
         with self.assertRaises(SystemExit):
@@ -248,6 +268,19 @@ class TestSubmit(RoleVerbCase):
             self.spawn.submit("GRE-1", self.body_file(SUBMISSION), max_wait_ms=1000)
         self.assertIn("q-1", str(ctx.exception))
         self.assertEqual(len(self.calls), 1)
+
+    def test_a_verdict_that_does_not_parse_is_a_readable_error(self):
+        """Someone answering by hand instead of through `spawn verdict` must
+        not produce a traceback, and must not send the planner back to
+        submit — that files a second question and costs another verdict."""
+
+        self.answers = [{"answer": "LGTM, go", "messageId": "q-1",
+                         "timedOut": False, "timeoutMs": 1000}]
+        with self.assertRaises(SystemExit) as ctx:
+            self.spawn.submit("GRE-1", self.body_file(SUBMISSION), max_wait_ms=60000)
+        message = str(ctx.exception)
+        self.assertIn("Do NOT submit again", message)
+        self.assertIn("LGTM, go", message)
 
     def test_a_malformed_submission_asks_nothing(self):
         broken = "## Plan\nGRE-1 — pointer\n\n## Changes\nNone.\n"  # no Decisions
