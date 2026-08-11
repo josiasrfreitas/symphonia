@@ -52,6 +52,7 @@ from adapters import reports as _reports
 from adapters import runtime_adapter as _contract
 from adapters.linear import adapter as _linear
 from adapters.linear import client as _linear_client
+from adapters.orca import adapter as _cli
 from adapters.orca import events as _events
 from adapters.orca import launcher as _launcher
 import setup_worktree as _setup_worktree
@@ -128,6 +129,12 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
     """One orca call, envelope unwrapped, failures loud. The CLI wraps every
     --json response in {id, ok, result, _meta}.
 
+    Delegates to `adapters.orca.adapter.unwrap_envelope` — the same
+    unwrapper `OrcaRuntimeAdapter._orca` uses (GRE-184 M1) — and turns
+    an `OrcaCliError` into the identical `SystemExit` this function has
+    always raised. Name, signature and error text are unchanged, so `wait`
+    and `verdict` (GRE-185) keep calling this without editing a line.
+
     `expect_lifecycle_ok` is for the lifecycle messages a role sends
     (`worker_done`). Measured against Orca 1.4.168: a rejected `worker_done`
     still answers `ok: true` — the refusal lives in `result.lifecycle` and in
@@ -137,24 +144,11 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
     rejection, so its absence must never be treated as failure.
     """
 
-    proc = subprocess.run(["orca", *argv, "--json"], capture_output=True, text=True)
-    if not proc.stdout.strip():
-        raise SystemExit(f"orca {' '.join(argv)} produced no output: {proc.stderr.strip()}")
-    data = json.loads(proc.stdout)
-    if isinstance(data, dict) and "ok" in data:
-        if not data.get("ok"):
-            err = data.get("error") or {}
-            raise SystemExit(f"orca {' '.join(argv)} failed: {err.get('code')}: {err.get('message')}")
-        data = data.get("result") or {}
-    if expect_lifecycle_ok:
-        lifecycle = (data or {}).get("lifecycle") or {}
-        if lifecycle.get("action") == "rejected" or proc.returncode != 0:
-            raise SystemExit(
-                f"orca {' '.join(argv[:2])} rejected: "
-                f"{lifecycle.get('code') or f'exit {proc.returncode}'}: "
-                f"{lifecycle.get('reason') or proc.stderr.strip()}"
-            )
-    return data
+    result = _cli.subprocess_runner(["orca", *argv, "--json"])
+    try:
+        return _cli.unwrap_envelope(argv, result, expect_lifecycle_ok=expect_lifecycle_ok)
+    except _cli.OrcaCliError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def state_read() -> dict:

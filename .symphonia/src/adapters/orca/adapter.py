@@ -47,9 +47,33 @@ from ..runtime_adapter import (
 from .events import parse_check_output
 from .launcher import LaunchPlan, TIER_MODELS, build_launch, observed_models, tier_matches
 
-Runner = Callable[[Sequence[str]], str]
-"""Runs one ``orca`` argv, returns stdout. Production uses subprocess; the
-conformance suite injects ``fake.ScriptedOrcaCli``."""
+
+@dataclass(frozen=True)
+class RunResult:
+    """One completed ``orca`` invocation, both halves the envelope
+    unwrapper needs: a rejected lifecycle message can only be told apart
+    from an accepted one by combining ``stdout`` (the envelope, which still
+    answers ``ok: true``) with ``returncode`` (GRE-184 M1 — measured in
+    ``spawn.orca`` before this adapter carried the same check)."""
+
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+Runner = Callable[[Sequence[str]], RunResult]
+"""Runs one full argv (``["orca", *args, "--json"]``), returns the
+completed result. Production uses ``subprocess_runner``; the conformance
+suite and ``spawn``'s characterization tests inject a scripted double."""
+
+
+class OrcaCliError(RuntimeError):
+    """One ``orca`` invocation failed — at the envelope layer (``ok:
+    false``), the transport layer (no stdout), or the lifecycle layer (a
+    refused ``worker_done``). ``str(exc)`` is the fully-formed message both
+    ``OrcaRuntimeAdapter._orca`` (surfaces it as-is) and ``spawn.orca``
+    (wraps it in ``SystemExit`` with no changes) show the caller — one
+    wording for both sides of the fence."""
 
 
 def _required(value: str, what: str) -> str:
@@ -62,11 +86,66 @@ def _required(value: str, what: str) -> str:
     return value
 
 
-def subprocess_runner(argv: Sequence[str]) -> str:
+def subprocess_runner(argv: Sequence[str]) -> RunResult:
+    """The production ``Runner``: one subprocess, stdout/stderr/returncode
+    all handed back. Never raises on a nonzero exit — deciding what a
+    nonzero exit or an ``ok: false`` envelope means is ``unwrap_envelope``'s
+    job, not the transport's, so the two error paths cannot disagree."""
+
     proc = subprocess.run(list(argv), capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(argv)} failed: {proc.stderr.strip()}")
-    return proc.stdout
+    return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
+
+
+def unwrap_envelope(
+    argv: Sequence[str], result: RunResult, *, expect_lifecycle_ok: bool = False
+) -> dict:
+    """The one envelope unwrapper, shared by ``OrcaRuntimeAdapter._orca``
+    and ``spawn.orca`` (GRE-184 M1 — the boundary condition with GRE-185:
+    ``spawn.orca``'s message text is exactly what this produces). The CLI
+    wraps every ``--json`` response in ``{id, ok, result, _meta}``.
+
+    ``argv`` is the bare call (no ``orca``/``--json``) — only used to name
+    the failing call in a message.
+
+    ``expect_lifecycle_ok`` is for the lifecycle messages a role sends
+    (``worker_done``). Measured against Orca 1.4.168: a rejected
+    ``worker_done`` still answers ``ok: true`` — the refusal lives in
+    ``result.lifecycle`` and in the process exit code, not in the envelope.
+    Without this flag a rejected completion reads as a success, which is
+    exactly how a planner ends up never retiring. Note the asymmetry:
+    ``lifecycle`` is present only on a rejection, so its absence must never
+    be treated as failure.
+    """
+
+    if not result.stdout.strip():
+        raise OrcaCliError(f"orca {' '.join(argv)} produced no output: {result.stderr.strip()}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise OrcaCliError(
+            f"orca {' '.join(argv)} exited {result.returncode} with unparseable output: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        ) from exc
+    if isinstance(data, dict) and "ok" in data:
+        if not data.get("ok"):
+            err = data.get("error")
+            if not isinstance(err, dict):
+                err = {"message": str(err)}
+            raise OrcaCliError(
+                f"orca {' '.join(argv)} failed: {err.get('code', 'unknown')}: {err.get('message', '')}"
+            )
+        data = data.get("result")
+    if expect_lifecycle_ok:
+        lifecycle = (data or {}).get("lifecycle") or {}
+        if lifecycle.get("action") == "rejected" or result.returncode != 0:
+            raise OrcaCliError(
+                f"orca {' '.join(argv[:2])} rejected: "
+                f"{lifecycle.get('code') or f'exit {result.returncode}'}: "
+                f"{lifecycle.get('reason') or result.stderr.strip()}"
+            )
+    if data is None:
+        return {}
+    return data if isinstance(data, dict) else {"items": data}
 
 
 # The (tier -> launch command) table GRE-161 put behind this boundary now
@@ -125,6 +204,18 @@ class OrcaRuntimeAdapter:
     run_id: str
     runner: Runner = subprocess_runner
     repo: str = ""
+    bind_control: bool = True
+    """Whether `_ensure_control` actually runs `run-current`/`run-use`
+    before each call. Defaults True — the coordinator loop and the
+    conformance suite construct with this default, so control-lost
+    detection is exercised there. GRE-184 M4 composes `spawn.py`'s verbs
+    over this adapter with `bind_control=False`: `spawn.py` never emitted
+    `run-current` and the characterization tests freeze that argv byte for
+    byte, so the coordinator-binding check cannot be introduced on that
+    path without breaking M0's frozen argv. Consequence, spelled out:
+    with `bind_control=False`, production spawn/status/retire never
+    exercises control-lost detection — the conformance suite (which
+    always binds) is the only place that check runs."""
 
     _contexts: dict[str, _ContextRecord] = field(default_factory=dict)
     _attempts: dict[str, _AttemptRecord] = field(default_factory=dict)
@@ -137,25 +228,9 @@ class OrcaRuntimeAdapter:
     def capabilities(self) -> RuntimeCapabilities:
         return RuntimeCapabilities(tier_verification=False, cooperative_completion=True)
 
-    def _orca(self, *argv: str) -> dict:
-        out = self.runner(["orca", *argv, "--json"])
-        data = json.loads(out) if out.strip() else {}
-        # The orca CLI wraps every --json response in an envelope
-        # {id, ok, result, _meta}; the payload lives under "result"
-        # (proved against the real CLI in the GRE-175 ad hoc test).
-        if isinstance(data, dict) and "ok" in data:
-            if not data.get("ok"):
-                error = data.get("error")
-                if not isinstance(error, dict):
-                    error = {"message": str(error)}
-                raise RuntimeError(
-                    f"orca {' '.join(argv)} failed: "
-                    f"{error.get('code', 'unknown')}: {error.get('message', '')}"
-                )
-            data = data.get("result")
-        if data is None:
-            return {}
-        return data if isinstance(data, dict) else {"items": data}
+    def _orca(self, *argv: str, expect_lifecycle_ok: bool = False) -> dict:
+        result = self.runner(["orca", *argv, "--json"])
+        return unwrap_envelope(argv, result, expect_lifecycle_ok=expect_lifecycle_ok)
 
     def _last_open_attempt(self) -> AttemptRef | None:
         for rec in reversed(list(self._attempts.values())):
@@ -166,8 +241,11 @@ class OrcaRuntimeAdapter:
     def _ensure_control(self) -> None:
         """Every operation re-establishes the coordinator binding first. A
         reclaim is reported, never silent — attributed to the most recent
-        open attempt, the work most at risk while control was lost."""
+        open attempt, the work most at risk while control was lost. A no-op
+        when `bind_control` is False (see that field's docstring)."""
 
+        if not self.bind_control:
+            return
         current = self._orca("orchestration", "run-current")
         run = current.get("run") if isinstance(current.get("run"), dict) else {}
         holder = str(run.get("terminal", current.get("terminal", current.get("coordinator", ""))))
@@ -350,9 +428,14 @@ class OrcaRuntimeAdapter:
 
     def drain(self, kinds: list[EventKind]) -> EventBatch:
         self._ensure_control()
-        batch = parse_check_output(
-            self.runner(["orca", "orchestration", "check", "--terminal", self.coordinator, "--peek", "--json"])
-        )
+        # `_orca` already unwraps the envelope (a failed `check` now raises
+        # `OrcaCliError` instead of going through here as "no events" —
+        # GRE-184 review round 1, finding 2); `parse_check_output` expects
+        # the raw JSON text of `check --peek --json`, so the unwrapped
+        # result is fed back in — the same trick `spawn.wait` uses to reuse
+        # this one parser for both call sites.
+        result = self._orca("orchestration", "check", "--terminal", self.coordinator, "--peek")
+        batch = parse_check_output(json.dumps(result))
         # Only local events that made it into this batch may be consumed by
         # the matching ack; a control-lost filtered out by `kinds` must
         # survive until a drain actually delivers it (review M1).
