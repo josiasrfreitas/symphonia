@@ -148,9 +148,13 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
     rejection, so its absence must never be treated as failure.
     """
 
-    result = _cli.subprocess_runner(["orca", *argv, "--json"])
+    # GRE-184 M5: the transport is `_adapter()._orca`, not a direct
+    # `subprocess_runner` call — the last piece of the seam. `wait`/
+    # `verdict`/`submit`/`done` (GRE-185's boundary) still call this
+    # function by the same name, signature, and error text; nothing below
+    # this line changed.
     try:
-        return _cli.unwrap_envelope(argv, result, expect_lifecycle_ok=expect_lifecycle_ok)
+        return _adapter()._orca(*argv, expect_lifecycle_ok=expect_lifecycle_ok)
     except _cli.OrcaCliError as exc:
         raise SystemExit(str(exc)) from exc
 
