@@ -1,6 +1,6 @@
 # The spawn interface
 
-**TLDR: `spawn` is the only way a role starts, `spawn wait` is the only way you hear back, and `spawn submit`/`spawn done` are the only way a role answers. Between those two, the Orchestrator makes no choice about models, permissions, worktrees or launch paths — they are all decided in `adapters/orca/launcher.py`. If you are about to type a raw `orca terminal create` or `orca orchestration worker-start`, stop: that is the failure this interface exists to prevent.**
+**TLDR: `spawn` is the only way a role starts, `spawn wait` is the only way you hear back, and `spawn submit`/`spawn done` are the only way a role answers. Between those two, the Orchestrator makes no choice about models, permissions, worktrees or launch paths — they are all decided in `src/adapters/orca/launcher.py`. If you are about to type a raw `orca terminal create` or `orca orchestration worker-start`, stop: that is the failure this interface exists to prevent.**
 
 ## The Orchestrator's commands
 
@@ -127,12 +127,12 @@ ownership to anyone. Every transition goes through you.
 
 | File | Decides |
 |---|---|
-| `adapters/orca/launcher.py` | Tier → model, effort, permission flags, read-only enforcement, provider grammar |
-| `bin/spawn` | The verbs, worktree policy, phase labels, what a role is told at dispatch, the Execution Brief (`build_brief`), the plan gate wiring (`wait`/`verdict`) |
-| `adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
-| `adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
+| `src/adapters/orca/launcher.py` | Tier → model, effort, permission flags, read-only enforcement, provider grammar |
+| `src/spawn.py` (behind the `bin/spawn` entrypoint) | The verbs, worktree policy, phase labels, what a role is told at dispatch, the Execution Brief (`build_brief`), the plan gate wiring (`wait`/`verdict`) |
+| `src/adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
+| `src/adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
 | `roles/*.md` | What each role does and never does, and (for the planner) the I/O shapes it reads and writes |
-| `bin/setup-worktree` | What a fresh checkout needs and git does not bring: the env files |
+| `src/setup_worktree.py` (behind the `bin/setup-worktree` entrypoint) | What a fresh checkout needs and git does not bring: the env files |
 | `config.json` | The calibration numbers |
 
 Adding a provider is a `PROVIDERS` entry in `launcher.py`. Changing a model is

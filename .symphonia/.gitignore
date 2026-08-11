@@ -1,6 +1,6 @@
-# Left over from installs before the registry moved out of the checkout.
-# The live one is ~/.symphonia/runtime/spawns.json (SYMPHONIA_RUNTIME
+# The live registry is ~/.symphonia/runtime/spawns.json (SYMPHONIA_RUNTIME
 # overrides it) — a role reads it from the ticket's worktree, which is a
-# different copy of this repository, so it cannot live in here.
+# different copy of this repository, so it cannot live in here. Kept
+# ignored in case an old checkout still writes one locally.
 .runtime/
 __pycache__/
