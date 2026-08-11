@@ -352,7 +352,14 @@ class OrcaRuntimeAdapter:
         retroported from ``spawn.find_worktree``. Matched on the path, not
         the display name: composed verbs rewrite the display name with the
         current phase, so a ``name:`` lookup would stop finding the ticket
-        the moment a phase change lands."""
+        the moment a phase change lands.
+
+        Known gap (GRE-187): the match is ``Path(path).name == ticket_key``,
+        so it only finds a worktree named exactly after the ticket. A second
+        checkout of the same ticket lands at a path like ``gre-184-2``, and
+        this lookup goes back to returning None for a ticket that in fact
+        already has a workspace — this has happened for real. The fix
+        belongs to GRE-187, not here."""
 
         self._ensure_control()
         name = ticket_key.strip().lower()
