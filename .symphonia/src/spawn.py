@@ -459,7 +459,11 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     # read and formatted here, never left for the role to go fetch. Every
     # other role still gets the `work_spec()` pointer until its own cycle
     # brings it a Brief (legacy, migrated one role at a time).
-    spec = build_brief(role, ticket, workspace.path) if role is RoleName.PLANNER else work_spec(role, ticket, workspace.path)
+    spec = (
+        build_brief(role, ticket, workspace.path)
+        if role is RoleName.PLANNER
+        else work_spec(role, ticket, workspace.path)
+    )
     try:
         attempt = adapter.dispatch(launch.context, spec)
     except _cli.OrcaCliError as exc:
