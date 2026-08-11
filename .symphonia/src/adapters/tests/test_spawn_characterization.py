@@ -170,11 +170,11 @@ class CharacterizationCase(unittest.TestCase):
 
 
 PLAN_COMMAND_PLANNER = (
-    "claude --model fable --effort high --permission-mode bypassPermissions "
+    "claude --model fable --effort medium --permission-mode bypassPermissions "
     f"--session-id {FIXED_UUID}"
 )
 PLAN_COMMAND_IMPLEMENTER = (
-    "claude --model sonnet --effort medium --permission-mode bypassPermissions "
+    "claude --model sonnet --effort high --permission-mode bypassPermissions "
     f"--session-id {FIXED_UUID}"
 )
 
