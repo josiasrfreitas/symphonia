@@ -552,8 +552,12 @@ class OrcaRuntimeAdapter:
         reconstructed by hand: terminal, task, dispatch, capability, tier,
         access, session id, transcript, launch command."""
 
-        attempt_record = self._attempts[attempt.attempt_id]
-        context_record = self._contexts[attempt.context.id]
+        attempt_record = self._attempts.get(attempt.attempt_id)
+        if attempt_record is None:
+            raise RuntimeError(f"attempt {attempt.attempt_id} is gone; snapshot has nothing to read")
+        context_record = self._contexts.get(attempt.context.id)
+        if context_record is None:
+            raise RuntimeError(f"context {attempt.context.id} is gone; snapshot has nothing to read")
         plan = context_record.plan
         return {
             "terminal": context_record.terminal,
