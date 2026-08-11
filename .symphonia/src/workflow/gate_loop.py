@@ -196,7 +196,7 @@ def run(
             if event.kind == "worker-done" and not rec.get("retired"):
                 teardown(ticket, rec["role"])
                 rec["retired"] = True
-                actions_taken.append({"ticket": ticket, "action": "retire_role"})
+                actions_taken.append({"ticket": ticket, "action": _gate.RETIRE_ROLE})
             continue
         for action, reason in apply_gate_event(rec, event, raw_by_id):
             if action == _gate.LABEL_ON:

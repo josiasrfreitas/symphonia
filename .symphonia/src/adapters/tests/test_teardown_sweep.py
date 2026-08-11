@@ -16,8 +16,11 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PACKAGE = Path(__file__).resolve().parents[2]  # .symphonia/src
 sys.path.insert(0, str(PACKAGE))
@@ -177,7 +180,7 @@ class SweepFindsOrphans(SpawnRuntimeCase):
         self.spawn.state_write({
             "GRE-1/implementer": _record(wt, ticket="GRE-1", role="implementer", terminal="term-dead"),
         })
-        self.adapter.terminals = set()
+        self.adapter.terminals = {"term-unrelated-live"}
 
         out = self.spawn.sweep(None)
 
@@ -219,7 +222,7 @@ class SweepFindsOrphans(SpawnRuntimeCase):
             "GRE-4/implementer": _record(wt4, ticket="GRE-4", role="implementer", terminal="term-dead-4"),
             "GRE-5/implementer": _record(wt5, ticket="GRE-5", role="implementer", terminal="term-dead-5"),
         })
-        self.adapter.terminals = set()
+        self.adapter.terminals = {"term-unrelated-live"}
 
         out = self.spawn.sweep("GRE-4")
 
@@ -232,12 +235,139 @@ class SweepFindsOrphans(SpawnRuntimeCase):
         self.spawn.state_write({
             "GRE-6/implementer": _record(wt, ticket="GRE-6", role="implementer", terminal="term-dead", retired=True),
         })
-        self.adapter.terminals = set()
+        self.adapter.terminals = {"term-unrelated-live"}
 
         out = self.spawn.sweep(None)
 
         self.assertEqual(out, [])
         self.assertEqual([c for c in self.adapter.calls if c[0] != "list_terminals"], [])
+
+
+class SweepRefusesAnEmptyTerminalList(SpawnRuntimeCase):
+    """An empty `list_terminals()` response is indistinguishable, from
+    inside the loop, from every role having died at once — the far more
+    likely explanation is a degraded CLI. GRE-189 F4: refuse rather than
+    tear down everything unretired on the strength of one bad response."""
+
+    def test_refuses_and_touches_nothing(self):
+        wt = self.worktree("gre-7")
+        self.spawn.state_write({
+            "GRE-7/implementer": _record(wt, ticket="GRE-7", role="implementer", terminal="term-live"),
+        })
+        self.adapter.terminals = set()
+
+        with self.assertRaises(SystemExit) as caught:
+            self.spawn.sweep(None)
+
+        self.assertIn("list_terminals()", str(caught.exception))
+        self.assertEqual([c for c in self.adapter.calls if c[0] != "list_terminals"], [])
+        self.assertNotIn("retired", self.spawn.state_read()["GRE-7/implementer"])
+
+
+class SweepLocksTheRegistry(SpawnRuntimeCase):
+    """GRE-189 F1 regression. Before this fix `sweep` read and wrote the
+    registry with no lock at all, so a concurrent `state_lock()` holder
+    (`wait`/`verdict`, sitting on a stale snapshot) could write back over a
+    `teardown` `sweep` had already run — after that teardown's effects
+    (`close_terminal`, `settle_task`) were already irreversible. Reproduced
+    by the standards reviewer with `repro_lock.py`; this pins the fix: a
+    concurrent lock holder must block `sweep`, not race it."""
+
+    def test_sweep_blocks_on_a_held_lock_and_does_not_lose_either_write(self):
+        wt = self.worktree("gre-7")
+        self.spawn.state_write({
+            "GRE-7/implementer": _record(wt, ticket="GRE-7", role="implementer", terminal="term-dead"),
+        })
+        self.adapter.terminals = {"term-unrelated-live"}
+
+        HOLD_SECONDS = 0.3
+        acquired = threading.Event()
+
+        def hold_the_lock():
+            with self.spawn.state_lock():
+                acquired.set()
+                data = self.spawn.state_read()
+                # Stands in for a concurrent `verdict` write elsewhere in
+                # the registry — must survive `sweep`'s write, not be
+                # clobbered by it.
+                data["GRE-7/implementer"]["gate_state"] = "verdict-approved"
+                time.sleep(HOLD_SECONDS)
+                self.spawn.state_write(data)
+
+        holder = threading.Thread(target=hold_the_lock)
+        holder.start()
+        self.assertTrue(acquired.wait(timeout=2), "lock holder never acquired state_lock()")
+
+        started = time.monotonic()
+        out = self.spawn.sweep(None)
+        elapsed = time.monotonic() - started
+        holder.join()
+
+        self.assertGreaterEqual(
+            elapsed, HOLD_SECONDS,
+            "sweep did not block on the concurrently-held state_lock()",
+        )
+        self.assertEqual(len(out), 1)
+        self.assertFalse(out[0]["live"])
+        rec = self.spawn.state_read()["GRE-7/implementer"]
+        self.assertTrue(rec["retired"], "sweep's teardown write was lost")
+        self.assertEqual(
+            rec["gate_state"], "verdict-approved",
+            "the lock holder's write was lost",
+        )
+
+
+class TeardownReportsWhenTheRecordVanished(SpawnRuntimeCase):
+    """GRE-189 F7. `_run_teardown` guards the `retired` write with
+    `if key in data`, but used to report success regardless. Only reachable
+    under the same concurrent-write conditions as F1, so this drives it
+    directly by deleting the record between the two reads `_run_teardown`
+    does."""
+
+    def test_effects_say_the_record_vanished_instead_of_claiming_success(self):
+        self.spawn.state_write({"GRE-9/implementer": _record(self.worktree("gre-9"))})
+        real_state_read = self.spawn.state_read
+        calls = []
+
+        def state_read_then_delete():
+            data = real_state_read()
+            calls.append(data)
+            # 1st read: `teardown`'s own idempotence check. 2nd: the guard
+            # read at the top of `_run_teardown`. 3rd: the read this test
+            # targets — the one right before the guarded `retired` write.
+            if len(calls) == 3:
+                data = dict(data)
+                del data["GRE-9/implementer"]
+            return data
+
+        with mock.patch.object(self.spawn, "state_read", side_effect=state_read_then_delete):
+            result = self.spawn.teardown("GRE-9", "implementer")
+
+        self.assertIn("registry record vanished before the retired write", result["effects"])
+
+
+class RetireRerunsEffectsOnADeadRole(SpawnRuntimeCase):
+    """GRE-189: `retire`'s non-idempotence is a deliberate product choice —
+    a human retiring an already-dead role a second time is asking "try
+    again, the world may have changed", not expecting a silent no-op. That
+    intent used to be pinned only by accident, as a side effect of
+    `test_retire_self_guard`'s `subTest` reusing state across iterations.
+    This test names the intent directly, independent of that guard."""
+
+    def test_retiring_an_already_retired_record_reruns_every_effect(self):
+        self.spawn.state_write({
+            "GRE-9/implementer": _record(self.worktree("gre-9"), retired=True),
+        })
+
+        with mock.patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": ""}):
+            result = self.spawn.retire("GRE-9", "implementer")
+
+        self.assertEqual(
+            [c[0] for c in self.adapter.calls],
+            ["stop_worker", "close_terminal", "dispatch_status", "settle_task"],
+        )
+        self.assertEqual(result["retired"], "GRE-9/implementer")
+        self.assertTrue(self.spawn.state_read()["GRE-9/implementer"]["retired"])
 
 
 if __name__ == "__main__":

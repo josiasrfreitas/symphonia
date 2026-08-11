@@ -49,6 +49,7 @@ RETIRED = "retired"
 LABEL_ON = "label_on"
 LABEL_OFF = "label_off"
 RETIRE_PLANNER = "retire_planner"
+RETIRE_ROLE = "retire_role"
 FLAG_MALFORMED = "flag_malformed"
 
 

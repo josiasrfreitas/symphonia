@@ -93,9 +93,9 @@ asking a second time."""
 # a different file, so a role could not look up its own task id, dispatch id
 # or capability. Override with SYMPHONIA_RUNTIME (the tests do).
 #
-# Writers: `spawn`, `wait`, `verdict`, `retire` — all Orchestrator-side. The
-# role-side verbs (`submit`, `done`) only ever read, so two processes in two
-# checkouts never race for this file.
+# Writers: `spawn`, `wait`, `verdict`, `retire`, `teardown`, `sweep` — all
+# Orchestrator-side. The role-side verbs (`submit`, `done`) only ever read,
+# so two processes in two checkouts never race for this file.
 #
 # The record shape below (`ticket`, `dispatch`, `task`, `gate_state`, ...) is
 # internal to this package, not a public contract: nothing outside `spawn.py`
@@ -200,11 +200,12 @@ def state_lock() -> Iterator[None]:
     flock, not a POSIX record lock: two separate `os.open()` calls on
     `STATE_LOCK` conflict even from the SAME process, because a flock is
     held by the open file description, not the process. That means this
-    lock does not nest — `retire()` must never call `state_lock()` while it
-    is invoked from inside `wait`'s critical section (which it is, via
-    `workflow.gate_loop.run`'s `retire` action): a second acquisition here
-    would deadlock the one process holding the first. `retire()` stays
-    unlocked; only `wait` and `verdict` acquire this.
+    lock does not nest — `teardown()` must never call `state_lock()` while
+    it is invoked from inside `wait`'s critical section (which it is, via
+    `workflow.gate_loop.run`'s `retire_planner`/`retire_role` actions): a
+    second acquisition here would deadlock the one process holding the
+    first. `teardown()` stays unlocked; `wait`, `verdict`, and `sweep`
+    acquire this.
     """
 
     STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -279,9 +280,6 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
         )
     lines.append(
         "5. Then send worker_done exactly once with --outcome succeeded or failed, and stop."
-    )
-    lines.append(
-        "6. Report short: no preamble, no recap of what the Orchestrator already knows."
     )
     return "\n".join(lines)
 
@@ -548,7 +546,9 @@ def retire(ticket: str, role_value: str) -> dict:
     role in the ticket needs it. The Orchestrator's own verb, typed by hand
     or by a script — not idempotent, unlike `teardown`: a human retiring an
     already-dead role a second time still deserves the same effects and the
-    same answer, not a silent no-op (`test_retire_self_guard` pins this).
+    same answer, not a silent no-op. This is a deliberate choice, pinned by
+    `RetireRerunsEffectsOnADeadRole` in `test_teardown_sweep.py` —
+    `test_retire_self_guard` only pins the self-guard above, not this.
 
     `worker-stop` is tried but not relied on: it only knows dispatches that
     `worker-start` created, and this package launches through `terminal
@@ -648,6 +648,8 @@ def _run_teardown(ticket: str, role_value: str) -> dict:
     if key in data:
         data[key]["retired"] = True
         state_write(data)
+    else:
+        effects.append("registry record vanished before the retired write")
     return {
         "retired": key,
         "dispatch_was": dispatch_status,
@@ -668,28 +670,49 @@ def sweep(ticket: str | None) -> list[dict]:
     Already-retired records are not this verb's business; `teardown`'s own
     idempotence would no-op them anyway, but skipping them here keeps a
     `sweep` report about the records that still needed a decision.
+
+    The whole read-decide-teardown loop runs under `state_lock()`: this is
+    the only writer in the package that used to do its read-modify-write
+    unlocked, which let a concurrent `wait`/`verdict` (holding the lock
+    across its own snapshot) silently revert a `teardown` this loop had
+    already run — after that teardown's effects (`close_terminal`,
+    `settle_task`) were already irreversible. `teardown` itself stays
+    unlocked, so this does not nest.
+
+    A `list_terminals()` that comes back empty is refused rather than acted
+    on: every unretired record would read as "terminal not live" and this
+    loop would tear down every live role in the registry on the strength of
+    one degraded CLI response. No retry, no heuristic — just refuse and say
+    why; the caller can run `sweep` again once the CLI is answering.
     """
 
     adapter = _adapter()
     live_terminals = adapter.list_terminals()
+    if not live_terminals:
+        raise SystemExit(
+            "list_terminals() returned no terminals at all; refusing to treat "
+            "every unretired record as an orphan. Retry once the CLI is "
+            "responding."
+        )
     out = []
-    for key, rec in sorted(state_read().items()):
-        if ticket and not key.startswith(ticket.upper() + "/"):
-            continue
-        if rec.get("retired"):
-            continue
-        reasons = []
-        if rec["terminal"] not in live_terminals:
-            reasons.append("terminal not live")
-        if not Path(rec["worktree"]).exists():
-            reasons.append("worktree missing")
-        if not reasons:
-            out.append({"key": key, "live": True})
-            continue
-        out.append({
-            "key": key, "live": False, "reason": reasons,
-            "teardown": teardown(rec["ticket"], rec["role"]),
-        })
+    with state_lock():
+        for key, rec in sorted(state_read().items()):
+            if ticket and not key.startswith(ticket.upper() + "/"):
+                continue
+            if rec.get("retired"):
+                continue
+            reasons = []
+            if rec["terminal"] not in live_terminals:
+                reasons.append("terminal not live")
+            if not Path(rec["worktree"]).exists():
+                reasons.append("worktree missing")
+            if not reasons:
+                out.append({"key": key, "live": True})
+                continue
+            out.append({
+                "key": key, "live": False, "reason": reasons,
+                "teardown": teardown(rec["ticket"], rec["role"]),
+            })
     return out
 
 

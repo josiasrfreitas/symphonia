@@ -143,13 +143,13 @@ class TestNonPlannerWorkerDone(GateLoopRunCase):
         self.assertEqual(unattributed, [])
         self.assertEqual(self.teardown_calls, [("GRE-1", "implementer")])
         self.assertTrue(self.data["GRE-1/implementer"]["retired"])
-        self.assertEqual(actions, [{"ticket": "GRE-1", "action": "retire_role"}])
+        self.assertEqual(actions, [{"ticket": "GRE-1", "action": GATE_LOOP._gate.RETIRE_ROLE}])
         self.assertNotIn("retired", self.data["GRE-1/planner"], "only the reporting role's record changes")
 
     def test_fires_on_a_failed_outcome_too(self):
         actions, _ = self._run([self.implementer_done(outcome="failed")])
         self.assertEqual(self.teardown_calls, [("GRE-1", "implementer")])
-        self.assertEqual(actions, [{"ticket": "GRE-1", "action": "retire_role"}])
+        self.assertEqual(actions, [{"ticket": "GRE-1", "action": GATE_LOOP._gate.RETIRE_ROLE}])
 
     def test_a_replayed_worker_done_is_a_no_op(self):
         self._run([self.implementer_done()])
