@@ -37,6 +37,20 @@ class Access(enum.Enum):
     READ = "read"
 
 
+@dataclass(frozen=True)
+class RolePolicy:
+    """What one role is allowed to run at and touch — core vocabulary, not a
+    harness detail. ``workflow.roles.load_policies`` is the only thing that
+    reads it off disk; this is just the shape (GRE-186 S1, relocated here in
+    the same round's correction round so ``adapters/`` never has to import
+    ``workflow/`` to know it)."""
+
+    role: RoleName
+    tier: CapabilityTier
+    access: Access
+    role_file: str
+
+
 class Liveness(enum.Enum):
     """Completion is cooperative — the runtime has no reaper."""
 
@@ -80,11 +94,14 @@ class AttemptRef:
     context: ContextRef
 
 
+TierEvidenceKind = Literal["requested", "observed", "unverifiable"]
+
+
 @dataclass(frozen=True)
 class TierEvidence:
     """What is actually known about the tier a Role Context ran at."""
 
-    kind: Literal["requested", "observed", "unverifiable"]
+    kind: TierEvidenceKind
     tier: CapabilityTier | None = None
     detail: str = ""
 

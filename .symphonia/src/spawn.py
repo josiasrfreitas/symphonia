@@ -64,7 +64,7 @@ from adapters.linear import adapter as _linear
 from adapters.linear import client as _linear_client
 from adapters.orca import adapter as _cli
 from adapters.orca import events as _events
-from adapters.harnesses import claude as _launcher
+from adapters.harnesses import claude as _claude
 import setup_worktree as _setup_worktree
 from workflow import gate_loop as _gate_loop
 from workflow import roles as _roles
@@ -484,7 +484,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "ticket": ticket,
         "role": role.value,
         "tier": snap["tier"],
-        "model_requested": _launcher.TIER_MODELS[policy.tier],
+        "model_requested": _claude.TIER_MODELS[policy.tier],
         "access": snap["access"],
         "worktree": workspace.path,
         "worktree_id": workspace.id,
@@ -521,7 +521,7 @@ def status(ticket: str | None) -> list[dict]:
         except _cli.OrcaCliError:
             dispatch_status = "unknown"
         transcript = Path(rec["transcript"]) if rec.get("transcript") else None
-        models = _launcher.observed_models(transcript) if transcript else []
+        models = _claude.observed_models(transcript) if transcript else []
         out.append(
             {
                 "key": key,

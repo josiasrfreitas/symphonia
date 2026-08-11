@@ -5,9 +5,10 @@ TLDR: `build_launch` still locks the two things that are silent when they
 break — a worker launched in a mode that can stop at a permission prompt,
 and a read-only role launched somewhere it could write. `ClaudeHarness`
 wraps the same argv behind the neutral Protocol; its own tests check the
-argv it produces matches `build_launch` byte for byte, that `observe()`
-reports all three `TierEvidence` kinds, and that a harness which cannot
-enforce read-only refuses rather than silently launching with write access.
+argv it produces against the frozen `test_spawn_characterization.py` oracle,
+that `observe()` reports both `TierEvidence` kinds this harness can produce,
+and that a harness which cannot enforce read-only refuses rather than
+silently launching with write access.
 Run either way:
 
     cd .symphonia/src && python3 -m unittest adapters.harnesses.tests.test_claude
@@ -20,19 +21,25 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from adapters.harness_adapter import HarnessCapabilities, HarnessRefusal
 from adapters.harnesses.claude import (
-    DEFAULT_PROVIDER,
     PROVIDERS,
     ClaudeHarness,
+    _shell_join,
     build_launch,
     observed_models,
     tier_matches,
 )
 from adapters.runtime_adapter import Access, CapabilityTier, RoleName, WorkspaceRef
+from adapters.tests.test_spawn_characterization import (
+    FIXED_UUID,
+    PLAN_COMMAND_IMPLEMENTER,
+    PLAN_COMMAND_PLANNER,
+)
 from workflow.roles import load_policies
 
 ROLES_DIR = Path(__file__).resolve().parents[4] / "roles"
@@ -154,20 +161,27 @@ class TestClaudeHarnessPrepare(unittest.TestCase):
     unjoined (joining into a shell string is the caller's job, not the
     harness's), keyed to a session id `prepare()` mints itself."""
 
-    def test_prepare_matches_build_launch_byte_for_byte(self):
-        for role, policy in POLICIES.items():
+    def test_prepare_matches_the_frozen_argv_oracle(self):
+        """`test_spawn_characterization.py`'s `PLAN_COMMAND_PLANNER`/
+        `PLAN_COMMAND_IMPLEMENTER` are the argv literals frozen for GRE-184
+        M0 and untouchable by this ticket's own condition #6 — imported, not
+        copied, so there is exactly one oracle for what these two roles'
+        commands are, not two that could quietly diverge. `prepare()` mints
+        its own session id via this module's `uuid.uuid4`, so it is patched
+        to the oracle's `FIXED_UUID` rather than matched positionally — a
+        `--session-id` that silently dropped from the argv would then leave
+        the expected `--session-id {FIXED_UUID}` in the string and fail
+        loudly, instead of both sides losing the slot together."""
+
+        cases = {
+            RoleName.PLANNER: PLAN_COMMAND_PLANNER,
+            RoleName.IMPLEMENTER: PLAN_COMMAND_IMPLEMENTER,
+        }
+        for role, expected in cases.items():
             with self.subTest(role=role.value):
-                plan = build_launch(
-                    role, session_id="fixed", workspace=WORKSPACE.path,
-                    tier=policy.tier, access=policy.access,
-                )
-                prepared = ClaudeHarness().prepare(workspace=WORKSPACE, policy=policy)
-                # The session id `prepare()` mints is its own, not "fixed" —
-                # compare argv with that one slot substituted.
-                argv = tuple(
-                    prepared.session.id if part == "fixed" else part for part in plan.argv
-                )
-                self.assertEqual(prepared.command, argv)
+                with mock.patch("adapters.harnesses.claude.uuid.uuid4", return_value=FIXED_UUID):
+                    prepared = ClaudeHarness().prepare(workspace=WORKSPACE, policy=POLICIES[role])
+                self.assertEqual(_shell_join(list(prepared.command)), expected)
 
     def test_prepare_refuses_read_when_the_harness_cannot_enforce_it(self):
         """Condition 3 of the GRE-186 PR-A verdict: `HarnessRefusal` is
@@ -189,10 +203,14 @@ class TestClaudeHarnessPrepare(unittest.TestCase):
 
 
 class TestClaudeHarnessObserve(unittest.TestCase):
-    """The three kinds `observe()` must report (condition 4 of the GRE-186
-    PR-A verdict): no/empty transcript -> requested; the requested tier
-    answered -> observed; a different tier answered -> observed, with the
-    mismatch named in the detail."""
+    """Condition 4 of the GRE-186 PR-A verdict, satisfied with the two kinds
+    this harness can actually emit: no/empty transcript -> `requested`; the
+    requested tier answered -> `observed`; a different tier answered ->
+    `observed` too, with the mismatch named in the detail. `unverifiable` has
+    no analogue here — it names `OrcaRuntimeAdapter.verify_tier`'s
+    "no such context" branch, a lookup failure that can only happen before a
+    session exists to observe; `observe()` is handed the session directly and
+    never does that lookup, so there is nothing for a third kind to report."""
 
     def _session(self, path):
         from adapters.harness_adapter import HarnessSession

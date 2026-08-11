@@ -86,6 +86,42 @@ class TestLoadPoliciesFailsLoudly(unittest.TestCase):
             load_policies(self.dirpath)
         self.assertIn("role=", str(ctx.exception))
 
+    def test_duplicate_key_fails(self):
+        """F1: a repeated key inside the fences must not silently let the
+        last occurrence win."""
+
+        (self.dirpath / "spec-reviewer.md").write_text(
+            "---\nrole: spec-reviewer\ncapability_tier: high\naccess: read\n"
+            "access: write\n---\n\n# Spec Reviewer\n"
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            load_policies(self.dirpath)
+        self.assertIn("access", str(ctx.exception))
+        self.assertIn("spec-reviewer.md", str(ctx.exception))
+
+    def test_non_empty_line_without_colon_fails(self):
+        (self.dirpath / "spec-reviewer.md").write_text(
+            "---\nrole: spec-reviewer\ncapability_tier: high\naccess: read\n"
+            "not a key value line\n---\n\n# Spec Reviewer\n"
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            load_policies(self.dirpath)
+        self.assertIn("spec-reviewer.md", str(ctx.exception))
+
+    def test_unresolved_merge_conflict_fails_instead_of_loading_theirs(self):
+        """The real-world shape of F1: a `spec-reviewer.md` left with an
+        unresolved merge conflict must not hand `spawn` `access: write` in
+        silence — it must fail, naming the file."""
+
+        (self.dirpath / "spec-reviewer.md").write_text(
+            "---\nrole: spec-reviewer\ncapability_tier: high\n"
+            "<<<<<<< HEAD\naccess: read\n=======\naccess: write\n>>>>>>> other\n"
+            "---\n\n# Spec Reviewer\n"
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            load_policies(self.dirpath)
+        self.assertIn("spec-reviewer.md", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

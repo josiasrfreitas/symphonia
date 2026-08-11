@@ -20,7 +20,7 @@ READMEs are the one exception: documentation of the folder they sit in, not cont
 |---|---|
 | `config.json` | The calibration numbers guardrail scripts read, plus (under the `"linear"` key) the Linear Tracker Adapter's provider identifiers. Nothing else configures the workflow. |
 | `DEPENDENCIES.md` | Third-party skills the workflow depends on (grilling, code-review, tdd). Declared, not bundled. |
-| `roles/` | Role templates (Orchestrator, Planner, Implementer, Spec Reviewer, Standards Reviewer) as markdown with a declared `capability_tier` field. |
+| `roles/` | Role templates (Orchestrator, Planner, Implementer, Spec Reviewer, Standards Reviewer) as markdown; the four spawnable roles each declare `capability_tier` and `access` in their frontmatter — the source, not a mirror, read by `src/workflow/roles.py`. |
 | `bin/` | Thin entrypoints (`spawn`, `setup-worktree`) — the CLI surface. Their bodies live in `src/`. |
 | `src/` | All Source. See below. |
 | `src/dag/` | Home of the Execution DAG tooling (`dag validate` / `dag brief` / `dag graph`). Placeholder for now. |

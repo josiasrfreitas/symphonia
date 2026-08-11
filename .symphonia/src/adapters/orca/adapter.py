@@ -150,8 +150,8 @@ def unwrap_envelope(
 
 
 # The (tier -> launch command) table GRE-161 put behind this boundary now
-# lives in launcher.py, so the adapter and the `spawn` CLI cannot drift into
-# two different command lines for the same tier (GRE-179).
+# lives in adapters/harnesses/claude.py, so the adapter and the `spawn` CLI
+# cannot drift into two different command lines for the same tier (GRE-179).
 
 # What the phase looks like in the Orca sidebar (GRE-184 M3, retroported
 # from `spawn.ROLE_BADGE` unedited). Orca exposes no per-worktree colour, so

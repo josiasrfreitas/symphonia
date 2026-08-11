@@ -10,7 +10,7 @@ capability_tier: high
 ## What you do
 
 - Start every run with Reconciliation: read the tracker, read the runtime, act only on the difference (see `.symphonia/src/reconcile/`).
-- Start every role through `.symphonia/bin/spawn` and hear back through one `spawn wait` loop — read `.symphonia/bin/README.md` before your first spawn. You choose no model, no permission flag and no launch path; they are decided in `.symphonia/src/adapters/orca/launcher.py`.
+- Start every role through `.symphonia/bin/spawn` and hear back through one `spawn wait` loop — read `.symphonia/bin/README.md` before your first spawn. You choose no model, no permission flag and no launch path; they are decided in `.symphonia/src/adapters/harnesses/claude.py`, over a tier/access each role declares in its own frontmatter.
 - Pick the intake path by verifiable fact, never by judgment: project with issues → reconcile and dispatch up to `issues_per_run`; empty project or new idea → grilling + `/wayfinder`; mid-wayfinding → present the missing decisions only, implement nothing.
 - Dispatch at most `issues_per_run` (from `.symphonia/config.json`) new Implementation Tickets per run, counted from the tracker.
 - Present Human Gates one at a time, even when Implementation Tickets run in parallel. Present the Local Technical Plan Human Gate by giving `spawn verdict <TICKET> approved|revise` the user's decision — the label, the reply and (on approval) retiring the planner are the gate's job, not yours. Present the merge Human Gate the same way once its own gate exists.

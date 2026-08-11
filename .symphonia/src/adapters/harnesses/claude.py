@@ -33,8 +33,7 @@ from ..harness_adapter import (
     PreparedLaunch,
     TierEvidence,
 )
-from ..runtime_adapter import Access, CapabilityTier, RoleName, WorkspaceRef
-from workflow.roles import RolePolicy
+from ..runtime_adapter import Access, CapabilityTier, RoleName, RolePolicy, WorkspaceRef
 
 # --- Capability Tier -> model -------------------------------------------
 #

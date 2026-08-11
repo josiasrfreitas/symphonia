@@ -9,8 +9,10 @@ the harness can and cannot do. ``harnesses.claude.ClaudeHarness`` is the
 first (and, until a second harness exists, the only) implementation.
 
 Import direction is one-way: this module reads core vocabulary
-(``CapabilityTier``, ``WorkspaceRef``, ``TierEvidence``) from
-``runtime_adapter``; nothing in ``runtime_adapter`` imports from here.
+(``CapabilityTier``, ``RolePolicy``, ``WorkspaceRef``, ``TierEvidence``) from
+``runtime_adapter``; nothing in ``runtime_adapter`` imports from here, and
+nothing here imports ``workflow`` — loading a policy off disk is
+``workflow.roles.load_policies``'s job, not this contract's.
 
 ``TierEvidence`` still lives in ``runtime_adapter.py``, not here — it is
 genuinely harness vocabulary (GRE-186's approved plan says so), but
@@ -22,12 +24,9 @@ every other module in this round reads it from one place.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
 
-from .runtime_adapter import CapabilityTier, TierEvidence, WorkspaceRef
-from workflow.roles import RolePolicy
-
-TierEvidenceKind = Literal["requested", "observed", "unverifiable"]
+from .runtime_adapter import CapabilityTier, RolePolicy, TierEvidence, TierEvidenceKind, WorkspaceRef
 
 
 @dataclass(frozen=True)
