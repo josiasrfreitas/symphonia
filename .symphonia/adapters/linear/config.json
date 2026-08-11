@@ -2,6 +2,7 @@
   "team_key": "SYM",
   "root_issue": "SYM-1",
   "attention_label": "needs-attention",
+  "gate_label": "human-gate",
   "kind_label_prefix": "kind:",
   "type_label_prefix": "type:",
   "delivery_heading": "## Symphonia delivery",

@@ -11,6 +11,8 @@
 .symphonia/bin/spawn review-standards <TICKET>
 .symphonia/bin/spawn status          [<TICKET>]
 .symphonia/bin/spawn retire           <TICKET> <role>
+.symphonia/bin/spawn wait            [--ack <delivery_id>] [--timeout-ms <ms>]
+.symphonia/bin/spawn verdict          <TICKET> approved|revise [--notes <text>|--notes-file <path>]
 ```
 
 One argument, the Ticket Key. No flags. `--tier` exists but is a human
@@ -35,22 +37,28 @@ Spawn every ready role first, then wait once. Never wait between spawns.
 ```bash
 .symphonia/bin/spawn plan SYM-5
 .symphonia/bin/spawn plan SYM-7          # independent node, same wave
-orca orchestration check --wait --types worker_done,escalation,question --timeout-ms 900000 --json
+.symphonia/bin/spawn wait --timeout-ms 900000
 ```
 
-Then, for every message in the returned Delivery:
+`wait` wraps `orca orchestration check --wait`; you never call that raw. For
+the planner it also drives the plan gate by itself: a plan submission
+(`question`) lights the `human-gate` label, and a `worker_done` after an
+approved verdict retires the planner — both are printed in `wait`'s output
+as `actions`, never something you decide by reading the message.
+
+Then, for every message `wait` reports that is not already a gate action:
 
 | Message | What it means | What you do |
 |---|---|---|
-| `worker_done` + `succeeded` | The role finished and wrote its handoff | Present the Human Gate, then `retire` it and spawn the next role |
+| `worker_done` + `succeeded` (non-planner role) | The role finished and wrote its handoff | Present the Human Gate if there is one, then `retire` it and spawn the next role |
 | `worker_done` + `failed` | The role gave up; Orca marked the Task failed | Read its handoff, decide retry or escalate to the human |
-| `question` | A role is blocked and waiting on you | `orca orchestration reply --id <msg_id> --body <answer>` — it stays blocked until you do |
+| `question` from the planner | A plan is waiting on a verdict | `.symphonia/bin/spawn verdict <TICKET> approved\|revise [--notes ...]` — never `orca orchestration reply` by hand |
 | `escalation` | The role has ownership but needs you to intervene | Read, act, and usually raise a Needs Attention flag |
 
 Acknowledge and keep waiting in one call:
 
 ```bash
-orca orchestration check --ack <delivery_id> --wait --types worker_done,escalation,question --timeout-ms 900000 --json
+.symphonia/bin/spawn wait --ack <delivery_id> --timeout-ms 900000
 ```
 
 ## Things that will bite you
@@ -82,8 +90,10 @@ ownership to anyone. Every transition goes through you.
 | File | Decides |
 |---|---|
 | `adapters/orca/launcher.py` | Tier → model, effort, permission flags, read-only enforcement, provider grammar |
-| `bin/spawn` | The verbs, worktree policy, phase labels, what a role is told at dispatch |
-| `roles/*.md` | What each role does and never does |
+| `bin/spawn` | The verbs, worktree policy, phase labels, what a role is told at dispatch, the Execution Brief (`build_brief`), the plan gate wiring (`wait`/`verdict`) |
+| `adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
+| `adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
+| `roles/*.md` | What each role does and never does, and (for the planner) the I/O shapes it reads and writes |
 | `config.json` | The calibration numbers |
 
 Adding a provider is a `PROVIDERS` entry in `launcher.py`. Changing a model is

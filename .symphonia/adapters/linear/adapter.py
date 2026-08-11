@@ -507,6 +507,19 @@ class LinearTracker:
             },
         )
 
+    def set_gate(self, id: str, waiting: bool) -> None:
+        """Put or lift the ``human-gate`` label — the visible sign that a
+        Human Gate is waiting. Always script-driven: on submission (script)
+        or on verdict (``spawn verdict``), never typed by an agent."""
+        node = self._issue(id)
+        label_id = self._label_id(node["team"]["id"], self._cfg["gate_label"])
+        mutation = "issueAddLabel" if waiting else "issueRemoveLabel"
+        self._c.query(
+            "mutation($id: String!, $label: String!) { %s(id: $id, labelId: $label) { success } }"
+            % mutation,
+            {"id": node["id"], "label": label_id},
+        )
+
     def set_delivery(self, id: str, **delivery: object) -> None:
         unknown = set(delivery) - {"branch", "workspace"}
         if unknown:
