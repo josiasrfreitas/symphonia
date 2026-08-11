@@ -585,9 +585,9 @@ class OrcaRuntimeAdapter:
     # registry already has on disk and act on them directly, one call each,
     # matching `spawn.status`/`spawn.retire`'s measured argv.
 
-    def dispatch_status(self, task_id: str) -> str:
+    def dispatch_status(self, task_id: str, *, default: str = "?") -> str:
         shown = self._orca("orchestration", "dispatch-show", "--task", task_id)
-        return str((shown.get("dispatch") or {}).get("status", "?"))
+        return str((shown.get("dispatch") or {}).get("status", default))
 
     def stop_worker(self, dispatch_id: str) -> None:
         """Best-effort: `worker-stop` only knows dispatches `worker-start`

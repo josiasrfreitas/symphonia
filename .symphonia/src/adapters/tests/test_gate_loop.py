@@ -63,9 +63,9 @@ class _FakeStatusRetireAdapter:
     def __init__(self, orca_fn):
         self._orca_fn = orca_fn
 
-    def dispatch_status(self, task_id):
+    def dispatch_status(self, task_id, *, default="?"):
         shown = self._orca_fn("orchestration", "dispatch-show", "--task", task_id)
-        return str((shown.get("dispatch") or {}).get("status", "?"))
+        return str((shown.get("dispatch") or {}).get("status", default))
 
     def stop_worker(self, dispatch_id):
         self._orca_fn("orchestration", "worker-stop", "--dispatch", dispatch_id)

@@ -560,7 +560,7 @@ def retire(ticket: str, role_value: str) -> dict:
     # A killed role leaves its Task sitting in `dispatched` forever, which
     # Reconciliation would read as an attempt still in flight. Settle it.
     try:
-        dispatch_status = adapter.dispatch_status(rec["task"])
+        dispatch_status = adapter.dispatch_status(rec["task"], default="")
     except _cli.OrcaCliError as exc:
         raise SystemExit(str(exc)) from exc
     if dispatch_status not in ("completed", "failed"):
