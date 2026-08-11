@@ -94,6 +94,10 @@ class RoleSpec:
     role: RoleName
     tier: CapabilityTier
     access: Access
+    # Kept on purpose (GRE-184 M3 review): no caller reads this back. The
+    # brief a role actually receives arrives as the body of its first
+    # `dispatch` — there is no second channel. GRE-186 (S5) rewrites this
+    # whole boundary; removing the field belongs there, not here.
     briefing: str
 
 
