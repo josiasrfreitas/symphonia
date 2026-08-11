@@ -343,12 +343,6 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
 
 # --- role identity: how a role finds its own record -----------------------
 
-# GRE-184 M4: the regex and the rollback it guards both moved into
-# `OrcaRuntimeAdapter.dispatch` (retroported in M3) — this is a direct
-# re-export, not a copy, so `test_role_verbs.TestCapabilityExtraction`
-# keeps calling the same name it always has.
-_capability_of = _cli._capability_of
-
 
 def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     """The record of the role calling this, from inside its own terminal.

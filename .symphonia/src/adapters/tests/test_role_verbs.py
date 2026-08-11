@@ -32,6 +32,7 @@ from pathlib import Path
 PACKAGE = Path(__file__).resolve().parents[2]  # .symphonia/src, the sys.path root since the move
 sys.path.insert(0, str(PACKAGE))
 
+from adapters.orca import adapter as _cli
 from adapters.tests.test_brief import _load_spawn
 
 SUBMISSION = "## Plan\nGRE-1 — comment abc\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
@@ -304,12 +305,12 @@ class TestCapabilityExtraction(RoleVerbCase):
             "  --type worker_done\n"
         )
         self.assertEqual(
-            self.spawn._capability_of(preamble),
+            _cli._capability_of(preamble),
             "dcap_CsezluWw_EVuCTHODwEPod--nDSh5BcFhdIKKDcVwUc",
         )
 
     def test_no_token_is_not_an_error_here(self):
-        self.assertIsNone(self.spawn._capability_of("no capability in this text"))
+        self.assertIsNone(_cli._capability_of("no capability in this text"))
 
 
 if __name__ == "__main__":
