@@ -569,6 +569,42 @@ class OrcaRuntimeAdapter:
             self._contexts.pop(record.ref.context.id, None)
         return KillReceipt(attempt=attempt, confirmed_gone=bool(stopped.get("stopped", True)))
 
+    # --- cross-process control (GRE-184 M4b) ---
+    #
+    # `status`/`retire` run in a fresh process, after `_contexts`/`_attempts`
+    # are gone with the process that populated them — the in-memory
+    # `kill`/`sweep` above have nowhere to look. These four concrete methods
+    # (outside the Protocol, like `message_worker`) take the ids the
+    # registry already has on disk and act on them directly, one call each,
+    # matching `spawn.status`/`spawn.retire`'s measured argv.
+
+    def dispatch_status(self, task_id: str) -> str:
+        shown = self._orca("orchestration", "dispatch-show", "--task", task_id)
+        return str((shown.get("dispatch") or {}).get("status", "?"))
+
+    def stop_worker(self, dispatch_id: str) -> None:
+        """Best-effort: `worker-stop` only knows dispatches `worker-start`
+        created, and this package launches through `terminal create` so it
+        can set a model and permissions (GRE-179) — a failure here is
+        expected, not exceptional. The caller decides what to do with it."""
+
+        self._orca("orchestration", "worker-stop", "--dispatch", dispatch_id)
+
+    def close_terminal(self, handle: str, *, tab: bool) -> None:
+        argv = ["terminal", "close", "--terminal", handle]
+        if tab:
+            argv.append("--tab")
+        self._orca(*argv)
+
+    def settle_task(self, task_id: str, reason: str) -> None:
+        """A killed role's Task would otherwise sit in `dispatched` forever,
+        which Reconciliation reads as an attempt still in flight."""
+
+        self._orca(
+            "orchestration", "task-update", "--id", task_id, "--status", "failed",
+            "--result", json.dumps({"reason": reason}),
+        )
+
     # --- events ---
 
     def _to_event(self, message, kinds: list[EventKind]) -> RuntimeEvent | None:

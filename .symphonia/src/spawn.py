@@ -500,14 +500,14 @@ def status(ticket: str | None) -> list[dict]:
     """Deterministic state per spawn: what the dispatch says, and which model
     actually answered — read from the transcript, never asked of the agent."""
 
+    adapter = _adapter()
     out = []
     for key, rec in sorted(state_read().items()):
         if ticket and not key.startswith(ticket.upper() + "/"):
             continue
         try:
-            shown = orca("orchestration", "dispatch-show", "--task", rec["task"])
-            dispatch_status = str((shown.get("dispatch") or {}).get("status", "?"))
-        except SystemExit:
+            dispatch_status = adapter.dispatch_status(rec["task"])
+        except _cli.OrcaCliError:
             dispatch_status = "unknown"
         transcript = Path(rec["transcript"]) if rec.get("transcript") else None
         models = _launcher.observed_models(transcript) if transcript else []
@@ -541,6 +541,7 @@ def retire(ticket: str, role_value: str) -> dict:
     terminal is what actually ends the role.
     """
 
+    adapter = _adapter()
     key = f"{ticket.upper()}/{role_value}"
     rec = state_read().get(key)
     if rec is None:
@@ -548,26 +549,28 @@ def retire(ticket: str, role_value: str) -> dict:
 
     effects = []
     try:
-        orca("orchestration", "worker-stop", "--dispatch", rec["dispatch"])
+        adapter.stop_worker(rec["dispatch"])
         effects.append("worker-stop")
-    except SystemExit:
+    except _cli.OrcaCliError:
         pass  # expected for terminal-created dispatches
 
     try:
-        orca("terminal", "close", "--terminal", rec["terminal"], "--tab")
+        adapter.close_terminal(rec["terminal"], tab=True)
         effects.append("terminal closed")
-    except SystemExit as exc:
+    except _cli.OrcaCliError as exc:
         effects.append(f"terminal not closed ({exc})")
 
     # A killed role leaves its Task sitting in `dispatched` forever, which
     # Reconciliation would read as an attempt still in flight. Settle it.
-    shown = orca("orchestration", "dispatch-show", "--task", rec["task"])
-    status = str((shown.get("dispatch") or {}).get("status", ""))
-    if status not in ("completed", "failed"):
-        orca(
-            "orchestration", "task-update", "--id", rec["task"], "--status", "failed",
-            "--result", json.dumps({"reason": f"{role_value} retired by the Orchestrator"}),
-        )
+    try:
+        dispatch_status = adapter.dispatch_status(rec["task"])
+    except _cli.OrcaCliError as exc:
+        raise SystemExit(str(exc)) from exc
+    if dispatch_status not in ("completed", "failed"):
+        try:
+            adapter.settle_task(rec["task"], f"{role_value} retired by the Orchestrator")
+        except _cli.OrcaCliError as exc:
+            raise SystemExit(str(exc)) from exc
         effects.append("task settled as failed")
 
     data = state_read()
@@ -575,7 +578,7 @@ def retire(ticket: str, role_value: str) -> dict:
     state_write(data)
     return {
         "retired": key,
-        "dispatch_was": status,
+        "dispatch_was": dispatch_status,
         "effects": effects,
         "worktree_kept": rec["worktree"],
     }

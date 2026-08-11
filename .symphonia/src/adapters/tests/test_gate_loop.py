@@ -52,6 +52,37 @@ class FakeTracker:
         self.attention.append((ticket, attention))
 
 
+class _FakeStatusRetireAdapter:
+    """`retire()`/`status()` compose over `OrcaRuntimeAdapter`'s concrete
+    id-taking methods now (GRE-184 M4b), not `spawn.orca` — so a fixture
+    that only replaces `spawn.orca` (this file's usual `fake_orca`) never
+    sees those calls. This stands in for just the four methods `retire()`/
+    `status()` use, routed through the same `orca_fn` double so `self.calls`
+    still records everything in one place."""
+
+    def __init__(self, orca_fn):
+        self._orca_fn = orca_fn
+
+    def dispatch_status(self, task_id):
+        shown = self._orca_fn("orchestration", "dispatch-show", "--task", task_id)
+        return str((shown.get("dispatch") or {}).get("status", "?"))
+
+    def stop_worker(self, dispatch_id):
+        self._orca_fn("orchestration", "worker-stop", "--dispatch", dispatch_id)
+
+    def close_terminal(self, handle, *, tab):
+        argv = ["terminal", "close", "--terminal", handle]
+        if tab:
+            argv.append("--tab")
+        self._orca_fn(*argv)
+
+    def settle_task(self, task_id, reason):
+        self._orca_fn(
+            "orchestration", "task-update", "--id", task_id, "--status", "failed",
+            "--result", json.dumps({"reason": reason}),
+        )
+
+
 class GateLoopCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -87,6 +118,7 @@ class GateLoopCase(unittest.TestCase):
             return {}
 
         self.spawn.orca = fake_orca
+        self.spawn._adapter = lambda: _FakeStatusRetireAdapter(fake_orca)
 
     def message(self, **over):
         base = {
