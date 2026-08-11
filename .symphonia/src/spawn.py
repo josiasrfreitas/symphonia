@@ -426,8 +426,14 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
 
     # `--tier` is a human override, not a knob for the Orchestrator: the
     # matrix is the default precisely so no agent has to choose a model.
-    # Read together, same adjacency as the GRE-179 matrix comment
-    # (`launcher.py:161-162`) — one reader of the two tables, not two.
+    #
+    # Both tables are read here, adjacent, because composition requires it:
+    # `launch_role` takes a `RoleSpec` with tier and access already decided,
+    # so the caller has to hold them (`launcher.py:151-153`). That does make
+    # this a second reading site alongside `build_launch` — a property this
+    # code had before the composition and lost. Collapsing tier/access to a
+    # single source is GRE-186's first scope item (RolePolicy); until then,
+    # keeping the two reads adjacent is containment, not a fix.
     resolved_tier = _launcher.ROLE_TIERS[role]
     resolved_access = _launcher.ROLE_ACCESS[role]
     if tier:
