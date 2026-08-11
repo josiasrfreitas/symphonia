@@ -137,7 +137,9 @@ class CharacterizationCase(unittest.TestCase):
 
     def install_runner(self, responses: list[SimpleNamespace]) -> RecordingRunner:
         runner = RecordingRunner(responses)
-        self.spawn.subprocess.run = runner
+        patcher = mock.patch.object(self.spawn.subprocess, "run", runner)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return runner
 
     def fake_tracker_for(self, ticket: str) -> FakeTracker:

@@ -100,7 +100,7 @@ def unwrap_envelope(
     argv: Sequence[str], result: RunResult, *, expect_lifecycle_ok: bool = False
 ) -> dict:
     """The one envelope unwrapper, shared by ``OrcaRuntimeAdapter._orca``
-    and ``spawn.orca`` (GRE-184 M1 — the fronteira condition with GRE-185:
+    and ``spawn.orca`` (GRE-184 M1 — the boundary condition with GRE-185:
     ``spawn.orca``'s message text is exactly what this produces). The CLI
     wraps every ``--json`` response in ``{id, ok, result, _meta}``.
 
@@ -119,11 +119,21 @@ def unwrap_envelope(
 
     if not result.stdout.strip():
         raise OrcaCliError(f"orca {' '.join(argv)} produced no output: {result.stderr.strip()}")
-    data = json.loads(result.stdout)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise OrcaCliError(
+            f"orca {' '.join(argv)} exited {result.returncode} with unparseable output: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        ) from exc
     if isinstance(data, dict) and "ok" in data:
         if not data.get("ok"):
-            err = data.get("error") or {}
-            raise OrcaCliError(f"orca {' '.join(argv)} failed: {err.get('code')}: {err.get('message')}")
+            err = data.get("error")
+            if not isinstance(err, dict):
+                err = {"message": str(err)}
+            raise OrcaCliError(
+                f"orca {' '.join(argv)} failed: {err.get('code', 'unknown')}: {err.get('message', '')}"
+            )
         data = data.get("result")
     if expect_lifecycle_ok:
         lifecycle = (data or {}).get("lifecycle") or {}
@@ -194,6 +204,18 @@ class OrcaRuntimeAdapter:
     run_id: str
     runner: Runner = subprocess_runner
     repo: str = ""
+    bind_control: bool = True
+    """Whether `_ensure_control` actually runs `run-current`/`run-use`
+    before each call. Defaults True — the coordinator loop and the
+    conformance suite construct with this default, so control-lost
+    detection is exercised there. GRE-184 M4 composes `spawn.py`'s verbs
+    over this adapter with `bind_control=False`: `spawn.py` never emitted
+    `run-current` and the characterization tests freeze that argv byte for
+    byte, so the coordinator-binding check cannot be introduced on that
+    path without breaking M0's frozen argv. Consequence, spelled out:
+    with `bind_control=False`, production spawn/status/retire never
+    exercises control-lost detection — the conformance suite (which
+    always binds) is the only place that check runs."""
 
     _contexts: dict[str, _ContextRecord] = field(default_factory=dict)
     _attempts: dict[str, _AttemptRecord] = field(default_factory=dict)
@@ -219,8 +241,11 @@ class OrcaRuntimeAdapter:
     def _ensure_control(self) -> None:
         """Every operation re-establishes the coordinator binding first. A
         reclaim is reported, never silent — attributed to the most recent
-        open attempt, the work most at risk while control was lost."""
+        open attempt, the work most at risk while control was lost. A no-op
+        when `bind_control` is False (see that field's docstring)."""
 
+        if not self.bind_control:
+            return
         current = self._orca("orchestration", "run-current")
         run = current.get("run") if isinstance(current.get("run"), dict) else {}
         holder = str(run.get("terminal", current.get("terminal", current.get("coordinator", ""))))
@@ -403,9 +428,14 @@ class OrcaRuntimeAdapter:
 
     def drain(self, kinds: list[EventKind]) -> EventBatch:
         self._ensure_control()
-        batch = parse_check_output(
-            self.runner(["orca", "orchestration", "check", "--terminal", self.coordinator, "--peek", "--json"]).stdout
-        )
+        # `_orca` already unwraps the envelope (a failed `check` now raises
+        # `OrcaCliError` instead of going through here as "no events" —
+        # GRE-184 review round 1, finding 2); `parse_check_output` expects
+        # the raw JSON text of `check --peek --json`, so the unwrapped
+        # result is fed back in — the same trick `spawn.wait` uses to reuse
+        # this one parser for both call sites.
+        result = self._orca("orchestration", "check", "--terminal", self.coordinator, "--peek")
+        batch = parse_check_output(json.dumps(result))
         # Only local events that made it into this batch may be consumed by
         # the matching ack; a control-lost filtered out by `kinds` must
         # survive until a drain actually delivers it (review M1).

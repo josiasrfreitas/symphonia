@@ -130,7 +130,7 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
     --json response in {id, ok, result, _meta}.
 
     Delegates to `adapters.orca.adapter.unwrap_envelope` — the same
-    desembrulhador `OrcaRuntimeAdapter._orca` uses (GRE-184 M1) — and turns
+    unwrapper `OrcaRuntimeAdapter._orca` uses (GRE-184 M1) — and turns
     an `OrcaCliError` into the identical `SystemExit` this function has
     always raised. Name, signature and error text are unchanged, so `wait`
     and `verdict` (GRE-185) keep calling this without editing a line.
