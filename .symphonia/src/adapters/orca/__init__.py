@@ -15,7 +15,7 @@ the Orca CLI, plus everything needed to trust it:
   scripted ``orca`` CLI so the real adapter runs without a live Orca.
 - ``conformance`` — the harness's 11-step walkthrough as an assert-based
   unittest suite. The double and the real adapter pass the same suite:
-  ``cd .symphonia && python3 -m unittest adapters.orca.conformance -v``
+  ``cd .symphonia/src && python3 -m unittest adapters.orca.conformance -v``
 
 Stdlib only. Deterministic: no wall clock, no randomness.
 """

@@ -1,22 +1,19 @@
-"""Tests for `build_brief` in `bin/spawn` (GRE-178).
+"""Tests for `build_brief` in `src/spawn.py` (GRE-178).
 
-TLDR: loads `bin/spawn` the same way it loads its own dependencies —
-`importlib` by file path, since the package lives in a dot-directory no
-import statement can name — then drives `build_brief` with a fake tracker
-so no network call and no `LINEAR_API_KEY` are needed. Checks: the
-`io:brief-template` block fills correctly, comments
-carry an author and a date, and a missing placeholder value fails loudly
-instead of shipping a Brief with a hole in it. Run either way:
+TLDR: imports `spawn` the same way production does — `src/` on `sys.path`,
+one module identity — then drives `build_brief` with a fake tracker and a
+fake GraphQL client so no network call and no `LINEAR_API_KEY` are needed.
+Checks: the `io:brief-template` block fills correctly, comments carry an
+author and a date, and a missing placeholder value fails loudly instead of
+shipping a Brief with a hole in it. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_brief
-    python3 .symphonia/adapters/tests/test_brief.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_brief
+    python3 .symphonia/src/adapters/tests/test_brief.py
 """
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
+import importlib
 import sys
-import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,26 +23,17 @@ sys.path.insert(0, str(PACKAGE))
 
 from adapters.tracker_adapter import Comment, Item, ItemKind, ItemRef, Openness
 
+import spawn as SPAWN
+
+RoleName = SPAWN.RoleName
+
 
 def _load_spawn():
-    """Mirrors `bin/spawn`'s own `_load`: the module has no `.py` suffix and
-    lives in a dot-directory, so it is loaded by file path, not import."""
+    """`STATE` is computed at import time from `SYMPHONIA_RUNTIME`, so a test
+    that redirects the registry reloads the real module rather than opening a
+    second identity for it."""
 
-    path = PACKAGE / "bin" / "spawn"
-    loader = importlib.machinery.SourceFileLoader("spawn_under_test", str(path))
-    spec = importlib.util.spec_from_loader("spawn_under_test", loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-SPAWN = _load_spawn()
-# `spawn` loads its own copy of `runtime_adapter.py` under the
-# `symphonia_pkg` name (it cannot `import adapters...` — the package lives
-# in a dot-directory). `RoleName` must come from that same copy: an enum
-# member from the `adapters.*` import above is a different class and would
-# fail every dict lookup keyed by `SPAWN`'s `RoleName`.
-RoleName = SPAWN.RoleName
+    return importlib.reload(SPAWN)
 
 
 class FakeTracker:

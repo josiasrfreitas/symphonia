@@ -5,8 +5,8 @@ matrix drifting away from what the role files declare, a worker launched in a
 mode that can stop at a permission prompt, and a read-only role launched
 somewhere it could write. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.orca.tests.test_launcher
-    python3 .symphonia/adapters/orca/tests/test_launcher.py
+    cd .symphonia/src && python3 -m unittest adapters.orca.tests.test_launcher
+    python3 .symphonia/src/adapters/orca/tests/test_launcher.py
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from adapters.orca.launcher import (
 )
 from adapters.runtime_adapter import Access, CapabilityTier, RoleName
 
-ROLES_DIR = Path(__file__).resolve().parents[3] / "roles"
+ROLES_DIR = Path(__file__).resolve().parents[4] / "roles"
 
 
 def declared_tier(role: RoleName) -> str:

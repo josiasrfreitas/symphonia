@@ -5,8 +5,8 @@ parser handles exactly what it promises and nothing more. The last case is
 the one that matters operationally: a role runs in the ticket's worktree, a
 different checkout, so only the shared `.env` reaches it. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_env
-    python3 .symphonia/adapters/tests/test_env.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_env
+    python3 .symphonia/src/adapters/tests/test_env.py
 """
 from __future__ import annotations
 

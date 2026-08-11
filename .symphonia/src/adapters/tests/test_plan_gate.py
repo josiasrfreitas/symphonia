@@ -10,8 +10,8 @@ The verdict is NOT an event here: measured on Orca 1.4.168, the answer to an
 mailbox, so `spawn verdict` writes the state directly and the planner's side
 of that exchange is parsed by `spawn submit`. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_plan_gate
-    python3 .symphonia/adapters/tests/test_plan_gate.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_plan_gate
+    python3 .symphonia/src/adapters/tests/test_plan_gate.py
 """
 from __future__ import annotations
 

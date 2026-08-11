@@ -5,8 +5,8 @@ reproducing the hostile parts of the real one — last write wins silently, no
 compare-and-swap, page caps — so every contract behavior is verifiable from
 the branch without a Linear API key. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.linear.tests.test_adapter
-    python3 .symphonia/adapters/linear/tests/test_adapter.py
+    cd .symphonia/src && python3 -m unittest adapters.linear.tests.test_adapter
+    python3 .symphonia/src/adapters/linear/tests/test_adapter.py
 """
 from __future__ import annotations
 

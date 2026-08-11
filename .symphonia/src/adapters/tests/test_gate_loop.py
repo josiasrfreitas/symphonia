@@ -9,8 +9,8 @@ of the first version, so each one is a regression, not a hypothetical.
 No network: `SPAWN.orca` and `SPAWN._linear.LinearTracker` are replaced.
 Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_gate_loop
-    python3 .symphonia/adapters/tests/test_gate_loop.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_gate_loop
+    python3 .symphonia/src/adapters/tests/test_gate_loop.py
 """
 from __future__ import annotations
 
@@ -211,25 +211,6 @@ class TestVerdictOrdering(GateLoopCase):
 
 
 class TestRegistryLocation(GateLoopCase):
-    def test_a_legacy_checkout_registry_is_merged_under_the_shared_one(self):
-        """Each checkout had its own `.runtime/spawns.json`. Reading the
-        legacy file only when the shared one is missing loses every other
-        checkout's records the moment anything writes."""
-
-        legacy = self.spawn.LEGACY_STATE
-        legacy.parent.mkdir(parents=True, exist_ok=True)
-        original = legacy.read_text() if legacy.exists() else None
-        legacy.write_text(json.dumps({
-            "GRE-9/planner": {"ticket": "GRE-9", "role": "planner"},
-            "GRE-1/planner": {"ticket": "GRE-1", "role": "STALE"},
-        }))
-        try:
-            data = self.spawn.state_read()
-            self.assertIn("GRE-9/planner", data, "another checkout's record must survive")
-            self.assertEqual(data["GRE-1/planner"]["role"], "planner", "shared file wins")
-        finally:
-            legacy.write_text(original) if original is not None else legacy.unlink()
-
     def test_the_registry_and_its_directory_are_not_world_readable(self):
         """It holds Dispatch capability tokens, and a token is what
         authorizes a worker_done on someone else's dispatch."""

@@ -9,7 +9,7 @@ to the same contract. Steps whose meaning depends on
 provider must reveal a silent downgrade, the weak one must at least never
 claim it observed anything.
 
-Run:  cd .symphonia && python3 -m unittest adapters.orca.conformance -v
+Run:  cd .symphonia/src && python3 -m unittest adapters.orca.conformance -v
 """
 from __future__ import annotations
 

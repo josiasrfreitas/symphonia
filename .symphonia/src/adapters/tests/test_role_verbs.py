@@ -16,8 +16,8 @@ style preference:
 No network: `SPAWN.orca` is replaced by a fake that records argv, and the
 registry is redirected with SYMPHONIA_RUNTIME. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_role_verbs
-    python3 .symphonia/adapters/tests/test_role_verbs.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_role_verbs
+    python3 .symphonia/src/adapters/tests/test_role_verbs.py
 """
 from __future__ import annotations
 

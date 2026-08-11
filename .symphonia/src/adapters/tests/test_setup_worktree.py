@@ -1,16 +1,14 @@
-"""Tests for `bin/setup-worktree`.
+"""Tests for `src/setup_worktree.py`.
 
 TLDR: a real git repo plus a real linked worktree in a temp dir — the whole
 point of the script is finding the main checkout from inside a worktree, and
 a fake would be testing the mock. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_setup_worktree
-    python3 .symphonia/adapters/tests/test_setup_worktree.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_setup_worktree
+    python3 .symphonia/src/adapters/tests/test_setup_worktree.py
 """
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -20,17 +18,7 @@ from pathlib import Path
 PACKAGE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE))
 
-
-def _load():
-    path = PACKAGE / "bin" / "setup-worktree"
-    loader = importlib.machinery.SourceFileLoader("setup_worktree_under_test", str(path))
-    spec = importlib.util.spec_from_loader("setup_worktree_under_test", loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-SETUP = _load()
+import setup_worktree as SETUP
 
 
 def git(*argv: str, cwd: Path) -> None:

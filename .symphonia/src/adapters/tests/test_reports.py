@@ -5,8 +5,8 @@ fenced blocks) are the golden fixtures — they parse back into the fields a
 human typed, and a body that drifts from the contract raises
 ``MalformedReport`` naming what is wrong. Run either way:
 
-    cd .symphonia && python3 -m unittest adapters.tests.test_reports
-    python3 .symphonia/adapters/tests/test_reports.py
+    cd .symphonia/src && python3 -m unittest adapters.tests.test_reports
+    python3 .symphonia/src/adapters/tests/test_reports.py
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from adapters.reports import (
     parse_planner_done,
 )
 
-PLANNER_MD = Path(__file__).resolve().parents[2] / "roles" / "planner.md"
+PLANNER_MD = Path(__file__).resolve().parents[3] / "roles" / "planner.md"
 
 
 def _example(tag: str) -> str:
