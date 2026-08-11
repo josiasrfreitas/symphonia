@@ -107,3 +107,15 @@ _Avoid_: Coordinator, supervisor, main agent
 **Reconciliation**:
 Comparing what the tracker says about an Implementation Ticket with what the runtime says is running for it, and acting on the difference.
 _Avoid_: Sync, refresh, healing
+
+**Source**:
+What a person writes and a review approves, and the package imports or executes — the Python under `src/`, entrypoints and tests included.
+_Avoid_: Scripts, tooling, the bin
+
+**Resource**:
+Authored content the Source reads at run time but never executes — role contracts, skills, config, brief templates. Versioned and reviewed like Source; changing one changes behavior without changing code.
+_Avoid_: Docs, assets, data files
+
+**Artifact**:
+Anything an execution produces — the spawn registry, a handoff baton, a transcript, an instantiated Execution DAG, a report. Never committed and never reviewed; it lives outside every checkout. A ticket attachment is an Artifact the tracker keeps.
+_Avoid_: Output, state file, log
