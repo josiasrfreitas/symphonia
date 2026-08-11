@@ -135,23 +135,36 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
         return SimpleNamespace(kind="plan-question", message_id=message_id, question=body)
 
     def test_non_submission_question_is_not_a_gate_event(self):
-        rec = {"gate_state": SPAWN.IDLE}
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
         actions = SPAWN._apply_gate_event(rec, self._question("Should I use A or B?"), {})
         self.assertEqual(actions, [])
         self.assertEqual(rec["gate_state"], SPAWN.IDLE)
         self.assertNotIn("question_id", rec)
 
     def test_real_submission_lights_the_label(self):
-        rec = {"gate_state": SPAWN.IDLE}
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
         body = "## Plan\nGRE-1 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
         actions = SPAWN._apply_gate_event(rec, self._question(body, "q-1"), {})
         self.assertEqual(actions, [(SPAWN._gate.LABEL_ON, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
         self.assertEqual(rec["question_id"], "q-1")
         self.assertEqual(rec["last_question_id"], "q-1")
+        # what the parser found is kept, not thrown away
+        self.assertEqual(rec["plan_pointer"], "pointer")
+        self.assertEqual(rec["plan_decisions"], ["1. x"])
+        self.assertEqual(rec["approval_rounds"], 1)
+
+    def test_a_submission_filed_under_another_ticket_is_flagged(self):
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
+        body = "## Plan\nGRE-9 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+        actions = SPAWN._apply_gate_event(rec, self._question(body), {})
+        action, reason = actions[0]
+        self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
+        self.assertIn("GRE-9", reason)
+        self.assertEqual(rec["gate_state"], SPAWN.IDLE)
 
     def test_body_that_starts_plan_but_fails_to_parse_is_flagged(self):
-        rec = {"gate_state": SPAWN.IDLE}
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
         body = "## Plan\nGRE-1 — pointer\n\n## Changes\nNone.\n"  # missing Decisions
         actions = SPAWN._apply_gate_event(rec, self._question(body), {})
         self.assertEqual(len(actions), 1)
@@ -172,49 +185,70 @@ class TestApplyGateEventReplayVsResubmission(unittest.TestCase):
         return SimpleNamespace(kind="plan-question", message_id=message_id, question=self.SUBMISSION)
 
     def test_replay_after_approval_does_not_relight_the_label(self):
-        rec = {"gate_state": SPAWN._gate.VERDICT_APPROVED, "last_question_id": "q-1"}
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED, "last_question_id": "q-1"}
         actions = SPAWN._apply_gate_event(rec, self._question("q-1"), {})
         self.assertEqual(actions, [])
         self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_APPROVED)
 
     def test_replay_after_revise_does_not_relight_the_label(self):
-        rec = {"gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
         actions = SPAWN._apply_gate_event(rec, self._question("q-1"), {})
         self.assertEqual(actions, [])
         self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_REVISE)
 
     def test_resubmission_after_revise_lights_the_label(self):
-        rec = {"gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
         actions = SPAWN._apply_gate_event(rec, self._question("q-2"), {})
         self.assertEqual(actions, [(SPAWN._gate.LABEL_ON, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
         self.assertEqual(rec["last_question_id"], "q-2")
+        # a second round is counted, so `spawn done` never asks the planner
+        self.assertEqual(rec["approval_rounds"], 1)
 
 
-class TestApplyGateEventWorkerDoneUsesRawPayload(unittest.TestCase):
-    """A1: the planner's worker_done must be parsed through
-    `reports.parse_planner_done`, not accepted on gate_state alone."""
+class TestApplyGateEventWorkerDone(unittest.TestCase):
+    """The planner's worker_done: parsed here, and only retiring when the
+    gate already recorded the approval."""
 
-    def _done(self, message_id="d-1", outcome="succeeded"):
-        summary = "## Plan\npointer\n\n## Approval\n1 round.\n\n## Deviations\nNone.\n"
+    SUMMARY = "## Plan\npointer\n\n## Approval\n1 rodada.\n\n## Deviations\nNone.\n"
+
+    def _done(self, message_id="d-1", outcome="succeeded", summary=None):
         return SimpleNamespace(
-            kind="worker-done", message_id=message_id, outcome=outcome, summary=summary,
+            kind="worker-done", message_id=message_id, outcome=outcome,
+            summary=self.SUMMARY if summary is None else summary,
         )
 
-    def test_approved_and_matching_payload_retires(self):
-        rec = {"gate_state": SPAWN._gate.VERDICT_APPROVED}
-        raw = SimpleNamespace(payload={"planApproved": True, "approvalRounds": 1})
+    def test_approved_and_wellformed_report_retires(self):
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED}
+        raw = SimpleNamespace(payload={})
         actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
         self.assertEqual(actions, [(SPAWN._gate.RETIRE_PLANNER, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.RETIRED)
+        self.assertEqual(rec["plan_pointer_final"], "pointer")
+        self.assertEqual(rec["deviations"], [])
 
-    def test_approved_state_with_planApproved_false_payload_is_flagged_not_retired(self):
-        rec = {"gate_state": SPAWN._gate.VERDICT_APPROVED}
-        raw = SimpleNamespace(payload={"planApproved": False, "approvalRounds": 1})
-        actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
-        self.assertEqual(len(actions), 1)
-        action, _ = actions[0]
+    def test_report_that_does_not_parse_is_flagged_not_retired(self):
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED}
+        raw = SimpleNamespace(payload={})
+        broken = "## Plan\npointer\n\n## Deviations\nNone.\n"  # no Approval
+        actions = SPAWN._apply_gate_event(rec, self._done(summary=broken), {"d-1": raw})
+        action, reason = actions[0]
         self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
+        self.assertIn("Approval", reason)
+        self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_APPROVED)
+
+    def test_a_lifecycle_rejection_from_orca_is_flagged(self):
+        """Measured on Orca 1.4.168: a refused worker_done still arrives as a
+        worker_done, marked in the payload. Without this it reads as a
+        completion that completed nothing."""
+        rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED}
+        raw = SimpleNamespace(payload={"_orcaLifecycleRejection": {
+            "code": "missing_dispatch_id", "reason": "worker_done requires dispatchId.",
+        }})
+        actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
+        action, reason = actions[0]
+        self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
+        self.assertIn("missing_dispatch_id", reason)
         self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_APPROVED)
 
 

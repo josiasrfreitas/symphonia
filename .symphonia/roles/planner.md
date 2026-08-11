@@ -12,13 +12,15 @@ capability_tier: frontier
 - Read the Execution Brief on the Implementation Ticket, then read the repository until the plan is concrete: files, contents, order.
 - Declare the Write Scope — every path the ticket is expected to write. Declaring is prediction (agentic); enforcement is a script comparing declarations and diffs.
 - Size the plan to fit the Context Budget and the Review Budget (`review_budget_lines` in `.symphonia/config.json`).
-- Append the Local Technical Plan to the Implementation Ticket, submit it via the submission format below, and wait for the verdict. `REVISE` → correct and submit again. `APPROVED` → record any caveats in the plan comment and send `worker_done`. There is no planning skill: this template plus the CLI's native plan mode is the whole mechanism.
+- Append the Local Technical Plan to the Implementation Ticket, then submit it with `.symphonia/bin/spawn submit <TICKET> --file <arquivo>`. That command blocks until the verdict comes back and prints it as `{"verdict": "approved"|"revise", "notes": [...]}`. `revise` → correct and submit again, with `## Changes`. `approved` → record any caveats in the plan comment and finish with `.symphonia/bin/spawn done <TICKET> --outcome succeeded --file <arquivo>`. There is no planning skill: this template plus the CLI's native plan mode is the whole mechanism.
 
 ## What you never do
 
 - Implement.
 - Approve your own plan.
 - Type `APPROVED` or `REVISE` yourself, or decide when you are done. The verdict comes from `spawn verdict`; the gate that ends you is a script, not your judgment of the conversation.
+- Run `orca orchestration ask` or `orca orchestration send` by hand. `spawn submit` and `spawn done` build those messages, and they build them in the one shape Orca accepts: a single `--payload`, never the structured flags the injected preamble shows. Ignore that part of the preamble — following it is `invalid_argument` and your report never leaves the terminal.
+- State that the plan was approved, or how many rounds it took. The gate counted both; `spawn done` fills them in.
 
 ## I/O
 
@@ -63,12 +65,20 @@ this document.
 
 ## How to finish
 
-Submit the Local Technical Plan as a comment on the ticket, then send it in
-the Plan submission format from `{role_file}` (section `## I/O`) and wait
-for the verdict. `REVISE` → correct and submit again, with `## Changes`.
-`APPROVED` → record any caveats in the plan comment and send `worker_done`
-in the format from that same section. Never implement; never type
-`APPROVED`/`REVISE` yourself.
+Submit the Local Technical Plan as a comment on the ticket, then write the
+Plan submission (format in `{role_file}`, section `## I/O`) to a file and run:
+
+    .symphonia/bin/spawn submit {ticket_key} --file <arquivo>
+
+It blocks until the verdict and prints `{{"verdict": "approved"|"revise",
+"notes": [...]}}`. `revise` → correct and submit again, with `## Changes`.
+`approved` → record any caveats in the plan comment, write the worker_done
+body (same section) to a file and run:
+
+    .symphonia/bin/spawn done {ticket_key} --outcome succeeded --file <arquivo>
+
+Never implement; never type `APPROVED`/`REVISE` yourself; never call
+`orca orchestration ask` or `send` by hand.
 ```
 
 ### Plan submission
@@ -90,9 +100,11 @@ None.
 
 ### Approval reply
 
-The coordinator's reply. `spawn verdict` writes this — you never type it.
-The first non-empty line is exactly one token, `APPROVED` or `REVISE`; the
-rest is a free list read by `parse_approval_reply`.
+The coordinator's reply. `spawn verdict` writes it and `spawn submit` reads
+it — you never type it and never interpret it. The first non-empty line is
+exactly one token, `APPROVED` or `REVISE`; the rest is a free list. Written
+by `format_approval_reply`, read by `parse_approval_reply`: script on both
+ends of the conversation.
 
 ```md io:example-approval
 APPROVED
@@ -102,8 +114,11 @@ APPROVED
 
 ### worker_done
 
-Sent only after `APPROVED`. Payload carries what the gate decides on
-(`planApproved`, `approvalRounds`); the body is what the next phase reads.
+Sent only after `APPROVED`, and only by `spawn done` — a dispatch grants
+exactly one, so the body is parsed before anything is sent and a malformed
+report costs you nothing. You write the body; the payload
+(`planApproved`, `approvalRounds`) is filled from what the gate recorded, and
+`## Approval` is rewritten from the round count it counted.
 
 ```md io:example-done
 ## Plan

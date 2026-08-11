@@ -4,13 +4,17 @@ TLDR: ``transition(state, event)`` is the whole mechanics of the gate
 between the planner and the human — submission turns the label on, a
 verdict turns it off, and an approved ``worker_done`` retires the planner.
 It knows nothing about Orca or Linear: ``event`` is duck-typed on the
-``kind`` field the gate events in ``adapters/orca/events.py`` already carry
-(``"plan-question"``, ``"approval-reply"``, ``"worker-done"``), so this file
-has no import of that module and stays reusable by any runtime adapter. It
-does import ``reports.py`` — that module is equally neutral (no runtime, no
-Orca, no Linear), so borrowing its ``APPROVED``/``REVISE`` parser and its
-``worker_done`` parser is legitimate: one house for that contract instead of
-one copy per file.
+``kind`` field the gate events in ``adapters/orca/events.py`` already carry,
+so this file has no import at all and stays reusable by any runtime adapter.
+
+It handles the two events a COORDINATOR can actually observe:
+``"plan-question"`` and ``"worker-done"``. The verdict reply is not among
+them — measured against Orca 1.4.168, the answer to an ``ask`` is printed
+back to the worker that asked and never reaches the coordinator's mailbox
+(``wait`` does not even subscribe to ``reply``). The state moves to
+``verdict-approved``/``verdict-revise`` when ``spawn verdict`` writes the
+reply, and the planner's side of that same exchange is parsed by
+``spawn submit``. Parsing bodies is the caller's job on both events.
 
 Replay-safe by construction: a Delivery that is not acked replays the same
 batch, so most transitions are keyed off the *current state*, not off having
@@ -30,8 +34,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-
-from .reports import MalformedReport, parse_approval_reply, parse_planner_done
 
 # --- states -----------------------------------------------------------------
 
@@ -64,16 +66,17 @@ def transition(
     event: Any,
     *,
     last_question_id: str | None = None,
-    payload: dict | None = None,
+    report_ok: bool = True,
 ) -> Transition:
     """One event, one state in, one state out plus the actions to run.
 
     ``last_question_id`` is the id of the plan-question that produced the
     current ``state`` (when that state came from a submission) — needed to
     tell a replayed submission from a genuine resubmission after REVISE.
-    ``payload`` is the raw payload of a ``worker-done`` event — the gate
-    itself does not receive typed events carrying it, so the caller supplies
-    it for the divergence check below.
+    ``report_ok`` is the caller's verdict on whether a ``worker-done`` body
+    parsed: parsing lives with the caller (as it already did for
+    plan-question), so this module imports nothing and stays a pure state
+    machine.
     """
 
     kind = getattr(event, "kind", None)
@@ -89,32 +92,19 @@ def transition(
             return Transition(state, ())
         return Transition(SUBMITTED, (LABEL_ON,), question_id=event.message_id)
 
-    if kind == "approval-reply":
-        try:
-            verdict = parse_approval_reply(event.body)
-        except MalformedReport:
-            return Transition(state, (FLAG_MALFORMED,))
-        if state != SUBMITTED:
-            # Out of order or replayed after the state already moved on.
-            return Transition(state, ())
-        next_state = VERDICT_APPROVED if verdict.approved else VERDICT_REVISE
-        return Transition(next_state, (LABEL_OFF,))
-
     if kind == "worker-done":
         if state == RETIRED:
             return Transition(state, ())  # guarded: retire fires once
         if event.outcome != "succeeded":
             return Transition(state, ())  # a failed planner is for the human
         if state == VERDICT_APPROVED:
-            try:
-                parse_planner_done(event.summary, payload or {})
-            except MalformedReport:
-                # Payload and body disagree with the recorded approval —
-                # never guess which one is right.
+            if not report_ok:
+                # The report does not follow its contract — never guess what
+                # was meant.
                 return Transition(state, (FLAG_MALFORMED,))
             return Transition(RETIRED, (RETIRE_PLANNER,))
-        # succeeded without a recorded approval: payload and gate state
-        # disagree — never guess which one is right.
+        # succeeded without a recorded approval: the report and the gate
+        # state disagree — never guess which one is right.
         return Transition(state, (FLAG_MALFORMED,))
 
     return Transition(state, ())

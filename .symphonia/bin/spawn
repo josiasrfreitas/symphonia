@@ -16,6 +16,12 @@ need, that is a package change, not an improvisation at the terminal.
     .symphonia/bin/spawn wait             [--ack <delivery_id>] [--timeout-ms <ms>]
     .symphonia/bin/spawn verdict          GRE-181 approved|revise [--notes <text>|--notes-file <path>]
 
+And two verbs a ROLE runs, inside its own dispatched terminal — the return
+half of the same interface. No role ever types `orca orchestration` by hand:
+
+    .symphonia/bin/spawn submit           GRE-181 --file plan.md
+    .symphonia/bin/spawn done             GRE-181 --outcome succeeded --file report.md
+
 `plan` derives a worktree from the repo's default base; every later role
 reuses that same worktree, so one Ticket Key means one checkout from plan to
 PR. Roles are Orca dispatches (attached), not child worktrees: they report
@@ -33,9 +39,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import importlib.util
@@ -81,7 +89,27 @@ GATE_ROLE = RoleName.PLANNER
 """Only the planner's completion is a Human Gate today; `wait` only reacts
 to gate events keyed to this role's dispatch."""
 
-STATE = PACKAGE / ".runtime" / "spawns.json"
+ASK_MAX_MS = 1_800_000
+"""What `orca orchestration ask` will actually wait, measured on 1.4.168: a
+larger `--timeout-ms` is clamped to this silently (asking for 99_999_999 came
+back reporting `timeoutMs: 1800000`). A human verdict routinely takes longer
+than 30 minutes, so `submit` resumes the same question by id instead of
+asking a second time."""
+
+# The registry of live spawns, deliberately OUTSIDE every checkout.
+#
+# Both sides of a dispatch read it: the Orchestrator, from its own checkout,
+# and the role itself, from the ticket's worktree — two different copies of
+# this repository. Keeping it under `PACKAGE/.runtime/` meant each side wrote
+# a different file, so a role could not look up its own task id, dispatch id
+# or capability. Override with SYMPHONIA_RUNTIME (the tests do).
+#
+# Writers: `spawn`, `wait`, `verdict`, `retire` — all Orchestrator-side. The
+# role-side verbs (`submit`, `done`) only ever read, so two processes in two
+# checkouts never race for this file.
+RUNTIME_DIR = Path(os.environ.get("SYMPHONIA_RUNTIME", "~/.symphonia/runtime")).expanduser()
+STATE = RUNTIME_DIR / "spawns.json"
+LEGACY_STATE = PACKAGE / ".runtime" / "spawns.json"
 # The baton between roles is the installed handoff skill's document, in the
 # location that skill owns — not a format this package invents.
 #
@@ -115,9 +143,22 @@ ROLE_BADGE = {
 # --- orca CLI ------------------------------------------------------------
 
 
-def orca(*argv: str) -> dict:
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
     """One orca call, envelope unwrapped, failures loud. The CLI wraps every
-    --json response in {id, ok, result, _meta}."""
+    --json response in {id, ok, result, _meta}.
+
+    `expect_lifecycle_ok` is for the lifecycle messages a role sends
+    (`worker_done`). Measured against Orca 1.4.168: a rejected `worker_done`
+    still answers `ok: true` — the refusal lives in `result.lifecycle` and in
+    the process exit code, not in the envelope. Without this flag a rejected
+    completion reads as a success, which is exactly how a planner ends up
+    never retiring. Note the asymmetry: `lifecycle` is present only on a
+    rejection, so its absence must never be treated as failure.
+    """
 
     proc = subprocess.run(["orca", *argv, "--json"], capture_output=True, text=True)
     if not proc.stdout.strip():
@@ -128,18 +169,37 @@ def orca(*argv: str) -> dict:
             err = data.get("error") or {}
             raise SystemExit(f"orca {' '.join(argv)} failed: {err.get('code')}: {err.get('message')}")
         data = data.get("result") or {}
+    if expect_lifecycle_ok:
+        lifecycle = (data or {}).get("lifecycle") or {}
+        if lifecycle.get("action") == "rejected" or proc.returncode != 0:
+            raise SystemExit(
+                f"orca {' '.join(argv[:2])} rejected: "
+                f"{lifecycle.get('code') or f'exit {proc.returncode}'}: "
+                f"{lifecycle.get('reason') or proc.stderr.strip()}"
+            )
     return data
 
 
 def state_read() -> dict:
+    """The live registry. Read from the shared runtime, falling back to the
+    per-checkout `.runtime/` a pre-GRE-178 install left behind."""
+
     if not STATE.exists():
+        if LEGACY_STATE.exists():
+            return json.loads(LEGACY_STATE.read_text())
         return {}
     return json.loads(STATE.read_text())
 
 
 def state_write(data: dict) -> None:
+    """Atomic, and 0600: the registry now carries Dispatch capability tokens,
+    which are what authorizes a `worker_done`."""
+
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp = STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp.chmod(0o600)
+    os.replace(tmp, STATE)
 
 
 # --- worktree ------------------------------------------------------------
@@ -354,6 +414,64 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None, cl
         )
 
 
+# --- role identity: how a role finds its own record -----------------------
+
+_CAPABILITY = re.compile(r"--dispatch-capability\s+(\S+)")
+
+
+def _capability_of(preamble: str) -> str | None:
+    """The Dispatch capability token Orca mints for an injected dispatch.
+
+    It exists only as text inside the preamble (the dispatch row's
+    `capability_hash` comes back null), so it is read with a regex — the
+    preamble repeats it once per lifecycle command and they are the same
+    token."""
+
+    found = _CAPABILITY.search(preamble)
+    return found.group(1) if found else None
+
+
+def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
+    """The record of the role calling this, from inside its own terminal.
+
+    Identity comes from `ORCA_TERMINAL_HANDLE`, which Orca exports into the
+    pane and `spawn` already stored as `terminal` — an exact match, never a
+    guess. The fallback (the worktree's git toplevel) exists for a pane whose
+    environment did not carry the handle; if it matches more than one live
+    role, this fails loudly rather than reporting on someone else's behalf.
+    """
+
+    ticket = ticket.upper()
+    data = state_read() if data is None else data
+    live = {
+        key: rec for key, rec in data.items()
+        if rec.get("ticket") == ticket and not rec.get("retired")
+    }
+    if not live:
+        raise SystemExit(f"no live spawn recorded for {ticket}; is this the right Ticket Key?")
+
+    handle = os.environ.get("ORCA_TERMINAL_HANDLE", "")
+    if handle:
+        for key, rec in live.items():
+            if rec.get("terminal") == handle:
+                return key, rec
+        raise SystemExit(
+            f"terminal {handle} is not a recorded role of {ticket}; "
+            f"this command is run by a role, from inside its own dispatched terminal"
+        )
+
+    toplevel = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    ).stdout.strip()
+    matches = [(key, rec) for key, rec in live.items() if rec.get("worktree") == toplevel]
+    if len(matches) == 1:
+        return matches[0]
+    raise SystemExit(
+        f"cannot tell which role is calling: ORCA_TERMINAL_HANDLE is unset and "
+        f"{len(matches)} live roles of {ticket} share the worktree {toplevel or '(unknown)'}"
+    )
+
+
 def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None = None) -> dict:
     ticket = ticket.upper()
     found = find_worktree(ticket)
@@ -417,9 +535,24 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "orchestration", "task-create",
         "--spec", spec,
     )["task"]["id"]
-    dispatch = orca(
+    dispatched = orca(
         "orchestration", "dispatch", "--task", task, "--to", terminal, "--inject",
-    )["dispatch"]["id"]
+        "--return-preamble",
+    )
+    dispatch = dispatched["dispatch"]["id"]
+    capability = _capability_of(dispatched.get("preamble") or "")
+    if not capability:
+        # Measured on Orca 1.4.168: an injected dispatch mints a capability
+        # and every lifecycle message is checked against it — a `worker_done`
+        # sent without it comes back `dispatch_capability_invalid` and the
+        # dispatch stays open forever. The token is printed only inside the
+        # preamble text (`capability_hash` on the dispatch row is null), so
+        # this is the one moment it can be captured.
+        print(
+            f"note: no dispatch capability found in the preamble for {ticket}/{role.value}; "
+            f"`spawn done` will not be able to complete this dispatch",
+            file=sys.stderr,
+        )
 
     record = {
         "ticket": ticket,
@@ -432,6 +565,9 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "terminal": terminal,
         "task": task,
         "dispatch": dispatch,
+        "capability": capability,
+        "gate_state": IDLE,
+        "approval_rounds": 0,
         "session_id": plan.session_id,
         "transcript": str(plan.transcript) if plan.transcript else None,
         "command": plan.command,
@@ -467,6 +603,12 @@ def status(ticket: str | None) -> list[dict]:
                 "model_requested": rec["model_requested"],
                 "model_observed": ",".join(models) or "(sem resposta ainda)",
                 "tier_ok": bool(models) and all(rec["model_requested"] in m for m in models),
+                # A role stuck at `verdict-approved` with an old
+                # `last_event_at` is one whose worker_done never landed —
+                # visible here rather than needing a verb of its own.
+                "gate_state": rec.get("gate_state", IDLE),
+                "approval_rounds": rec.get("approval_rounds", 0),
+                "last_event_at": rec.get("last_event_at"),
                 "worktree": rec["worktree"],
                 "terminal": rec["terminal"],
             }
@@ -551,28 +693,72 @@ def _apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str 
     for the caller to treat as an ordinary message instead. A body that
     starts `## Plan` but does not otherwise parse is flagged rather than
     silently accepted or silently ignored.
+
+    What the parsers return is kept, not discarded: the plan's pointer (the
+    comment the next role has to read) and the round count both come from
+    here, and the Ticket Key on the `## Plan` line is checked against the
+    record so a report filed under the wrong ticket is caught rather than
+    counted.
     """
 
     state = rec.get("gate_state", IDLE)
+    raw = raw_by_id.get(event.message_id)
+
+    # Orca does not drop a refused lifecycle message: it rewrites the subject
+    # and body and marks the payload. Measured on 1.4.168 — a `worker_done`
+    # without `dispatchId` comes back as a `worker_done` carrying
+    # `_orcaLifecycleRejection`. Without this branch that arrival is a
+    # completion that never completed anything.
+    rejection = (raw.payload if raw else {}).get("_orcaLifecycleRejection")
+    if rejection:
+        return [(
+            _gate.FLAG_MALFORMED,
+            f"Orca refused this {event.kind}: "
+            f"{rejection.get('code')}: {rejection.get('reason')}",
+        )]
 
     if event.kind == "plan-question":
         if not _reports.is_plan_submission(event.question):
             return []
         try:
-            _reports.parse_plan_submission(event.question)
+            submission = _reports.parse_plan_submission(event.question)
         except _reports.MalformedReport as exc:
             return [(_gate.FLAG_MALFORMED, str(exc))]
+        if submission.ticket.upper() != str(rec.get("ticket", "")).upper():
+            return [(
+                _gate.FLAG_MALFORMED,
+                f"plan submission is filed under {submission.ticket!r} but this "
+                f"dispatch is {rec.get('ticket')!r}",
+            )]
         result = _gate.transition(state, event, last_question_id=rec.get("last_question_id"))
         if result.question_id:
             rec["question_id"] = result.question_id
             rec["last_question_id"] = result.question_id
+            rec["plan_pointer"] = submission.pointer
+            rec["plan_decisions"] = list(submission.decisions)
+            # Counted here, so `spawn done` never has to ask the planner how
+            # many rounds it took.
+            rec["approval_rounds"] = int(rec.get("approval_rounds", 0)) + 1
     elif event.kind == "worker-done":
-        raw = raw_by_id.get(event.message_id)
-        result = _gate.transition(state, event, payload=(raw.payload if raw else {}))
+        report_ok = True
+        try:
+            report = _reports.parse_planner_done(event.summary)
+        except _reports.MalformedReport as exc:
+            report_ok, report = False, None
+            malformed_reason = str(exc)
+        result = _gate.transition(state, event, report_ok=report_ok)
+        if report is not None:
+            rec["plan_pointer_final"] = report.plan_pointer
+            rec["deviations"] = list(report.deviations)
+        if not report_ok and _gate.FLAG_MALFORMED in result.actions:
+            rec["gate_state"] = result.state
+            rec["last_event_at"] = _now()
+            return [(_gate.FLAG_MALFORMED, malformed_reason)]
     else:
         result = _gate.transition(state, event)
 
     rec["gate_state"] = result.state
+    rec["last_event_at"] = _now()
     divergence = (
         f"gate event {event.kind!r} did not match the recorded gate_state {state!r}"
     )
@@ -625,10 +811,19 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
             _tracker.append(_linear.LinearTracker())
         return _tracker[0]
 
+    unattributed = []
     for event in events:
         dispatch_id = getattr(event, "dispatch_id", None)
         key = by_dispatch.get(dispatch_id)
-        if key is None or not key.endswith(f"/{GATE_ROLE.value}"):
+        if key is None:
+            # A lifecycle message whose dispatch this package does not know:
+            # it completes nothing and would otherwise vanish. Reported, not
+            # swallowed — a `worker_done` that lost its `dispatchId` lands
+            # here.
+            if event.kind == "worker-done":
+                unattributed.append({"message": event.message_id, "dispatch": dispatch_id})
+            continue
+        if not key.endswith(f"/{GATE_ROLE.value}"):
             continue  # the gate governs only the planner's own dispatch
         rec = data[key]
         ticket = rec["ticket"]
@@ -656,6 +851,7 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
             for m in batch.messages
         ],
         "actions": actions_taken,
+        "unattributed_worker_done": unattributed,
     }
 
 
@@ -691,10 +887,156 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     _linear.LinearTracker().set_gate(ticket, False)
 
     rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
+    rec["last_event_at"] = _now()
     rec.pop("question_id", None)
     data[key] = rec
     state_write(data)
     return {"ticket": ticket, "decision": token}
+
+
+# --- the role's own two verbs ---------------------------------------------
+#
+# Everything above is run by the Orchestrator. The two below are run BY A
+# ROLE, inside its own dispatched terminal, and they are the return half of
+# what `spawn plan` is on the way in: the role writes a body, the script
+# builds and checks the message. Three things measured on Orca 1.4.168 are
+# why this cannot be left to a role typing `orca orchestration` by hand:
+#
+#   1. `--payload` and the structured flags (`--task-id`, `--dispatch-id`,
+#      `--outcome`) are MUTUALLY EXCLUSIVE — using both is `invalid_argument`
+#      and no message is sent at all. Anything the gate needs beyond those
+#      three fields therefore forces one single `--payload` carrying all of
+#      them, which is not the shape Orca's own preamble teaches.
+#   2. An injected dispatch mints a capability, and a lifecycle message
+#      without it is refused with `dispatch_capability_invalid`.
+#   3. A dispatch grants exactly one `worker_done`. A second is refused, so a
+#      malformed report cannot be corrected — the body has to be checked
+#      BEFORE the single shot is spent, which is what these verbs do.
+
+
+def _payload_for(rec: dict, outcome: str, extra: dict | None = None) -> str:
+    """The one `--payload` a lifecycle message is allowed to carry: the three
+    fields Orca reconciles on, plus whatever the gate needs."""
+
+    payload = {
+        "taskId": rec["task"],
+        "dispatchId": rec["dispatch"],
+        "outcome": outcome,
+        **(extra or {}),
+    }
+    return json.dumps(payload)
+
+
+def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
+    """Send a Local Technical Plan for a verdict and block until it arrives.
+
+    The verdict is parsed here and returned as a field. That is the other
+    half of `spawn verdict`: the reply is written by a script on the
+    coordinator's side and read by a script on the planner's side, so
+    `APPROVED`/`REVISE` never depends on a model reading prose.
+
+    `ask` caps its own wait at 30 minutes, and a human verdict routinely
+    takes longer, so a timeout is resumed by message id rather than asked
+    again — a second `ask` would be a second question, and the gate would
+    have two submissions to reconcile.
+    """
+
+    ticket = ticket.upper()
+    key, rec = own_record(ticket)
+    if rec["role"] != GATE_ROLE.value:
+        raise SystemExit(f"{key} is not the planner; only the planner submits a plan for a verdict")
+
+    body = Path(body_path).read_text()
+    submission = _reports.parse_plan_submission(body)  # loud, before anything is sent
+    if submission.ticket.upper() != ticket:
+        raise SystemExit(
+            f"the '## Plan' line says {submission.ticket!r} but you are dispatched on {ticket!r}"
+        )
+
+    ask = ["orchestration", "ask", "--from", rec["terminal"]]
+    if rec.get("capability"):
+        ask += ["--dispatch-capability", rec["capability"]]
+
+    waited, message_id, answer = 0, None, None
+    while answer is None:
+        if waited >= max_wait_ms:
+            raise SystemExit(
+                f"no verdict after {max_wait_ms}ms; the question is still pending as "
+                f"{message_id} — resume it with a longer --max-wait-ms, never ask again"
+            )
+        argv = list(ask)
+        argv += ["--resume", message_id] if message_id else ["--question", body]
+        slice_ms = min(ASK_MAX_MS, max_wait_ms - waited)
+        result = orca(*argv, "--timeout-ms", str(slice_ms))
+        # `ask` answers with its own object and no {id, ok, result} envelope:
+        # {answer, messageId, answerMessageId, threadId, timedOut, timeoutMs}.
+        waited += int(result.get("timeoutMs") or slice_ms)
+        message_id = str(result.get("messageId") or message_id or "")
+        answer = result.get("answer")
+        if answer is None and not result.get("timedOut"):
+            raise SystemExit(
+                f"ask ended without an answer and without a timeout "
+                f"(cancelled={result.get('cancelled')}, "
+                f"connectionLost={result.get('connectionLost')}); question {message_id} is pending"
+            )
+
+    parsed = _reports.parse_approval_reply(str(answer))
+    return {
+        "ticket": ticket,
+        "question_id": message_id,
+        "verdict": "approved" if parsed.approved else "revise",
+        "notes": list(parsed.notes),
+    }
+
+
+def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> dict:
+    """The single `worker_done` a dispatch allows, built and checked here.
+
+    For the planner it also refuses to fire before the gate recorded an
+    approval — that check is what protects the one shot, since a `worker_done`
+    that arrives without a recorded approval is flagged and cannot be resent.
+    """
+
+    ticket = ticket.upper()
+    if outcome not in ("succeeded", "failed"):
+        raise SystemExit(f"unknown outcome {outcome!r}; use 'succeeded' or 'failed'")
+    key, rec = own_record(ticket)
+    body = Path(body_path).read_text()
+    extra: dict = {}
+
+    if rec["role"] == GATE_ROLE.value and outcome == "succeeded":
+        state = rec.get("gate_state", IDLE)
+        if state != _gate.VERDICT_APPROVED:
+            raise SystemExit(
+                f"the plan for {ticket} is not approved (gate state {state!r}); a planner's "
+                f"worker_done is only valid after APPROVED, and you get exactly one"
+            )
+        report = _reports.parse_planner_done(body)  # loud, before the shot is spent
+        rounds = int(rec.get("approval_rounds", 1)) or 1
+        # The body is rewritten from the record: `## Approval` states what the
+        # gate counted, not what the planner remembers.
+        body = _reports.format_planner_done(report.plan_pointer, rounds, report.deviations)
+        extra = {"planApproved": True, "approvalRounds": rounds}
+
+    argv = [
+        "orchestration", "send",
+        "--from", rec["terminal"],
+        "--type", "worker_done",
+        "--subject", f"{ticket} {rec['role']}: {outcome}",
+        "--body", body,
+        "--payload", _payload_for(rec, outcome, extra),
+    ]
+    if rec.get("capability"):
+        argv += ["--dispatch-capability", rec["capability"]]
+    if files_modified.strip():
+        # Never as `--files-modified`: that is a structured flag, and one of
+        # those alongside `--payload` is refused outright.
+        payload = json.loads(argv[argv.index("--payload") + 1])
+        payload["filesModified"] = [f.strip() for f in files_modified.split(",") if f.strip()]
+        argv[argv.index("--payload") + 1] = json.dumps(payload)
+
+    orca(*argv, expect_lifecycle_ok=True)
+    return {"ticket": ticket, "role": rec["role"], "outcome": outcome, "reported": key}
 
 
 # --- CLI -----------------------------------------------------------------
@@ -731,6 +1073,17 @@ def main() -> int:
     p.add_argument("decision", choices=["approved", "revise"])
     p.add_argument("--notes", default="")
     p.add_argument("--notes-file")
+    # The role's own two verbs. Run inside a dispatched terminal, by the role
+    # itself — the Orchestrator never calls these.
+    p = sub.add_parser("submit")
+    p.add_argument("ticket")
+    p.add_argument("--file", required=True, help="Path to the plan submission body.")
+    p.add_argument("--max-wait-ms", type=int, default=6 * ASK_MAX_MS)
+    p = sub.add_parser("done")
+    p.add_argument("ticket")
+    p.add_argument("--file", required=True, help="Path to the report body.")
+    p.add_argument("--outcome", choices=["succeeded", "failed"], required=True)
+    p.add_argument("--files-modified", default="")
 
     args = parser.parse_args()
     if args.verb in VERBS:
@@ -749,6 +1102,15 @@ def main() -> int:
         if args.notes_file:
             notes = (notes + "\n" + Path(args.notes_file).read_text()).strip()
         print(json.dumps(verdict(args.ticket, args.decision, notes), indent=2))
+    elif args.verb == "submit":
+        print(json.dumps(
+            submit(args.ticket, args.file, max_wait_ms=args.max_wait_ms), indent=2
+        ))
+    elif args.verb == "done":
+        print(json.dumps(done(
+            args.ticket, args.file,
+            outcome=args.outcome, files_modified=args.files_modified,
+        ), indent=2))
     return 0
 
 

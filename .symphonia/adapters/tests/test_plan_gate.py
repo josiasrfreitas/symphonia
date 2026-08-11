@@ -1,9 +1,14 @@
 """Tests for the plan gate state machine (GRE-178).
 
-TLDR: the transition table end to end (submit -> label on -> approve ->
-label off -> worker_done -> retire), the REVISE round trip, and replay
-idempotency — the same event applied twice from the same state must not
-double an action. Run either way:
+TLDR: the transition table end to end (submit -> label on -> verdict
+recorded by `spawn verdict` -> worker_done -> retire), the REVISE round
+trip, and replay idempotency — the same event applied twice from the same
+state must not double an action.
+
+The verdict is NOT an event here: measured on Orca 1.4.168, the answer to an
+`ask` goes back to the worker that asked and never reaches the coordinator's
+mailbox, so `spawn verdict` writes the state directly and the planner's side
+of that exchange is parsed by `spawn submit`. Run either way:
 
     cd .symphonia && python3 -m unittest adapters.tests.test_plan_gate
     python3 .symphonia/adapters/tests/test_plan_gate.py
@@ -35,19 +40,13 @@ def question(message_id: str = "q-1"):
     return SimpleNamespace(kind="plan-question", message_id=message_id)
 
 
-def reply(token: str, notes: str = ""):
-    body = token + (f"\n\n- {notes}" if notes else "")
-    return SimpleNamespace(kind="approval-reply", body=body)
-
-
 DONE_BODY = "## Plan\npointer\n\n## Approval\n1 round.\n\n## Deviations\nNone.\n"
 
 
-def done(outcome: str, *, approved: bool = True, rounds: int = 1):
-    payload = {"planApproved": approved, "approvalRounds": rounds}
+def done(outcome: str):
     return SimpleNamespace(
         kind="worker-done", message_id="d-1", outcome=outcome, summary=DONE_BODY,
-    ), payload
+    )
 
 
 class TestHappyPath(unittest.TestCase):
@@ -57,23 +56,16 @@ class TestHappyPath(unittest.TestCase):
         self.assertEqual((result.state, result.actions), (SUBMITTED, (LABEL_ON,)))
         self.assertEqual(result.question_id, "q-1")
 
-        result = transition(result.state, reply("APPROVED"))
-        self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, (LABEL_OFF,)))
-
-        event, payload = done("succeeded")
-        result = transition(result.state, event, payload=payload)
+        # `spawn verdict` records the verdict; no event carries it.
+        result = transition(VERDICT_APPROVED, done("succeeded"), report_ok=True)
         self.assertEqual((result.state, result.actions), (RETIRED, (RETIRE_PLANNER,)))
 
 
 class TestReviseRoundTrip(unittest.TestCase):
     def test_revise_then_resubmit_relights_the_label(self):
-        state = SUBMITTED
-        result = transition(state, reply("REVISE", "fix the write scope"))
-        self.assertEqual((result.state, result.actions), (VERDICT_REVISE, (LABEL_OFF,)))
-
         # A genuine resubmission carries a NEW question id — the planner
         # asked again after correcting the plan.
-        result = transition(result.state, question("q-2"), last_question_id="q-1")
+        result = transition(VERDICT_REVISE, question("q-2"), last_question_id="q-1")
         self.assertEqual((result.state, result.actions), (SUBMITTED, (LABEL_ON,)))
         self.assertEqual(result.question_id, "q-2")
 
@@ -83,13 +75,16 @@ class TestReplayIsIdempotent(unittest.TestCase):
         result = transition(SUBMITTED, question("q-1"), last_question_id="q-1")
         self.assertEqual((result.state, result.actions), (SUBMITTED, ()))
 
-    def test_repeated_approval_reply_is_a_no_op(self):
-        result = transition(VERDICT_APPROVED, reply("APPROVED"))
+    def test_an_approval_reply_event_is_inert(self):
+        """The coordinator never sees one; if a runtime ever delivered one it
+        must change nothing, since `spawn verdict` already recorded the
+        state."""
+        inert = SimpleNamespace(kind="approval-reply", body="APPROVED")
+        result = transition(VERDICT_APPROVED, inert)
         self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, ()))
 
     def test_repeated_worker_done_after_retirement_does_not_retire_twice(self):
-        event, payload = done("succeeded")
-        result = transition(RETIRED, event, payload=payload)
+        result = transition(RETIRED, done("succeeded"), report_ok=True)
         self.assertEqual((result.state, result.actions), (RETIRED, ()))
 
     def test_replay_of_the_submission_after_approval_does_not_relight_the_label(self):
@@ -107,26 +102,19 @@ class TestReplayIsIdempotent(unittest.TestCase):
 
 
 class TestDivergenceIsFlagged(unittest.TestCase):
-    def test_invalid_approval_token_is_flagged_not_guessed(self):
-        result = transition(SUBMITTED, reply("MAYBE"))
-        self.assertEqual((result.state, result.actions), (SUBMITTED, (FLAG_MALFORMED,)))
-
     def test_succeeded_done_without_recorded_approval_is_flagged(self):
-        event, payload = done("succeeded")
-        result = transition(SUBMITTED, event, payload=payload)
+        result = transition(SUBMITTED, done("succeeded"), report_ok=True)
         self.assertEqual((result.state, result.actions), (SUBMITTED, (FLAG_MALFORMED,)))
 
     def test_failed_done_is_left_for_the_human(self):
-        event, payload = done("failed")
-        result = transition(SUBMITTED, event, payload=payload)
+        result = transition(SUBMITTED, done("failed"))
         self.assertEqual((result.state, result.actions), (SUBMITTED, ()))
 
-    def test_approved_done_with_payload_disagreeing_is_flagged_not_retired(self):
-        """A1: worker_done now goes through `parse_planner_done`, closing
-        the payload side of the divergence check — a `planApproved: false`
-        payload after an APPROVED verdict must not retire the planner."""
-        event, payload = done("succeeded", approved=False)
-        result = transition(VERDICT_APPROVED, event, payload=payload)
+    def test_approved_done_whose_body_did_not_parse_is_flagged_not_retired(self):
+        """The caller parses the body; a report that does not follow its
+        contract must not retire the planner, and cannot be resent — a
+        dispatch grants exactly one worker_done."""
+        result = transition(VERDICT_APPROVED, done("succeeded"), report_ok=False)
         self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, (FLAG_MALFORMED,)))
 
 

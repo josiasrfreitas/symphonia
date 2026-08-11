@@ -15,6 +15,14 @@ side of the conversation; a coordinator-side reader will see the
 ``PlanQuestion`` and the eventual ``WorkerDone``, but not the reply it
 itself sent.
 
+Which is why ``plan_gate`` handles only the two the coordinator can see. The
+worker's side of that same exchange is not left to a model reading its
+screen: ``orca orchestration ask`` prints the answer back to the caller
+(measured on 1.4.168 — the response object carries ``answer``,
+``messageId``, ``timedOut``), and ``spawn submit`` parses it with
+``reports.parse_approval_reply``. ``ApprovalReply`` stays here because it is
+the shape of that message; nothing coordinator-side consumes it.
+
 Run standalone to print gate events as JSON lines:
 
     python3 events.py --terminal <handle>

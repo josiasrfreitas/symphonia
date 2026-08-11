@@ -22,6 +22,7 @@
 - The tracker is the only state. Every `/orchestrate` run starts with Reconciliation.
 - `CLAUDE.md` is always only a link to `AGENTS.md`.
 - Skills never duplicate content; they point into `.symphonia/`.
+- **A role's return path is a script, like its launch path.** No role types `orca orchestration` by hand: `spawn submit` and `spawn done` build, check and send what it reports. The live registry that makes this possible lives at `~/.symphonia/runtime/spawns.json` (override with `SYMPHONIA_RUNTIME`) — outside every checkout, because both the Orchestrator and the role read it from different worktrees.
 - **Payload × body:** if a script decides on a field, it travels as payload (or a fixed-position token, for messages with no payload); if a human or the next phase reads it, it is a body section. The body may repeat a payload value for a human to read, but it is never the source of truth for automation. Role templates and `adapters/reports.py` point here instead of restating it.
 
 ## Installing

@@ -23,6 +23,7 @@ from adapters.reports import (
     is_plan_submission,
     parse_approval_reply,
     parse_plan_submission,
+    format_planner_done,
     parse_planner_done,
 )
 
@@ -72,22 +73,27 @@ class TestApprovalReplyGolden(unittest.TestCase):
 
 class TestPlannerDoneGolden(unittest.TestCase):
     def test_parses_plan_pointer_and_deviations_from_the_body(self):
-        report = parse_planner_done(
-            _example("md io:example-done"),
-            {"planApproved": True, "approvalRounds": 1},
-        )
+        report = parse_planner_done(_example("md io:example-done"))
         self.assertIn("85dfe356-d077-436c-895c-ffc8f4bf1264", report.plan_pointer)
         self.assertEqual(report.deviations, ())
-        self.assertTrue(report.plan_approved)
-        self.assertEqual(report.approval_rounds, 1)
 
-    def test_approval_rounds_comes_from_payload_not_body(self):
-        """The rule from the README: a script-decided field is payload, and
-        the body is never the source of truth for it, even when it repeats
-        the number for a human to read."""
-        body = _example("md io:example-done").replace("1 round.", "1 round.")
-        report = parse_planner_done(body, {"planApproved": True, "approvalRounds": 4})
-        self.assertEqual(report.approval_rounds, 4)
+    def test_the_body_carries_no_approval_facts(self):
+        """`planApproved` and `approvalRounds` are decided by the gate and
+        written into the payload by `spawn done`; the parser must not offer
+        them, so nothing downstream can read a role's claim by mistake."""
+        report = parse_planner_done(_example("md io:example-done"))
+        self.assertFalse(hasattr(report, "plan_approved"))
+        self.assertFalse(hasattr(report, "approval_rounds"))
+
+    def test_round_trips_through_the_formatter(self):
+        written = format_planner_done("GRE-181 — comment abc", 2, ["escopo ampliado"])
+        report = parse_planner_done(written)
+        self.assertEqual(report.plan_pointer, "GRE-181 — comment abc")
+        self.assertEqual(report.deviations, ("escopo ampliado",))
+        self.assertIn("2 rodadas.", written)
+
+    def test_one_round_is_singular(self):
+        self.assertIn("1 rodada.", format_planner_done("p", 1))
 
 
 class TestIsPlanSubmission(unittest.TestCase):
@@ -154,19 +160,13 @@ class TestMalformedPlannerDone(unittest.TestCase):
     def test_missing_section_names_it(self):
         body = "## Plan\npointer\n\n## Deviations\nNone.\n"
         with self.assertRaises(MalformedReport) as ctx:
-            parse_planner_done(body, {"planApproved": True, "approvalRounds": 1})
+            parse_planner_done(body)
         self.assertIn("Approval", str(ctx.exception))
 
-    def test_missing_payload_field_names_it(self):
-        body = _example("md io:example-done")
+    def test_empty_body_names_the_first_missing_section(self):
         with self.assertRaises(MalformedReport) as ctx:
-            parse_planner_done(body, {"approvalRounds": 1})
-        self.assertIn("planApproved", str(ctx.exception))
-
-    def test_payload_not_approved_raises(self):
-        body = _example("md io:example-done")
-        with self.assertRaises(MalformedReport):
-            parse_planner_done(body, {"planApproved": False, "approvalRounds": 1})
+            parse_planner_done("")
+        self.assertIn("Plan", str(ctx.exception))
 
 
 if __name__ == "__main__":

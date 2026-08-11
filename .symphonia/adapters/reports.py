@@ -161,11 +161,15 @@ def format_approval_reply(token: str, notes: tuple[str, ...] | list[str] = ()) -
 class PlannerReport:
     plan_pointer: str
     deviations: tuple[str, ...]
-    plan_approved: bool
-    approval_rounds: int
 
 
-def parse_planner_done(body: str, payload: dict) -> PlannerReport:
+def parse_planner_done(body: str) -> PlannerReport:
+    """The body only. ``planApproved`` and ``approvalRounds`` used to be read
+    from the payload and are now derived from the recorded gate state by
+    ``spawn done`` — a role asserting "the plan was approved" was a claim the
+    script already had the answer to, and the only thing that claim could add
+    was a disagreement."""
+
     sections = _sections(body)
     plan_pointer = _require_section(sections, "Plan", "planner worker_done")
     _require_section(sections, "Approval", "planner worker_done")
@@ -179,24 +183,19 @@ def parse_planner_done(body: str, payload: dict) -> PlannerReport:
             if line.strip().startswith("- ")
         )
     )
+    return PlannerReport(plan_pointer=plan_pointer.strip(), deviations=deviations)
 
-    if "planApproved" not in payload:
-        raise MalformedReport(
-            "planner worker_done: payload is missing required field 'planApproved'"
-        )
-    if "approvalRounds" not in payload:
-        raise MalformedReport(
-            "planner worker_done: payload is missing required field 'approvalRounds'"
-        )
-    plan_approved = bool(payload["planApproved"])
-    if not plan_approved:
-        raise MalformedReport(
-            "planner worker_done: payload['planApproved'] is not true; "
-            "this report may only be sent after APPROVED"
-        )
-    return PlannerReport(
-        plan_pointer=plan_pointer.strip(),
-        deviations=deviations,
-        plan_approved=plan_approved,
-        approval_rounds=int(payload["approvalRounds"]),
-    )
+
+def format_planner_done(
+    plan_pointer: str, approval_rounds: int, deviations: tuple[str, ...] | list[str] = ()
+) -> str:
+    """The one place that writes the shape ``parse_planner_done`` reads.
+
+    ``## Approval`` is written from the round count the gate observed, not
+    from what the role remembers — same reason ``format_approval_reply``
+    exists on the other side of the conversation."""
+
+    rounds = f"{approval_rounds} rodada." if approval_rounds == 1 else f"{approval_rounds} rodadas."
+    listed = [line.strip() for line in deviations if line.strip()]
+    body = "\n".join(f"- {line}" for line in listed) if listed else "None."
+    return f"## Plan\n{plan_pointer.strip()}\n\n## Approval\n{rounds}\n\n## Deviations\n{body}"
