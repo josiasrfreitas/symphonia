@@ -6,7 +6,7 @@
 
 Every folder here is 100% one of three things:
 
-- **Source** — what is written, reviewed, and imported or executed. Lives under `src/`: the Python package (`adapters/`, `guardrails/`, `dag/`, `reconcile/`) and the two scripts (`spawn.py`, `setup_worktree.py`) behind the thin `bin/` entrypoints. `bin/` itself is Source too — the two thin executable entrypoints, kept outside `src/` as the stable CLI surface (per ADR-0001), with their body living in `src/`.
+- **Source** — what is written, reviewed, and imported or executed. Lives under `src/`: the Python package (`adapters/`, `guardrails/`, `dag/`, `reconcile/`, `workflow/`) and the two scripts (`spawn.py`, `setup_worktree.py`) behind the thin `bin/` entrypoints. `bin/` itself is Source too — the two thin executable entrypoints, kept outside `src/` as the stable CLI surface (per ADR-0001), with their body living in `src/`.
 - **Resource** — content Source reads but never executes: `roles/`, `skills/`, `config.json`, `DEPENDENCIES.md`. Siblings of `src/`, not inside it.
 - **Artifact** — what a run produces: the spawn registry, handoff documents, transcripts, an instantiated DAG. Never committed, and lives outside every checkout (`~/.symphonia/runtime/`, `~/orca/.context`).
 
@@ -27,6 +27,7 @@ READMEs are the one exception: documentation of the folder they sit in, not cont
 | `src/guardrails/` | Guardrail scripts: Write Scope collision/audit, Review Budget meter, Context Budget gate. Skeletons for now. |
 | `src/reconcile/` | Reconciliation: how a run compares tracker vs runtime and acts only on the difference. |
 | `src/adapters/` | The shared Python interfaces: Tracker Adapter contract, Runtime Adapter contract, structured Needs Attention codes, role I/O parsing (`reports.py`), and the plan gate state machine (`plan_gate.py`). |
+| `src/workflow/` | The gate loop: turns typed gate events into gate actions and executes them, over `src/adapters/plan_gate.py`'s pure state machine. Dependency-injected, so it is driven by a test without loading the CLI. |
 | `src/spawn.py` | The spawn interface's implementation — verbs, worktree policy, the plan gate wiring. `bin/spawn` just imports it. |
 | `src/setup_worktree.py` | Copies the env files a fresh worktree never gets. `bin/setup-worktree` just imports it. |
 | `hooks/` | Harness hooks (the `Stop` hook that drives the context gate). |

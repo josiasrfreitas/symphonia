@@ -22,6 +22,7 @@ PACKAGE = Path(__file__).resolve().parents[2]  # .symphonia/src, the sys.path ro
 sys.path.insert(0, str(PACKAGE))
 
 from adapters.tracker_adapter import Comment, Item, ItemKind, ItemRef, Openness
+from workflow import gate_loop as GATE_LOOP
 
 import spawn as SPAWN
 
@@ -119,7 +120,7 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
 
     def test_non_submission_question_is_not_a_gate_event(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
-        actions = SPAWN._apply_gate_event(rec, self._question("Should I use A or B?"), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question("Should I use A or B?"), {})
         self.assertEqual(actions, [])
         self.assertEqual(rec["gate_state"], SPAWN.IDLE)
         self.assertNotIn("question_id", rec)
@@ -127,7 +128,7 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
     def test_real_submission_lights_the_label(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
         body = "## Plan\nGRE-1 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
-        actions = SPAWN._apply_gate_event(rec, self._question(body, "q-1"), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question(body, "q-1"), {})
         self.assertEqual(actions, [(SPAWN._gate.LABEL_ON, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
         self.assertEqual(rec["question_id"], "q-1")
@@ -140,7 +141,7 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
     def test_a_submission_filed_under_another_ticket_is_flagged(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
         body = "## Plan\nGRE-9 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
-        actions = SPAWN._apply_gate_event(rec, self._question(body), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question(body), {})
         action, reason = actions[0]
         self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
         self.assertIn("GRE-9", reason)
@@ -149,7 +150,7 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
     def test_body_that_starts_plan_but_fails_to_parse_is_flagged(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
         body = "## Plan\nGRE-1 — pointer\n\n## Changes\nNone.\n"  # missing Decisions
-        actions = SPAWN._apply_gate_event(rec, self._question(body), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question(body), {})
         self.assertEqual(len(actions), 1)
         action, reason = actions[0]
         self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
@@ -169,19 +170,19 @@ class TestApplyGateEventReplayVsResubmission(unittest.TestCase):
 
     def test_replay_after_approval_does_not_relight_the_label(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED, "last_question_id": "q-1"}
-        actions = SPAWN._apply_gate_event(rec, self._question("q-1"), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question("q-1"), {})
         self.assertEqual(actions, [])
         self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_APPROVED)
 
     def test_replay_after_revise_does_not_relight_the_label(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
-        actions = SPAWN._apply_gate_event(rec, self._question("q-1"), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question("q-1"), {})
         self.assertEqual(actions, [])
         self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_REVISE)
 
     def test_resubmission_after_revise_lights_the_label(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
-        actions = SPAWN._apply_gate_event(rec, self._question("q-2"), {})
+        actions = GATE_LOOP.apply_gate_event(rec, self._question("q-2"), {})
         self.assertEqual(actions, [(SPAWN._gate.LABEL_ON, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
         self.assertEqual(rec["last_question_id"], "q-2")
@@ -204,7 +205,7 @@ class TestApplyGateEventWorkerDone(unittest.TestCase):
     def test_approved_and_wellformed_report_retires(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED}
         raw = SimpleNamespace(payload={})
-        actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
+        actions = GATE_LOOP.apply_gate_event(rec, self._done(), {"d-1": raw})
         self.assertEqual(actions, [(SPAWN._gate.RETIRE_PLANNER, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.RETIRED)
         self.assertEqual(rec["plan_pointer_final"], "pointer")
@@ -214,7 +215,7 @@ class TestApplyGateEventWorkerDone(unittest.TestCase):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_APPROVED}
         raw = SimpleNamespace(payload={})
         broken = "## Plan\npointer\n\n## Deviations\nNone.\n"  # no Approval
-        actions = SPAWN._apply_gate_event(rec, self._done(summary=broken), {"d-1": raw})
+        actions = GATE_LOOP.apply_gate_event(rec, self._done(summary=broken), {"d-1": raw})
         action, reason = actions[0]
         self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
         self.assertIn("Approval", reason)
@@ -228,7 +229,7 @@ class TestApplyGateEventWorkerDone(unittest.TestCase):
         raw = SimpleNamespace(payload={"_orcaLifecycleRejection": {
             "code": "missing_dispatch_id", "reason": "worker_done requires dispatchId.",
         }})
-        actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
+        actions = GATE_LOOP.apply_gate_event(rec, self._done(), {"d-1": raw})
         action, reason = actions[0]
         self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
         self.assertIn("missing_dispatch_id", reason)

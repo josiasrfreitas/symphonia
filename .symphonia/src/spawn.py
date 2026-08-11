@@ -28,15 +28,18 @@ PR. Roles are Orca dispatches (attached), not child worktrees: they report
 `worker_done` to the Orchestrator's Run.
 
 `wait` is the one loop that hears back from every role — it also drives the
-plan gate: it turns mailbox messages into typed events (`adapters/orca/events.py`),
-runs each through `adapters/plan_gate.py`, and executes what comes back
-(label the ticket, retire the planner, flag a divergence). `verdict` is how
-the human's decision reaches the planner: it never comes from an agent
-typing `APPROVED`/`REVISE` into a reply by hand.
+plan gate: it turns mailbox messages into typed events (`adapters/orca/events.py`)
+and hands them to `workflow.gate_loop.run`, which runs each through
+`adapters/plan_gate.py` and executes what comes back (label the ticket,
+retire the planner, flag a divergence). `verdict` is how the human's
+decision reaches the planner: it never comes from an agent typing
+`APPROVED`/`REVISE` into a reply by hand.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -45,8 +48,8 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
-from adapters import attention as _attention
 from adapters import plan_gate as _gate
 from adapters import reports as _reports
 from adapters import runtime_adapter as _contract
@@ -56,6 +59,7 @@ from adapters.orca import adapter as _cli
 from adapters.orca import events as _events
 from adapters.orca import launcher as _launcher
 import setup_worktree as _setup_worktree
+from workflow import gate_loop as _gate_loop
 
 # `.symphonia/`, the package root: two levels up from this file
 # (`src/spawn.py`), one for `src/` and one for the package. Everything below
@@ -86,8 +90,17 @@ asking a second time."""
 # Writers: `spawn`, `wait`, `verdict`, `retire` — all Orchestrator-side. The
 # role-side verbs (`submit`, `done`) only ever read, so two processes in two
 # checkouts never race for this file.
+#
+# The record shape below (`ticket`, `dispatch`, `task`, `gate_state`, ...) is
+# internal to this package, not a public contract: nothing outside `spawn.py`
+# and `workflow/gate_loop.py` is entitled to depend on it, and it can change
+# shape between versions without notice.
 RUNTIME_DIR = Path(os.environ.get("SYMPHONIA_RUNTIME", "~/.symphonia/runtime")).expanduser()
 STATE = RUNTIME_DIR / "spawns.json"
+# A sibling, not `STATE` itself: `state_write` swaps the inode via
+# `os.replace`, so an flock held on the file being replaced protects
+# nothing once the swap happens.
+STATE_LOCK = STATE.with_name(STATE.name + ".lock")
 # The baton between roles is the installed handoff skill's document, in the
 # location that skill owns — not a format this package invents.
 #
@@ -173,6 +186,39 @@ def state_write(data: dict) -> None:
     with os.fdopen(fd, "w") as handle:
         handle.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, STATE)
+
+
+@contextlib.contextmanager
+def state_lock() -> Iterator[None]:
+    """Serializes a read-modify-write cycle of the registry across
+    processes: `wait` can sit on a snapshot for up to 15 minutes while a
+    concurrent `verdict` writes `gate_state` elsewhere, and without this the
+    read-modify-write in either one can silently revert the other's write.
+
+    Hold this ONLY around a `state_read()`/`state_write()` pair, never
+    around the blocking `check --wait` itself — that wait is the up-to-15-
+    minute part, and holding the lock across it would starve every
+    concurrent `verdict` for as long as `wait` sits idle.
+
+    flock, not a POSIX record lock: two separate `os.open()` calls on
+    `STATE_LOCK` conflict even from the SAME process, because a flock is
+    held by the open file description, not the process. That means this
+    lock does not nest — `retire()` must never call `state_lock()` while it
+    is invoked from inside `wait`'s critical section (which it is, via
+    `workflow.gate_loop.run`'s `retire` action): a second acquisition here
+    would deadlock the one process holding the first. `retire()` stays
+    unlocked; only `wait` and `verdict` acquire this.
+    """
+
+    STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE.parent, 0o700)  # a directory that already existed
+    fd = os.open(STATE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # --- worktree ------------------------------------------------------------
@@ -652,112 +698,13 @@ def retire(ticket: str, role_value: str) -> dict:
 IDLE = _gate.IDLE
 
 
-def _flag_malformed(tracker, ticket: str, reason: str) -> None:
-    tracker.set_attention(
-        ticket,
-        _attention.Attention(
-            needs=True, code=_attention.AttentionCode.MALFORMED_REPORT, reason=reason,
-        ),
-    )
-
-
-def _apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str | None]]:
-    """The gate's decision for one event, isolated from the tracker/Linear
-    calls `wait` makes: mutates `rec`'s `gate_state`/`question_id` in place
-    and returns the `(action, reason)` pairs to execute — `reason` is only
-    set for `flag_malformed`. No network call happens here, so this is what
-    a unit test drives.
-
-    A `plan-question` is only a gate event when its body is a real plan
-    submission (`reports.is_plan_submission`) — a clarifying question from
-    the planner is not a submission, does not light the label, and is left
-    for the caller to treat as an ordinary message instead. A body that
-    starts `## Plan` but does not otherwise parse is flagged rather than
-    silently accepted or silently ignored.
-
-    What the parsers return is kept, not discarded: the plan's pointer (the
-    comment the next role has to read) and the round count both come from
-    here, and the Ticket Key on the `## Plan` line is checked against the
-    record so a report filed under the wrong ticket is caught rather than
-    counted.
-    """
-
-    state = rec.get("gate_state", IDLE)
-    raw = raw_by_id.get(event.message_id)
-
-    # Orca does not drop a refused lifecycle message: it rewrites the subject
-    # and body and marks the payload. Measured on 1.4.168 — a `worker_done`
-    # without `dispatchId` comes back as a `worker_done` carrying
-    # `_orcaLifecycleRejection`. Without this branch that arrival is a
-    # completion that never completed anything.
-    rejection = (raw.payload if raw else {}).get("_orcaLifecycleRejection")
-    if rejection:
-        return [(
-            _gate.FLAG_MALFORMED,
-            f"Orca refused this {event.kind}: "
-            f"{rejection.get('code')}: {rejection.get('reason')}",
-        )]
-
-    if event.kind == "plan-question":
-        if not _reports.is_plan_submission(event.question):
-            return []
-        try:
-            submission = _reports.parse_plan_submission(event.question)
-        except _reports.MalformedReport as exc:
-            return [(_gate.FLAG_MALFORMED, str(exc))]
-        if submission.ticket.upper() != str(rec.get("ticket", "")).upper():
-            return [(
-                _gate.FLAG_MALFORMED,
-                f"plan submission is filed under {submission.ticket!r} but this "
-                f"dispatch is {rec.get('ticket')!r}",
-            )]
-        result = _gate.transition(state, event, last_question_id=rec.get("last_question_id"))
-        if result.question_id:
-            rec["question_id"] = result.question_id
-            rec["last_question_id"] = result.question_id
-            rec["plan_pointer"] = submission.pointer
-            rec["plan_decisions"] = list(submission.decisions)
-            if result.state == _gate.SUBMITTED and state != _gate.SUBMITTED:
-                # A round is a plan put in front of the human, counted here
-                # so `spawn done` never asks the planner how many there were.
-                # Re-asking the same pending question is not a new round.
-                rec["approval_rounds"] = int(rec.get("approval_rounds", 0)) + 1
-    elif event.kind == "worker-done":
-        report_ok = True
-        try:
-            report = _reports.parse_planner_done(event.summary)
-        except _reports.MalformedReport as exc:
-            report_ok, report = False, None
-            malformed_reason = str(exc)
-        result = _gate.transition(state, event, report_ok=report_ok)
-        if report is not None:
-            rec["plan_pointer_final"] = report.plan_pointer
-            rec["deviations"] = list(report.deviations)
-        if not report_ok and _gate.FLAG_MALFORMED in result.actions:
-            rec["gate_state"] = result.state
-            rec["last_event_at"] = _now()
-            return [(_gate.FLAG_MALFORMED, malformed_reason)]
-    else:
-        result = _gate.transition(state, event)
-
-    rec["gate_state"] = result.state
-    rec["last_event_at"] = _now()
-    divergence = (
-        f"gate event {event.kind!r} did not match the recorded gate_state {state!r}"
-    )
-    return [
-        (action, divergence if action == _gate.FLAG_MALFORMED else None)
-        for action in result.actions
-    ]
-
-
 def wait(*, ack: str | None, timeout_ms: int) -> dict:
     """The one loop the Orchestrator uses to hear back from every role.
-    Wraps `orca orchestration check --wait`, then runs each gate event
-    through `_apply_gate_event`/`plan_gate.transition` and executes the
-    actions it returns — label the ticket, retire the planner, flag a
-    divergence — never the Orchestrator reading a message and deciding by
-    itself.
+    Wraps `orca orchestration check --wait`, then hands the batch to
+    `workflow.gate_loop.run`, which runs each gate event through
+    `apply_gate_event`/`plan_gate.transition` and executes what comes
+    back — label the ticket, retire the planner, flag a divergence —
+    never the Orchestrator reading a message and deciding by itself.
 
     Replay-safe: an unacked Delivery replays the same batch, but every
     action is guarded by the recorded `gate_state` (and, for plan-question,
@@ -766,6 +713,11 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     The Linear tracker is built lazily, only when a gate action actually
     needs it — a `wait` that observes no gate action (the common case for
     every role but the planner) must work even without `LINEAR_API_KEY` set.
+
+    The blocking `check --wait` runs BEFORE `state_lock()` is taken — it is
+    the up-to-15-minute wait itself, and holding the lock across it would
+    starve every concurrent `verdict` for as long as this call sits idle.
+    Only the read-modify-write that follows is locked.
     """
 
     argv = [
@@ -783,53 +735,15 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     events = _events.gate_events(batch.messages)
     raw_by_id = {m.id: m for m in batch.messages}
 
-    data = state_read()
-    by_dispatch = {rec["dispatch"]: key for key, rec in data.items()}
-    # Attribution falls back to the task id because a REFUSED lifecycle
-    # message is exactly the one whose `dispatchId` may be missing — that is
-    # what it was refused for. Measured: the refusal keeps the rest of the
-    # payload, `taskId` included, so it can still be traced to its role.
-    by_task = {rec["task"]: key for key, rec in data.items()}
-    actions_taken = []
-
-    _tracker: list = []
-
-    def tracker():
-        if not _tracker:
-            _tracker.append(_linear.LinearTracker())
-        return _tracker[0]
-
-    unattributed = []
-    for event in events:
-        dispatch_id = getattr(event, "dispatch_id", None)
-        key = by_dispatch.get(dispatch_id) or by_task.get(getattr(event, "task_id", None))
-        if key is None:
-            # Neither id maps to a spawn this package started: it completes
-            # nothing and would otherwise vanish. Reported, never swallowed.
-            unattributed.append({
-                "message": event.message_id, "kind": event.kind,
-                "dispatch": dispatch_id, "task": getattr(event, "task_id", None),
-            })
-            continue
-        if not key.endswith(f"/{GATE_ROLE.value}"):
-            continue  # the gate governs only the planner's own dispatch
-        rec = data[key]
-        ticket = rec["ticket"]
-        for action, reason in _apply_gate_event(rec, event, raw_by_id):
-            if action == _gate.LABEL_ON:
-                tracker().set_gate(ticket, True)
-            elif action == _gate.LABEL_OFF:
-                tracker().set_gate(ticket, False)
-            elif action == _gate.RETIRE_PLANNER:
-                retire(ticket, GATE_ROLE.value)
-                # `retire` re-reads and rewrites the registry; without this
-                # the `state_write` at the end of the loop would put this
-                # stale copy back and resurrect the planner.
-                rec["retired"] = True
-            elif action == _gate.FLAG_MALFORMED:
-                _flag_malformed(tracker(), ticket, reason or "malformed gate report")
-            actions_taken.append({"ticket": ticket, "action": action})
-    state_write(data)
+    with state_lock():
+        data = state_read()
+        actions_taken, unattributed = _gate_loop.run(
+            events, raw_by_id, data,
+            tracker=lambda: _linear.LinearTracker(),
+            retire=lambda t: retire(t, GATE_ROLE.value),
+            gate_role=GATE_ROLE.value,
+        )
+        state_write(data)
     return {
         "delivery_id": batch.delivery_id,
         # Every mailbox message, not just the ones typed as gate events —
@@ -854,41 +768,51 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     happen here: it happens in `wait`, when the planner's `worker_done`
     arrives with the approved gate_state already recorded — one path for
     both APPROVED and APPROVED-with-caveats, and it never kills a planner
-    still blocked inside its `ask`."""
+    still blocked inside its `ask`.
+
+    The read, both writes and the reply all happen inside one
+    `state_lock()`: the reply is deliberately inside the lock, not just the
+    registry writes around it. That preserves the two invariants below
+    (state recorded before the reply, `question_id` retained until the
+    reply lands) against a concurrent `wait`, and costs that `wait` only the
+    duration of one local `orca reply` call, not the network round trip
+    `wait` itself makes.
+    """
 
     ticket = ticket.upper()
     if decision not in ("approved", "revise"):
         raise SystemExit(f"unknown decision {decision!r}; use 'approved' or 'revise'")
 
     key = f"{ticket}/{GATE_ROLE.value}"
-    data = state_read()
-    rec = data.get(key)
-    if rec is None or not rec.get("question_id"):
-        raise SystemExit(
-            f"no pending plan submission recorded for {ticket}; "
-            f"`spawn wait` must observe the submission before a verdict can be given"
-        )
-    if decision == "revise" and not notes.strip():
-        raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
-
     token = "APPROVED" if decision == "approved" else "REVISE"
     note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
     body = _reports.format_approval_reply(token, note_lines)
 
-    # Recorded BEFORE the reply goes out. The reply unblocks the planner,
-    # which may run `spawn done` immediately; a registry that still said
-    # `submitted` would refuse the very report the human just authorized.
-    # `question_id` is kept until the reply lands, so a failed reply can be
-    # retried instead of stranding the planner in its `ask`.
-    rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
-    rec["last_event_at"] = _now()
-    data[key] = rec
-    state_write(data)
+    with state_lock():
+        data = state_read()
+        rec = data.get(key)
+        if rec is None or not rec.get("question_id"):
+            raise SystemExit(
+                f"no pending plan submission recorded for {ticket}; "
+                f"`spawn wait` must observe the submission before a verdict can be given"
+            )
+        if decision == "revise" and not notes.strip():
+            raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
 
-    orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
-    rec.pop("question_id", None)
-    data[key] = rec
-    state_write(data)
+        # Recorded BEFORE the reply goes out. The reply unblocks the planner,
+        # which may run `spawn done` immediately; a registry that still said
+        # `submitted` would refuse the very report the human just authorized.
+        # `question_id` is kept until the reply lands, so a failed reply can
+        # be retried instead of stranding the planner in its `ask`.
+        rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
+        rec["last_event_at"] = _now()
+        data[key] = rec
+        state_write(data)
+
+        orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
+        rec.pop("question_id", None)
+        data[key] = rec
+        state_write(data)
 
     # The label is cosmetic next to the verdict; losing Linear must not make
     # a delivered verdict look like a failure.
