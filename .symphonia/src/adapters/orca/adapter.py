@@ -369,7 +369,13 @@ class OrcaRuntimeAdapter:
             path = str(wt.get("path", ""))
             if Path(path).name == name:
                 wt_id = str(wt.get("id", ""))
-                branch = str(wt.get("branch") or name)
+                # `worktree list` answers with a full ref
+                # (`refs/heads/josiasrfreitas/gre-188`) while `worktree
+                # create` answers with the branch alone, so the same
+                # workspace described two ways used to disagree on this
+                # field. Strip the ref so both agree — measured 2026-08-11,
+                # sample in `conformance.RealCliContract`.
+                branch = str(wt.get("branch") or name).removeprefix("refs/heads/")
                 return WorkspaceRef(ticket_key=ticket_key, id=wt_id, path=path, branch=branch)
         return None
 

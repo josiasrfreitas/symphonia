@@ -13,6 +13,7 @@ Run:  cd .symphonia/src && python3 -m unittest adapters.orca.conformance -v
 """
 from __future__ import annotations
 
+import json
 import unittest
 
 from ..attention import AttentionCode
@@ -317,6 +318,48 @@ class RealCliContract(unittest.TestCase):
     preamble. It does work in production — it minted a capability four
     times in one wave the day this note was written — but that fact lives
     nowhere but this comment, and the next reader deserves to know it."""
+
+    # orca worktree list --json  (2026-08-11, during the GRE-188 smoke run;
+    # trimmed to the keys this package reads plus enough neighbours to show
+    # the shape). This is the first of the five shapes above to get a real
+    # sample, and it immediately contradicted the fake: `branch` comes back
+    # as a full ref, where `worktree create` answers with the bare name.
+    REAL_WORKTREE_LIST = """
+    {
+      "id": "6e6f2c1a-4c1f-4a1e-9b7a-1d2f3a4b5c6d",
+      "ok": true,
+      "result": {
+        "worktrees": [
+          {
+            "id": "52a38d04-79af-4956-b72d-cc075a975764::/Users/j/orca/workspaces/symphonia/gre-188",
+            "repoId": "52a38d04-79af-4956-b72d-cc075a975764",
+            "path": "/Users/j/orca/workspaces/symphonia/gre-188",
+            "head": "586b01547e17db7185d21426911fb65f6f71b16c",
+            "branch": "refs/heads/josiasrfreitas/gre-188",
+            "isBare": false,
+            "isMainWorktree": false,
+            "displayName": "🧭 GRE-188 · planning",
+            "comment": "symphonia ticket GRE-188"
+          }
+        ]
+      }
+    }
+    """
+
+    def test_worktree_list_answers_branch_as_a_full_ref(self):
+        """The measured shape, and the reason `find_workspace` strips.
+
+        `worktree create` answers `branch` as a bare name while `list`
+        answers a full ref. Before this fixture the fake emitted no
+        `branch` at all, so the fallback was the only value any test saw
+        and the two sides could not be caught disagreeing."""
+
+        payload = json.loads(self.REAL_WORKTREE_LIST)["result"]
+        (wt,) = payload["worktrees"]
+        self.assertEqual(wt["branch"], "refs/heads/josiasrfreitas/gre-188")
+        self.assertEqual(
+            wt["branch"].removeprefix("refs/heads/"), "josiasrfreitas/gre-188"
+        )
 
     # orca orchestration dispatch-show --task task_75ed1fd7b0b9 --json
     REAL_DISPATCH_SHOW = """

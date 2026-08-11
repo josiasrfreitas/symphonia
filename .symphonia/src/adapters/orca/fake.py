@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 
 from ..runtime_adapter import (
@@ -521,7 +522,15 @@ class ScriptedOrcaCli:
             ws = self.rt.workspaces.get(ws_id)
             if ws is None:
                 continue
-            items.append({"id": ws_id, "path": path})
+            # `branch` comes back as a full ref, not a bare name — measured
+            # against the real CLI on 2026-08-11 (sample in
+            # `conformance.RealCliContract.REAL_WORKTREE_LIST`). Emitting it
+            # here is what makes `find_workspace`'s ref-stripping reachable
+            # from a test; without it the fallback was the only branch value
+            # any test ever produced, and the two sides disagreed silently.
+            items.append(
+                {"id": ws_id, "path": path, "branch": f"refs/heads/{Path(path).name}"}
+            )
         return {"worktrees": items}
 
     def _worktree_set(self, selector: str, display_name: str, status: str) -> dict:
