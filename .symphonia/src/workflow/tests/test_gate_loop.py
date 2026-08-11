@@ -2,7 +2,7 @@
 
 TLDR: `apply_gate_event` (the per-event decision) is covered in
 `adapters.tests.test_brief`; this file covers the loop AROUND it, driven
-directly with a plain registry dict, a fake tracker and a fake `retire` —
+directly with a plain registry dict, a fake tracker and a fake `teardown` —
 no CLI, no `importlib.reload`, no monkeypatching a module. Run either way:
 
     cd .symphonia/src && python3 -m unittest workflow.tests.test_gate_loop
@@ -46,13 +46,17 @@ class GateLoopRunCase(unittest.TestCase):
         }
         self.data = {"GRE-1/planner": dict(self.record)}
         self.tracker = FakeTracker()
-        self.retired = []
+        self.teardown_calls = []
+
+    def _teardown(self, ticket, role):
+        self.teardown_calls.append((ticket, role))
+        return {"retired": f"{ticket}/{role}", "effects": ["worker-stop", "terminal closed"]}
 
     def _run(self, events, raw_by_id=None, gate_role="planner"):
         return GATE_LOOP.run(
             events, raw_by_id or {}, self.data,
             tracker=lambda: self.tracker,
-            retire=lambda ticket: self.retired.append(ticket),
+            teardown=self._teardown,
             gate_role=gate_role,
         )
 
@@ -91,24 +95,79 @@ class TestAttribution(GateLoopRunCase):
         self.assertEqual(unattributed[0]["task"], "task_other")
 
     def test_an_event_for_another_role_is_left_alone(self):
+        """A non-`worker-done` event attributed to a record outside
+        `gate_role` has nothing to do with the plan gate OR role
+        termination — it is simply left alone."""
+
         actions, unattributed = self._run([self.question()], gate_role="implementer")
         self.assertEqual(actions, [])
         self.assertEqual(unattributed, [])
         self.assertEqual(self.data["GRE-1/planner"]["gate_state"], GATE_LOOP.IDLE)
+        self.assertEqual(self.teardown_calls, [])
 
 
-class TestRetireCarryOver(GateLoopRunCase):
-    def test_the_retired_flag_survives_alongside_a_separate_retire_write(self):
-        """`retire()` re-reads and rewrites the registry on its own, outside
-        this `data` copy; `run` still has to carry the flag over so the
-        caller's `state_write` does not resurrect the retired role."""
+class TestPlannerRetirement(GateLoopRunCase):
+    def test_an_approved_worker_done_tears_down_the_planner(self):
+        """`teardown()` re-reads and rewrites the registry on its own,
+        outside this `data` copy; `run` still has to carry the flag over so
+        the caller's `state_write` does not resurrect the retired role."""
 
         self.data["GRE-1/planner"]["gate_state"] = GATE_LOOP._gate.VERDICT_APPROVED
         actions, _ = self._run([self.done()])
-        self.assertEqual(self.retired, ["GRE-1"])
+        self.assertEqual(self.teardown_calls, [("GRE-1", "planner")])
         self.assertTrue(self.data["GRE-1/planner"]["retired"])
         self.assertEqual(self.data["GRE-1/planner"]["gate_state"], GATE_LOOP._gate.RETIRED)
         self.assertEqual(actions, [{"ticket": "GRE-1", "action": GATE_LOOP._gate.RETIRE_PLANNER}])
+
+
+class TestNonPlannerWorkerDone(GateLoopRunCase):
+    """The gate governs only the planner's own dispatch, but a `worker_done`
+    from anyone else's still has to end that role — there is no gate state
+    for it to transition, so `run` handles it directly."""
+
+    def setUp(self):
+        super().setUp()
+        self.data["GRE-1/implementer"] = {
+            "ticket": "GRE-1", "role": "implementer",
+            "dispatch": "ctx_2", "task": "task_2",
+        }
+
+    def implementer_done(self, message_id="d-2", outcome="succeeded"):
+        return SimpleNamespace(
+            kind="worker-done", message_id=message_id, summary=DONE_BODY, outcome=outcome,
+            dispatch_id="ctx_2", task_id="task_2",
+        )
+
+    def test_worker_done_tears_down_a_non_gate_role(self):
+        actions, unattributed = self._run([self.implementer_done()])
+        self.assertEqual(unattributed, [])
+        self.assertEqual(self.teardown_calls, [("GRE-1", "implementer")])
+        self.assertTrue(self.data["GRE-1/implementer"]["retired"])
+        self.assertEqual(actions, [{"ticket": "GRE-1", "action": GATE_LOOP._gate.RETIRE_ROLE}])
+        self.assertNotIn("retired", self.data["GRE-1/planner"], "only the reporting role's record changes")
+
+    def test_fires_on_a_failed_outcome_too(self):
+        actions, _ = self._run([self.implementer_done(outcome="failed")])
+        self.assertEqual(self.teardown_calls, [("GRE-1", "implementer")])
+        self.assertEqual(actions, [{"ticket": "GRE-1", "action": GATE_LOOP._gate.RETIRE_ROLE}])
+
+    def test_a_replayed_worker_done_is_a_no_op(self):
+        self._run([self.implementer_done()])
+        self.teardown_calls.clear()
+        actions, _ = self._run([self.implementer_done()])
+        self.assertEqual(self.teardown_calls, [], "an already-retired record is not torn down twice")
+        self.assertEqual(actions, [])
+
+    def test_a_non_worker_done_event_for_a_non_gate_role_is_left_alone(self):
+        event = SimpleNamespace(
+            kind="plan-question", message_id="q-9", question=SUBMISSION,
+            dispatch_id="ctx_2", task_id="task_2",
+        )
+        actions, unattributed = self._run([event])
+        self.assertEqual(actions, [])
+        self.assertEqual(unattributed, [])
+        self.assertEqual(self.teardown_calls, [])
+        self.assertNotIn("retired", self.data["GRE-1/implementer"])
 
 
 class TestApprovalRounds(GateLoopRunCase):
@@ -130,7 +189,7 @@ class TestFlagMalformed(GateLoopRunCase):
         ticket, attention = self.tracker.attention[0]
         self.assertEqual(ticket, "GRE-1")
         self.assertTrue(attention.reason)
-        self.assertEqual(self.retired, [], "a malformed report must not retire the role")
+        self.assertEqual(self.teardown_calls, [], "a malformed report must not retire the role")
 
 
 if __name__ == "__main__":

@@ -7,9 +7,14 @@ public — same body, same behavior. `run` is the attribution/execution loop
 that used to live inside `wait`: it maps each event to the registry record
 it belongs to, applies `apply_gate_event`, and executes what comes back.
 Neither function makes an Orca or Linear call directly — the registry, the
-tracker and `retire` all arrive by injection, so a test drives this with a
+tracker and `teardown` all arrive by injection, so a test drives this with a
 plain dict and a fake tracker instead of loading the CLI or monkeypatching
 `spawn`.
+
+A `worker_done` from any role's own dispatch ends that role: the planner's
+goes through `apply_gate_event`/`RETIRE_PLANNER` as it always has, and a
+non-planner's (implementer, either reviewer) is handled directly here,
+since it carries no gate state of its own to transition.
 """
 from __future__ import annotations
 
@@ -133,12 +138,12 @@ def run(
     data: dict,
     *,
     tracker: Callable[[], TrackerAdapter],
-    retire: Callable[[str], None],
+    teardown: Callable[[str, str], dict],
     gate_role: str,
 ) -> tuple[list[dict], list[dict]]:
     """Attribute each event to the registry record it belongs to, apply
     `apply_gate_event`, and execute the actions it returns — label the
-    ticket, retire the role, flag a divergence. Mutates `data` in place and
+    ticket, end the role, flag a divergence. Mutates `data` in place and
     returns `(actions_taken, unattributed)`; it never reads or writes the
     registry itself — the caller does both, under the same lock, so this
     only ever touches the copy it was handed.
@@ -146,10 +151,13 @@ def run(
     `tracker` is a zero-argument factory, not a tracker: a `wait` that
     observes no gate action (the common case for every role but the
     planner) must keep working without `LINEAR_API_KEY` set, so the tracker
-    is built at most once, and only if an action actually needs it. `retire`
-    takes the ticket alone — the caller closes over the role — and
-    `gate_role` is the role value this loop is scoped to: an event
-    attributed to any other role's dispatch is left alone.
+    is built at most once, and only if an action actually needs it.
+    `teardown` takes `(ticket, role_value)` — this loop supplies the role,
+    since it is the one that knows which record an event belongs to.
+    `gate_role` is the role value the plan gate itself is scoped to (the
+    planner): an event attributed to any other role's dispatch never goes
+    through `apply_gate_event` — a `worker_done` from one of those still
+    ends the role, just directly, below.
     """
 
     by_dispatch = {rec["dispatch"]: key for key, rec in data.items()}
@@ -179,18 +187,25 @@ def run(
                 "dispatch": dispatch_id, "task": getattr(event, "task_id", None),
             })
             continue
-        if not key.endswith(f"/{gate_role}"):
-            continue  # the gate governs only the gate role's own dispatch
         rec = data[key]
         ticket = rec["ticket"]
+        if not key.endswith(f"/{gate_role}"):
+            # Not the gate's own role — the plan gate has nothing to say
+            # about this dispatch. A `worker_done` still ends it, on both
+            # outcomes; an already-retired record is left alone.
+            if event.kind == "worker-done" and not rec.get("retired"):
+                teardown(ticket, rec["role"])
+                rec["retired"] = True
+                actions_taken.append({"ticket": ticket, "action": _gate.RETIRE_ROLE})
+            continue
         for action, reason in apply_gate_event(rec, event, raw_by_id):
             if action == _gate.LABEL_ON:
                 resolved_tracker().set_gate(ticket, True)
             elif action == _gate.LABEL_OFF:
                 resolved_tracker().set_gate(ticket, False)
             elif action == _gate.RETIRE_PLANNER:
-                retire(ticket)
-                # `retire` re-reads and rewrites the registry on its own;
+                teardown(ticket, gate_role)
+                # `teardown` re-reads and rewrites the registry on its own;
                 # without this the caller's `state_write` would put this
                 # stale copy back and resurrect the retired role.
                 rec["retired"] = True

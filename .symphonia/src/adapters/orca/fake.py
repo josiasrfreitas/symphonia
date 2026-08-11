@@ -145,8 +145,11 @@ class FakeRuntime:
         """The only way to stop a process. There is no signal to ask nicely."""
         self.processes[pid].alive = False
 
+    def live_all(self) -> list[FakeProcess]:
+        return [p for p in self.processes.values() if p.alive]
+
     def live_in(self, ws_id: str) -> list[FakeProcess]:
-        return [p for p in self.processes.values() if p.alive and p.workspace_id == ws_id]
+        return [p for p in self.live_all() if p.workspace_id == ws_id]
 
     def post(self, msg_type: str, body: str, payload: dict) -> str:
         msg_id = self._next("msg")
@@ -556,9 +559,12 @@ class ScriptedOrcaCli:
         return {"terminal": {"handle": pid}}
 
     def _terminal_list(self, selector: str) -> dict:
-        ws_id = selector.removeprefix("id:")
+        # No `--worktree` is `sweep`'s call (`adapter.list_terminals`): the
+        # real CLI answers with every live terminal, not just one
+        # workspace's — verified 2026-08-11, see `adapter.list_terminals`.
+        procs = self.rt.live_all() if not selector else self.rt.live_in(selector.removeprefix("id:"))
         terms = []
-        for proc in self.rt.live_in(ws_id):
+        for proc in procs:
             if proc.display_name == "fallback shell":
                 # Blank title/command is what marks a bare fallback shell as
                 # orphaned in the real CLI's response, not this fake's

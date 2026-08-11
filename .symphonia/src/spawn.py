@@ -2,10 +2,11 @@
 """The whole spawn interface the Orchestrator is allowed to use.
 
 TLDR: the four role verbs take one argument each — a Ticket Key — plus
-`status`, `retire`, and the plan gate pair `wait`/`verdict`. The Orchestrator
-never picks a model, a permission flag, a worktree or a launch path; every
-one of those is decided here. If a command below does not express what you
-need, that is a package change, not an improvisation at the terminal.
+`status`, `retire`, `sweep`, and the plan gate pair `wait`/`verdict`. The
+Orchestrator never picks a model, a permission flag, a worktree or a launch
+path; every one of those is decided here. If a command below does not
+express what you need, that is a package change, not an improvisation at
+the terminal.
 
     .symphonia/bin/spawn plan             GRE-181
     .symphonia/bin/spawn implement        GRE-181
@@ -13,6 +14,7 @@ need, that is a package change, not an improvisation at the terminal.
     .symphonia/bin/spawn review-standards GRE-181
     .symphonia/bin/spawn status          [GRE-181]
     .symphonia/bin/spawn retire           GRE-181 planner
+    .symphonia/bin/spawn sweep           [GRE-181]
     .symphonia/bin/spawn wait             [--ack <delivery_id>] [--timeout-ms <ms>]
     .symphonia/bin/spawn verdict          GRE-181 approved|revise [--notes <text>|--notes-file <path>]
 
@@ -91,9 +93,9 @@ asking a second time."""
 # a different file, so a role could not look up its own task id, dispatch id
 # or capability. Override with SYMPHONIA_RUNTIME (the tests do).
 #
-# Writers: `spawn`, `wait`, `verdict`, `retire` — all Orchestrator-side. The
-# role-side verbs (`submit`, `done`) only ever read, so two processes in two
-# checkouts never race for this file.
+# Writers: `spawn`, `wait`, `verdict`, `retire`, `teardown`, `sweep` — all
+# Orchestrator-side. The role-side verbs (`submit`, `done`) only ever read,
+# so two processes in two checkouts never race for this file.
 #
 # The record shape below (`ticket`, `dispatch`, `task`, `gate_state`, ...) is
 # internal to this package, not a public contract: nothing outside `spawn.py`
@@ -198,11 +200,12 @@ def state_lock() -> Iterator[None]:
     flock, not a POSIX record lock: two separate `os.open()` calls on
     `STATE_LOCK` conflict even from the SAME process, because a flock is
     held by the open file description, not the process. That means this
-    lock does not nest — `retire()` must never call `state_lock()` while it
-    is invoked from inside `wait`'s critical section (which it is, via
-    `workflow.gate_loop.run`'s `retire` action): a second acquisition here
-    would deadlock the one process holding the first. `retire()` stays
-    unlocked; only `wait` and `verdict` acquire this.
+    lock does not nest — `teardown()` must never call `state_lock()` while
+    it is invoked from inside `wait`'s critical section (which it is, via
+    `workflow.gate_loop.run`'s `retire_planner`/`retire_role` actions): a
+    second acquisition here would deadlock the one process holding the
+    first. `teardown()` stays unlocked; `wait`, `verdict`, and `sweep`
+    acquire this.
     """
 
     STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -540,7 +543,12 @@ def status(ticket: str | None) -> list[dict]:
 
 def retire(ticket: str, role_value: str) -> dict:
     """Stop one role and close its pane. The worktree survives — the next
-    role in the ticket needs it.
+    role in the ticket needs it. The Orchestrator's own verb, typed by hand
+    or by a script — not idempotent, unlike `teardown`: a human retiring an
+    already-dead role a second time still deserves the same effects and the
+    same answer, not a silent no-op. This is a deliberate choice, pinned by
+    `RetireRerunsEffectsOnADeadRole` in `test_teardown_sweep.py` —
+    `test_retire_self_guard` only pins the self-guard above, not this.
 
     `worker-stop` is tried but not relied on: it only knows dispatches that
     `worker-start` created, and this package launches through `terminal
@@ -548,7 +556,6 @@ def retire(ticket: str, role_value: str) -> dict:
     terminal is what actually ends the role.
     """
 
-    adapter = _adapter()
     key = f"{ticket.upper()}/{role_value}"
     rec = state_read().get(key)
     if rec is None:
@@ -569,6 +576,44 @@ def retire(ticket: str, role_value: str) -> dict:
             f"yet. Report first and let the Orchestrator retire you."
         )
 
+    return _run_teardown(ticket, role_value)
+
+
+def teardown(ticket: str, role_value: str) -> dict:
+    """Same effects as `retire`, minus the self-guard, plus idempotence: a
+    record already marked `retired` returns immediately, without touching
+    the adapter. Called by the gate loop when a non-planner's `worker_done`
+    arrives, and by `sweep` for a record whose world is already gone — both
+    a replayed Delivery and a repeated `sweep` must be a no-op, which is
+    what the guard here is for. `retire` does not use it: a human retiring
+    an already-dead role by hand still gets the same effects run again, not
+    a silent no-op.
+    """
+
+    key = f"{ticket.upper()}/{role_value}"
+    rec = state_read().get(key)
+    if rec is None:
+        raise SystemExit(f"no spawn recorded for {key}")
+    if rec.get("retired"):
+        return {"retired": key, "effects": ["already retired"], "worktree_kept": rec["worktree"]}
+    return _run_teardown(ticket, role_value)
+
+
+def _run_teardown(ticket: str, role_value: str) -> dict:
+    """Every effect of ending one role's dispatch, best-effort, in a fixed
+    order: `stop_worker` -> `close_terminal --tab` -> settle the Task ->
+    mark `retired` in the registry. Nothing here raises on a failed effect:
+    a dead terminal or an unreachable dispatch is exactly the situation
+    this exists to clean up after, so each failure becomes an `effects`
+    entry instead of aborting before `retired` is written.
+    """
+
+    adapter = _adapter()
+    key = f"{ticket.upper()}/{role_value}"
+    rec = state_read().get(key)
+    if rec is None:
+        raise SystemExit(f"no spawn recorded for {key}")
+
     effects = []
     try:
         adapter.stop_worker(rec["dispatch"])
@@ -583,27 +628,92 @@ def retire(ticket: str, role_value: str) -> dict:
         effects.append(f"terminal not closed ({exc})")
 
     # A killed role leaves its Task sitting in `dispatched` forever, which
-    # Reconciliation would read as an attempt still in flight. Settle it.
+    # Reconciliation would read as an attempt still in flight. Settle it —
+    # best-effort like everything else here, so a CLI outage on this one
+    # call cannot stop `retired` from ever being written.
+    dispatch_status = ""
     try:
         dispatch_status = adapter.dispatch_status(rec["task"], default="")
     except _cli.OrcaCliError as exc:
-        raise SystemExit(str(exc)) from exc
-    if dispatch_status not in ("completed", "failed"):
-        try:
-            adapter.settle_task(rec["task"], f"{role_value} retired by the Orchestrator")
-        except _cli.OrcaCliError as exc:
-            raise SystemExit(str(exc)) from exc
-        effects.append("task settled as failed")
+        effects.append(f"task NOT settled ({exc})")
+    else:
+        if dispatch_status not in ("completed", "failed"):
+            try:
+                adapter.settle_task(rec["task"], f"{role_value} retired by the Orchestrator")
+                effects.append("task settled as failed")
+            except _cli.OrcaCliError as exc:
+                effects.append(f"task NOT settled ({exc})")
 
     data = state_read()
-    data[key]["retired"] = True
-    state_write(data)
+    if key in data:
+        data[key]["retired"] = True
+        state_write(data)
+    else:
+        effects.append("registry record vanished before the retired write")
     return {
         "retired": key,
         "dispatch_was": dispatch_status,
         "effects": effects,
         "worktree_kept": rec["worktree"],
     }
+
+
+def sweep(ticket: str | None) -> list[dict]:
+    """Audit the registry for a record whose world is already gone — its
+    terminal not among Orca's live handles, or its worktree missing from
+    disk — and tear it down without being told which ticket/role died.
+    What `retired` records are for `wait`'s gate on a `worker_done`, this is
+    for everything that never reported at all: a role killed by the app
+    quitting, a machine that lost power, a worktree deleted by hand.
+
+    A live record is reported, not touched — `{"key": ..., "live": True}`.
+    Already-retired records are not this verb's business; `teardown`'s own
+    idempotence would no-op them anyway, but skipping them here keeps a
+    `sweep` report about the records that still needed a decision.
+
+    The whole read-decide-teardown loop runs under `state_lock()`: this is
+    the only writer in the package that used to do its read-modify-write
+    unlocked, which let a concurrent `wait`/`verdict` (holding the lock
+    across its own snapshot) silently revert a `teardown` this loop had
+    already run — after that teardown's effects (`close_terminal`,
+    `settle_task`) were already irreversible. `teardown` itself stays
+    unlocked, so this does not nest.
+
+    A `list_terminals()` that comes back empty is refused rather than acted
+    on: every unretired record would read as "terminal not live" and this
+    loop would tear down every live role in the registry on the strength of
+    one degraded CLI response. No retry, no heuristic — just refuse and say
+    why; the caller can run `sweep` again once the CLI is answering.
+    """
+
+    adapter = _adapter()
+    live_terminals = adapter.list_terminals()
+    if not live_terminals:
+        raise SystemExit(
+            "list_terminals() returned no terminals at all; refusing to treat "
+            "every unretired record as an orphan. Retry once the CLI is "
+            "responding."
+        )
+    out = []
+    with state_lock():
+        for key, rec in sorted(state_read().items()):
+            if ticket and not key.startswith(ticket.upper() + "/"):
+                continue
+            if rec.get("retired"):
+                continue
+            reasons = []
+            if rec["terminal"] not in live_terminals:
+                reasons.append("terminal not live")
+            if not Path(rec["worktree"]).exists():
+                reasons.append("worktree missing")
+            if not reasons:
+                out.append({"key": key, "live": True})
+                continue
+            out.append({
+                "key": key, "live": False, "reason": reasons,
+                "teardown": teardown(rec["ticket"], rec["role"]),
+            })
+    return out
 
 
 # --- the plan gate ---------------------------------------------------------
@@ -653,7 +763,7 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
         actions_taken, unattributed = _gate_loop.run(
             events, raw_by_id, data,
             tracker=lambda: _linear.LinearTracker(),
-            retire=lambda t: retire(t, GATE_ROLE.value),
+            teardown=teardown,
             gate_role=GATE_ROLE.value,
         )
         state_write(data)
@@ -918,6 +1028,8 @@ def main() -> int:
     p = sub.add_parser("retire")
     p.add_argument("ticket")
     p.add_argument("role")
+    p = sub.add_parser("sweep")
+    p.add_argument("ticket", nargs="?")
     p = sub.add_parser("wait")
     p.add_argument("--ack", help="Delivery id to acknowledge before waiting again.")
     p.add_argument("--timeout-ms", type=int, default=900000)
@@ -948,6 +1060,8 @@ def main() -> int:
         print(json.dumps(status(args.ticket), indent=2))
     elif args.verb == "retire":
         print(json.dumps(retire(args.ticket, args.role), indent=2))
+    elif args.verb == "sweep":
+        print(json.dumps(sweep(args.ticket), indent=2))
     elif args.verb == "wait":
         print(json.dumps(wait(ack=args.ack, timeout_ms=args.timeout_ms), indent=2))
     elif args.verb == "verdict":

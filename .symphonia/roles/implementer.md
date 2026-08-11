@@ -14,6 +14,7 @@ capability_tier: standard
 - Use `tdd` for risky behavior changes.
 - Commit on the ticket's branch. Never merge — the merge has a Human Gate.
 - When the context gate fires (`context_gate_used_fraction`), write a `/handoff` and stop: new Attempt, same ticket, same Workspace, plan intact, phase unchanged.
+- Report short: no preamble, no recap of what the Orchestrator already knows.
 
 ## What you never do
 
