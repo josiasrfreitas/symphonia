@@ -42,9 +42,13 @@ import contextlib
 import fcntl
 import json
 import os
-import re
 import subprocess
 import sys
+# Session ids are minted inside adapters.orca.adapter now (GRE-184 M4), not
+# here — but `uuid` is still imported so the name resolves as `spawn.uuid`.
+# `adapter.py` imports the identical shared module object, so a test that
+# patches `uuid4` through this attribute (`self.spawn.uuid`) still reaches
+# the code that actually calls it.
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,19 +122,6 @@ ROLE_FILES = {
     RoleName.STANDARDS_REVIEWER: "standards-reviewer.md",
 }
 
-# What the phase looks like in the Orca sidebar. Orca exposes no per-worktree
-# colour, so the phase is carried by the three labels it does expose: the
-# worktree display name, the terminal title, and the board column. A glance
-# at the sidebar should answer "which phase is this ticket in" without
-# opening anything.
-ROLE_BADGE = {
-    RoleName.PLANNER: ("🧭", "planning", "in-progress"),
-    RoleName.IMPLEMENTER: ("🔨", "implementing", "in-progress"),
-    RoleName.SPEC_REVIEWER: ("🔍", "spec review", "in-review"),
-    RoleName.STANDARDS_REVIEWER: ("📐", "standards review", "in-review"),
-}
-
-
 # --- orca CLI ------------------------------------------------------------
 
 
@@ -157,9 +148,13 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
     rejection, so its absence must never be treated as failure.
     """
 
-    result = _cli.subprocess_runner(["orca", *argv, "--json"])
+    # GRE-184 M5: the transport is `_adapter()._orca`, not a direct
+    # `subprocess_runner` call — the last piece of the seam. `wait`/
+    # `verdict`/`submit`/`done` (GRE-185's boundary) still call this
+    # function by the same name, signature, and error text; nothing below
+    # this line changed.
     try:
-        return _cli.unwrap_envelope(argv, result, expect_lifecycle_ok=expect_lifecycle_ok)
+        return _adapter()._orca(*argv, expect_lifecycle_ok=expect_lifecycle_ok)
     except _cli.OrcaCliError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -221,94 +216,22 @@ def state_lock() -> Iterator[None]:
         os.close(fd)
 
 
-# --- worktree ------------------------------------------------------------
+# --- the runtime adapter, composed -----------------------------------------
 
 
-def worktree_name(ticket: str) -> str:
-    return ticket.strip().lower()
+def _adapter() -> _cli.OrcaRuntimeAdapter:
+    """The production adapter `spawn()` composes its verbs over (GRE-184
+    M4): `find_workspace`/`create_workspace`/`default_base`/`set_phase`/
+    `launch_role`/`dispatch`/`snapshot`. `coordinator`/`run_id` are inert
+    placeholders — `bind_control=False` (approval condition #3 of the PR-A
+    plan) means `_ensure_control` never reads them, and none of the methods
+    above reference `self.coordinator` either; only `message_worker`/
+    `respond`/`sweep` do, and this package never calls those. Consequence,
+    same as documented on the flag itself: `spawn`'s production path never
+    exercises control-lost detection — the conformance suite (which always
+    binds) is the only place that check runs."""
 
-
-def find_worktree(ticket: str) -> tuple[str, str] | None:
-    """(id, path) of this ticket's worktree, or None."""
-
-    # Matched on the path, not the display name: spawn rewrites the display
-    # name with the current phase ("🧭 SYM-5 · planning"), so a `name:`
-    # lookup stops finding the ticket the moment it starts. The directory
-    # never changes.
-    name = worktree_name(ticket)
-    listed = orca("worktree", "list")
-    items = listed.get("worktrees", listed.get("items", []))
-    for wt in items:
-        if Path(str(wt.get("path", ""))).name == name:
-            return str(wt.get("id", "")), str(wt.get("path", ""))
-    return None
-
-
-def default_base() -> str:
-    """The repo's default base, read from git rather than assumed.
-
-    The Orchestrator may be sitting on any branch when it spawns, and a
-    ticket must never be stacked on whatever that branch happens to be.
-    """
-
-    proc = subprocess.run(
-        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        capture_output=True, text=True,
-    )
-    base = proc.stdout.strip()
-    if not base:
-        raise SystemExit(
-            "cannot resolve origin/HEAD; run `git remote set-head origin -a` "
-            "so the ticket branch has a known base"
-        )
-    return base
-
-
-def create_worktree(ticket: str) -> tuple[str, str]:
-    """One checkout per Ticket Key: child of the Orchestrator in Orca
-    lineage, off the repo default base in git.
-
-    Those are two different axes and both matter. `--parent-worktree active`
-    makes every role show up under the Orchestrator in the sidebar, so the
-    fleet is visible as one tree no matter which branch the Orchestrator is
-    on. `--base-branch` is passed explicitly for exactly that reason: child
-    lineage must not drag the Orchestrator's current branch in as the base.
-    """
-
-    created = orca(
-        "worktree", "create",
-        "--name", worktree_name(ticket),
-        "--parent-worktree", "active",
-        "--base-branch", default_base(),
-        "--setup", "run",
-        "--linear-issue", ticket,
-        "--comment", f"symphonia ticket {ticket}",
-    )
-    wt = created.get("worktree", created)
-    wt_id, path = str(wt.get("id", "")), str(wt.get("path", ""))
-    if not wt_id or not path:
-        raise SystemExit(f"worktree create returned no id/path for {ticket}: {created}")
-    # Bare create leaves one untitled fallback shell (measured on GRE-179).
-    # It is closed here so a ticket's tab list is exactly its live roles.
-    #
-    # Best-effort on purpose: this is cosmetic, and the shell's tab can
-    # already be gone by the time we ask (`tab_not_found`). A tidy sidebar is
-    # never worth failing a spawn that otherwise succeeded.
-    for term in orca("terminal", "list", "--worktree", f"id:{wt_id}").get("terminals", []):
-        if term.get("title") or term.get("command"):
-            continue
-        try:
-            orca("terminal", "close", "--terminal", str(term.get("handle")), "--tab")
-        except SystemExit as exc:
-            print(f"note: leftover shell not closed ({exc})", file=sys.stderr)
-
-    # The env files are gitignored, so the new checkout does not have them —
-    # it looks complete and fails the first time something reads `.env`.
-    # Called here rather than relying on Orca's repo setup hook, which is a
-    # per-machine setting and is empty until someone fills it in: a spawn must
-    # not depend on a checkbox. Running it twice is harmless.
-    print(json.dumps(_setup_worktree.setup(Path(path))), file=sys.stderr)
-    return wt_id, path
+    return _cli.OrcaRuntimeAdapter(coordinator="spawn", run_id="spawn", bind_control=False)
 
 
 # --- the spawn itself ----------------------------------------------------
@@ -420,53 +343,6 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
 
 # --- role identity: how a role finds its own record -----------------------
 
-_CAPABILITY = re.compile(r"--dispatch-capability\s+(\S+)")
-
-
-def _capability_of(preamble: str) -> str | None:
-    """The Dispatch capability token Orca mints for an injected dispatch.
-
-    It exists only as text inside the preamble (the dispatch row's
-    `capability_hash` comes back null), so it is read with a regex — the
-    preamble repeats it once per lifecycle command and they are the same
-    token."""
-
-    found = _CAPABILITY.search(preamble)
-    return found.group(1) if found else None
-
-
-def _require_capability(preamble: str, ticket: str, role_value: str, *, task: str, terminal: str) -> str:
-    """The capability, or no spawn at all.
-
-    Measured on Orca 1.4.168: an injected dispatch mints a capability and
-    every lifecycle message is checked against it — a `worker_done` sent
-    without it comes back `dispatch_capability_invalid` and the dispatch
-    stays open forever. The token is printed only inside the preamble text
-    (`capability_hash` on the dispatch row is null), so this is the one
-    moment it can be captured.
-
-    Fatal rather than a warning: a role launched without it would work for
-    hours and only then be unable to report. Failing here costs a spawn;
-    failing there costs the work. The task and terminal are rolled back so a
-    retry starts clean.
-    """
-
-    capability = _capability_of(preamble)
-    if capability:
-        return capability
-    orca(
-        "orchestration", "task-update", "--id", task, "--status", "failed",
-        "--result", json.dumps({"reason": "no dispatch capability in the preamble"}),
-    )
-    try:
-        orca("terminal", "close", "--terminal", terminal, "--tab")
-    except SystemExit as exc:
-        print(f"note: terminal not closed ({exc})", file=sys.stderr)
-    raise SystemExit(
-        f"dispatch for {ticket}/{role_value} minted no capability, so the role could "
-        f"never report; the terminal and task were rolled back. Retry the spawn."
-    )
-
 
 def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     """The record of the role calling this, from inside its own terminal.
@@ -510,94 +386,113 @@ def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
 
 
 def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None = None) -> dict:
+    """Composed over `OrcaRuntimeAdapter` (GRE-184 M4) — every orca call
+    below lives in `_adapter()`'s methods, not here. Item 10 of GRE-181
+    ("failure mid-sequence leaves no orphan"): a fresh workspace is torn
+    down if `set_phase`/`launch_role` fails; `dispatch`'s one characterized
+    failure (a dispatch that minted no capability) already rolls its own
+    task/terminal back inside the adapter (GRE-184 M3) — unchanged from
+    what M0 froze, so this wrapper only translates the error, it does not
+    clean up a second time. A workspace is never destroyed once reused.
+    """
+
     ticket = ticket.upper()
-    found = find_worktree(ticket)
+    adapter = _adapter()
+    workspace = adapter.find_workspace(ticket)
+    fresh = False
     if fresh_worktree:
-        if found:
+        if workspace is not None:
             raise SystemExit(
-                f"{ticket} already has a worktree at {found[1]}. "
+                f"{ticket} already has a worktree at {workspace.path}. "
                 f"Planning runs once per ticket; use `implement` to continue in it."
             )
-        wt_id, path = create_worktree(ticket)
+        try:
+            workspace = adapter.create_workspace(ticket, base_branch=adapter.default_base())
+        except (RuntimeError, _cli.OrcaCliError) as exc:
+            raise SystemExit(str(exc)) from exc
+        fresh = True
+        # The env files are gitignored, so the new checkout does not have them —
+        # it looks complete and fails the first time something reads `.env`.
+        # Called here rather than relying on Orca's repo setup hook, which is a
+        # per-machine setting and is empty until someone fills it in: a spawn must
+        # not depend on a checkbox. Running it twice is harmless.
+        print(json.dumps(_setup_worktree.setup(Path(workspace.path))), file=sys.stderr)
     else:
-        if not found:
+        if workspace is None:
             raise SystemExit(
                 f"{ticket} has no worktree yet. Run `spawn plan {ticket}` first — "
                 f"every role after the planner reuses the checkout planning created."
             )
-        wt_id, path = found
 
     # `--tier` is a human override, not a knob for the Orchestrator: the
     # matrix is the default precisely so no agent has to choose a model.
-    override = None
+    #
+    # Both tables are read here, adjacent, because composition requires it:
+    # `launch_role` takes a `RoleSpec` with tier and access already decided,
+    # so the caller has to hold them (`launcher.py:151-153`). That does make
+    # this a second reading site alongside `build_launch` — a property this
+    # code had before the composition and lost. Collapsing tier/access to a
+    # single source is GRE-186's first scope item (RolePolicy); until then,
+    # keeping the two reads adjacent is containment, not a fix.
+    resolved_tier = _launcher.ROLE_TIERS[role]
+    resolved_access = _launcher.ROLE_ACCESS[role]
     if tier:
         try:
-            override = _contract.CapabilityTier(tier)
+            resolved_tier = _contract.CapabilityTier(tier)
         except ValueError:
             raise SystemExit(
                 f"unknown tier {tier!r}; known: "
                 f"{', '.join(t.value for t in _contract.CapabilityTier)}"
             )
-    plan = _launcher.build_launch(
-        role, session_id=str(uuid.uuid4()), workspace=path, tier=override
-    )
-    emoji, phase, board = ROLE_BADGE[role]
 
-    # The ticket's worktree carries the phase it is currently in, so the
-    # sidebar reads as a board without opening a single terminal.
-    orca(
-        "worktree", "set",
-        "--worktree", f"id:{wt_id}",
-        "--display-name", f"{emoji} {ticket} · {phase}",
-        "--workspace-status", board,
-    )
-
-    terminal = orca(
-        "terminal", "create",
-        "--worktree", f"id:{wt_id}",
-        "--title", f"{emoji} {phase} · {ticket}",
-        "--command", plan.command,
-    )["terminal"]["handle"]
-
-    # Losing the first prompt costs a whole spawn, so readiness is waited on,
-    # never assumed.
-    orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle", "--timeout-ms", "120000")
+    try:
+        adapter.set_phase(workspace, role)
+        launch = adapter.launch_role(
+            workspace,
+            _contract.RoleSpec(
+                role=role, tier=resolved_tier, access=resolved_access, briefing="",
+            ),
+        )
+    except (RuntimeError, _cli.OrcaCliError) as exc:
+        if fresh:
+            try:
+                adapter.destroy_workspace(workspace)
+            except (RuntimeError, _cli.OrcaCliError):
+                pass  # best-effort; the launch failure is what gets reported
+        raise SystemExit(str(exc)) from exc
 
     # The planner's input is the Execution Brief, injected: the issue is
     # read and formatted here, never left for the role to go fetch. Every
     # other role still gets the `work_spec()` pointer until its own cycle
     # brings it a Brief (legacy, migrated one role at a time).
-    spec = build_brief(role, ticket, path) if role is RoleName.PLANNER else work_spec(role, ticket, path)
-    task = orca(
-        "orchestration", "task-create",
-        "--spec", spec,
-    )["task"]["id"]
-    dispatched = orca(
-        "orchestration", "dispatch", "--task", task, "--to", terminal, "--inject",
-        "--return-preamble",
+    spec = (
+        build_brief(role, ticket, workspace.path)
+        if role is RoleName.PLANNER
+        else work_spec(role, ticket, workspace.path)
     )
-    dispatch = dispatched["dispatch"]["id"]
-    capability = _require_capability(
-        dispatched.get("preamble") or "", ticket, role.value, task=task, terminal=terminal
-    )
+    try:
+        attempt = adapter.dispatch(launch.context, spec)
+    except _cli.OrcaCliError as exc:
+        raise SystemExit(str(exc)) from exc
+    snap = adapter.snapshot(attempt)
 
     record = {
         "ticket": ticket,
         "role": role.value,
-        "tier": plan.tier.value,
-        "model_requested": _launcher.TIER_MODELS[plan.tier],
-        "access": plan.access.value,
-        "worktree": path,
-        "worktree_id": wt_id,
-        "terminal": terminal,
-        "task": task,
-        "dispatch": dispatch,
-        "capability": capability,
+        "tier": snap["tier"],
+        "model_requested": _launcher.TIER_MODELS[resolved_tier],
+        "access": snap["access"],
+        "worktree": workspace.path,
+        "worktree_id": workspace.id,
+        "terminal": snap["terminal"],
+        "task": snap["task"],
+        "dispatch": snap["dispatch"],
+        "capability": snap["capability"],
         "gate_state": IDLE,
         "approval_rounds": 0,
-        "session_id": plan.session_id,
-        "transcript": str(plan.transcript) if plan.transcript else None,
-        "command": plan.command,
+        "session_id": snap["session_id"],
+        "transcript": snap["transcript"],
+        "command": snap["command"],
     }
     data = state_read()
     data[f"{ticket}/{role.value}"] = record
@@ -612,14 +507,14 @@ def status(ticket: str | None) -> list[dict]:
     """Deterministic state per spawn: what the dispatch says, and which model
     actually answered — read from the transcript, never asked of the agent."""
 
+    adapter = _adapter()
     out = []
     for key, rec in sorted(state_read().items()):
         if ticket and not key.startswith(ticket.upper() + "/"):
             continue
         try:
-            shown = orca("orchestration", "dispatch-show", "--task", rec["task"])
-            dispatch_status = str((shown.get("dispatch") or {}).get("status", "?"))
-        except SystemExit:
+            dispatch_status = adapter.dispatch_status(rec["task"])
+        except _cli.OrcaCliError:
             dispatch_status = "unknown"
         transcript = Path(rec["transcript"]) if rec.get("transcript") else None
         models = _launcher.observed_models(transcript) if transcript else []
@@ -653,6 +548,7 @@ def retire(ticket: str, role_value: str) -> dict:
     terminal is what actually ends the role.
     """
 
+    adapter = _adapter()
     key = f"{ticket.upper()}/{role_value}"
     rec = state_read().get(key)
     if rec is None:
@@ -660,26 +556,28 @@ def retire(ticket: str, role_value: str) -> dict:
 
     effects = []
     try:
-        orca("orchestration", "worker-stop", "--dispatch", rec["dispatch"])
+        adapter.stop_worker(rec["dispatch"])
         effects.append("worker-stop")
-    except SystemExit:
+    except _cli.OrcaCliError:
         pass  # expected for terminal-created dispatches
 
     try:
-        orca("terminal", "close", "--terminal", rec["terminal"], "--tab")
+        adapter.close_terminal(rec["terminal"], tab=True)
         effects.append("terminal closed")
-    except SystemExit as exc:
+    except _cli.OrcaCliError as exc:
         effects.append(f"terminal not closed ({exc})")
 
     # A killed role leaves its Task sitting in `dispatched` forever, which
     # Reconciliation would read as an attempt still in flight. Settle it.
-    shown = orca("orchestration", "dispatch-show", "--task", rec["task"])
-    status = str((shown.get("dispatch") or {}).get("status", ""))
-    if status not in ("completed", "failed"):
-        orca(
-            "orchestration", "task-update", "--id", rec["task"], "--status", "failed",
-            "--result", json.dumps({"reason": f"{role_value} retired by the Orchestrator"}),
-        )
+    try:
+        dispatch_status = adapter.dispatch_status(rec["task"], default="")
+    except _cli.OrcaCliError as exc:
+        raise SystemExit(str(exc)) from exc
+    if dispatch_status not in ("completed", "failed"):
+        try:
+            adapter.settle_task(rec["task"], f"{role_value} retired by the Orchestrator")
+        except _cli.OrcaCliError as exc:
+            raise SystemExit(str(exc)) from exc
         effects.append("task settled as failed")
 
     data = state_read()
@@ -687,7 +585,7 @@ def retire(ticket: str, role_value: str) -> dict:
     state_write(data)
     return {
         "retired": key,
-        "dispatch_was": status,
+        "dispatch_was": dispatch_status,
         "effects": effects,
         "worktree_kept": rec["worktree"],
     }

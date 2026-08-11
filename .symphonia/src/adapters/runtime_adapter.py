@@ -47,9 +47,15 @@ class Liveness(enum.Enum):
 
 @dataclass(frozen=True)
 class WorkspaceRef:
-    """The isolated checkout owned by exactly one Implementation Ticket."""
+    """The isolated checkout owned by exactly one Implementation Ticket.
+
+    ``id`` is the provider's own identifier for the worktree (GRE-184 M2) —
+    composed verbs address the terminal/badge calls by ``id:<id>``, never by
+    ``path:``, because the display name changes with the phase while the id
+    does not."""
 
     ticket_key: TicketKey
+    id: str
     path: str
     branch: str
 
@@ -88,6 +94,10 @@ class RoleSpec:
     role: RoleName
     tier: CapabilityTier
     access: Access
+    # Kept on purpose (GRE-184 M3 review): no caller reads this back. The
+    # brief a role actually receives arrives as the body of its first
+    # `dispatch` — there is no second channel. GRE-186 (S5) rewrites this
+    # whole boundary; removing the field belongs there, not here.
     briefing: str
 
 
@@ -167,7 +177,8 @@ class RuntimeAdapter(Protocol):
     def capabilities(self) -> RuntimeCapabilities: ...
 
     # Workspaces
-    def create_workspace(self, ticket_key: TicketKey, *, branch: str) -> WorkspaceRef: ...
+    def create_workspace(self, ticket_key: TicketKey, *, base_branch: str) -> WorkspaceRef: ...
+    def find_workspace(self, ticket_key: TicketKey) -> WorkspaceRef | None: ...
     def destroy_workspace(self, workspace: WorkspaceRef) -> None: ...
 
     # Role Contexts

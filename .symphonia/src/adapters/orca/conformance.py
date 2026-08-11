@@ -48,10 +48,13 @@ class ConformanceMixin:
         # 1. a prepared workspace: setup ran and the stray shell was closed
         # before create resolved — no caller can name an unprepared workspace.
         with self.subTest(step=1):
-            ws = a.create_workspace("GRE-201", branch="gre-201-pilot-feature")
+            ws = a.create_workspace("GRE-201", base_branch="main")
             self.assertEqual(ws.ticket_key, "GRE-201")
-            self.assertEqual(ws.branch, "gre-201-pilot-feature")
+            self.assertEqual(ws.branch, "gre-201")
+            self.assertTrue(ws.id)
             self.assertTrue(ws.path)
+            self.assertIsNone(a.find_workspace("GRE-999"))
+            self.assertEqual(a.find_workspace("GRE-201"), ws)
             setup_done, live = rig.workspace_state("GRE-201")
             self.assertTrue(setup_done)
             self.assertEqual(live, 0)
@@ -110,7 +113,7 @@ class ConformanceMixin:
         # A strong provider reveals it; a weak one cannot — but must never
         # dress the gap up as an observation.
         with self.subTest(step=6):
-            ws2 = a.create_workspace("GRE-202", branch="gre-202-second-ticket")
+            ws2 = a.create_workspace("GRE-202", base_branch="main")
             rig.stage(RoleName.PLANNER, CapabilityTier.FAST)
             planner2 = a.launch_role(ws2, _spec(RoleName.PLANNER, CapabilityTier.HIGH, Access.WRITE))
             plan2 = a.dispatch(planner2.context, "Plan it.")
@@ -185,7 +188,7 @@ class ConformanceMixin:
         # consumed by the ack of a drain whose kinds filtered it out —
         # nothing is consumed until it was actually delivered and acked.
         a, rig = self.adapter, self.rig
-        ws = a.create_workspace("GRE-211", branch="gre-211-control")
+        ws = a.create_workspace("GRE-211", base_branch="main")
         planner = a.launch_role(ws, _spec(RoleName.PLANNER, CapabilityTier.STANDARD, Access.WRITE))
         a.dispatch(planner.context, "Work.")
         rig.steal_control("some-other-pane")
@@ -199,7 +202,7 @@ class ConformanceMixin:
 
     def test_question_token_is_single_use(self):
         a, rig = self.adapter, self.rig
-        ws = a.create_workspace("GRE-210", branch="gre-210-question")
+        ws = a.create_workspace("GRE-210", base_branch="main")
         planner = a.launch_role(ws, _spec(RoleName.PLANNER, CapabilityTier.STANDARD, Access.WRITE))
         attempt = a.dispatch(planner.context, "Plan, then ask.")
         rig.post_question(attempt, "Approve the plan?")
@@ -234,7 +237,7 @@ class OrcaConformance(ConformanceMixin, unittest.TestCase):
 
     def test_message_worker_validates_dispatch_state(self):
         a, rig = self.adapter, self.rig
-        ws = a.create_workspace("GRE-203", branch="gre-203-messaging")
+        ws = a.create_workspace("GRE-203", base_branch="main")
         impl = a.launch_role(ws, _spec(RoleName.IMPLEMENTER, CapabilityTier.STANDARD, Access.WRITE))
         attempt = a.dispatch(impl.context, "Do the work.")
 
@@ -299,7 +302,21 @@ class GateEventReading(unittest.TestCase):
 class RealCliContract(unittest.TestCase):
     """Frozen samples captured from the REAL orca CLI (2026-08-10, ad hoc
     test after the envelope bug). If the CLI's response contract changes,
-    these fixtures — not the scripted fake — are what must disagree."""
+    these fixtures — not the scripted fake — are what must disagree.
+
+    Honesty note (GRE-184 PR-B review): this PR changed five response
+    shapes in ``fake.py`` — ``worktree create``, ``worktree list``,
+    ``terminal create``, ``task-create``, and ``dispatch`` — without adding
+    a matching ``REAL_*`` fixture for any of them. No recorded sample backs
+    those shapes; their only provenance is the argv observed from
+    ``spawn.py`` running against the real CLI. A fixture copied out of the
+    fake would be worse than having none, since it would read as authority
+    echoing itself. The dispatch preamble deserves special mention: the
+    ``_capability_of`` regex (``adapter.py``) is only ever exercised in this
+    suite against a string the fake synthesizes, never against a real
+    preamble. It does work in production — it minted a capability four
+    times in one wave the day this note was written — but that fact lives
+    nowhere but this comment, and the next reader deserves to know it."""
 
     # orca orchestration dispatch-show --task task_75ed1fd7b0b9 --json
     REAL_DISPATCH_SHOW = """
@@ -376,7 +393,7 @@ class RealCliContract(unittest.TestCase):
         # The bug this task fixes: reading status off the envelope gave ""
         # and the guard never fired — a raw send went to a dead worker.
         adapter = self._adapter_answering(self.REAL_DISPATCH_SHOW)
-        workspace = WorkspaceRef(ticket_key="GRE-175", path="/workspaces/gre-175", branch="b")
+        workspace = WorkspaceRef(ticket_key="GRE-175", id="wt-175", path="/workspaces/gre-175", branch="b")
         context = ContextRef(id="ctx-1", role=RoleName.IMPLEMENTER, workspace=workspace)
         ref = AttemptRef(attempt_id="ctx_9c7251a58edd", ticket_key="GRE-175", context=context)
         adapter._attempts["ctx_9c7251a58edd"] = _AttemptRecord(ref=ref, task_id="task_75ed1fd7b0b9")
