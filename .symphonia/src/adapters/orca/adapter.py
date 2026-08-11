@@ -47,9 +47,33 @@ from ..runtime_adapter import (
 from .events import parse_check_output
 from .launcher import LaunchPlan, TIER_MODELS, build_launch, observed_models, tier_matches
 
-Runner = Callable[[Sequence[str]], str]
-"""Runs one ``orca`` argv, returns stdout. Production uses subprocess; the
-conformance suite injects ``fake.ScriptedOrcaCli``."""
+
+@dataclass(frozen=True)
+class RunResult:
+    """One completed ``orca`` invocation, both halves the envelope
+    unwrapper needs: a rejected lifecycle message can only be told apart
+    from an accepted one by combining ``stdout`` (the envelope, which still
+    answers ``ok: true``) with ``returncode`` (GRE-184 M1 — measured in
+    ``spawn.orca`` before this adapter carried the same check)."""
+
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+Runner = Callable[[Sequence[str]], RunResult]
+"""Runs one full argv (``["orca", *args, "--json"]``), returns the
+completed result. Production uses ``subprocess_runner``; the conformance
+suite and ``spawn``'s characterization tests inject a scripted double."""
+
+
+class OrcaCliError(RuntimeError):
+    """One ``orca`` invocation failed — at the envelope layer (``ok:
+    false``), the transport layer (no stdout), or the lifecycle layer (a
+    refused ``worker_done``). ``str(exc)`` is the fully-formed message both
+    ``OrcaRuntimeAdapter._orca`` (surfaces it as-is) and ``spawn.orca``
+    (wraps it in ``SystemExit`` with no changes) show the caller — one
+    wording for both sides of the fence."""
 
 
 def _required(value: str, what: str) -> str:
@@ -62,11 +86,56 @@ def _required(value: str, what: str) -> str:
     return value
 
 
-def subprocess_runner(argv: Sequence[str]) -> str:
+def subprocess_runner(argv: Sequence[str]) -> RunResult:
+    """The production ``Runner``: one subprocess, stdout/stderr/returncode
+    all handed back. Never raises on a nonzero exit — deciding what a
+    nonzero exit or an ``ok: false`` envelope means is ``unwrap_envelope``'s
+    job, not the transport's, so the two error paths cannot disagree."""
+
     proc = subprocess.run(list(argv), capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(argv)} failed: {proc.stderr.strip()}")
-    return proc.stdout
+    return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
+
+
+def unwrap_envelope(
+    argv: Sequence[str], result: RunResult, *, expect_lifecycle_ok: bool = False
+) -> dict:
+    """The one envelope unwrapper, shared by ``OrcaRuntimeAdapter._orca``
+    and ``spawn.orca`` (GRE-184 M1 — the fronteira condition with GRE-185:
+    ``spawn.orca``'s message text is exactly what this produces). The CLI
+    wraps every ``--json`` response in ``{id, ok, result, _meta}``.
+
+    ``argv`` is the bare call (no ``orca``/``--json``) — only used to name
+    the failing call in a message.
+
+    ``expect_lifecycle_ok`` is for the lifecycle messages a role sends
+    (``worker_done``). Measured against Orca 1.4.168: a rejected
+    ``worker_done`` still answers ``ok: true`` — the refusal lives in
+    ``result.lifecycle`` and in the process exit code, not in the envelope.
+    Without this flag a rejected completion reads as a success, which is
+    exactly how a planner ends up never retiring. Note the asymmetry:
+    ``lifecycle`` is present only on a rejection, so its absence must never
+    be treated as failure.
+    """
+
+    if not result.stdout.strip():
+        raise OrcaCliError(f"orca {' '.join(argv)} produced no output: {result.stderr.strip()}")
+    data = json.loads(result.stdout)
+    if isinstance(data, dict) and "ok" in data:
+        if not data.get("ok"):
+            err = data.get("error") or {}
+            raise OrcaCliError(f"orca {' '.join(argv)} failed: {err.get('code')}: {err.get('message')}")
+        data = data.get("result")
+    if expect_lifecycle_ok:
+        lifecycle = (data or {}).get("lifecycle") or {}
+        if lifecycle.get("action") == "rejected" or result.returncode != 0:
+            raise OrcaCliError(
+                f"orca {' '.join(argv[:2])} rejected: "
+                f"{lifecycle.get('code') or f'exit {result.returncode}'}: "
+                f"{lifecycle.get('reason') or result.stderr.strip()}"
+            )
+    if data is None:
+        return {}
+    return data if isinstance(data, dict) else {"items": data}
 
 
 # The (tier -> launch command) table GRE-161 put behind this boundary now
@@ -137,25 +206,9 @@ class OrcaRuntimeAdapter:
     def capabilities(self) -> RuntimeCapabilities:
         return RuntimeCapabilities(tier_verification=False, cooperative_completion=True)
 
-    def _orca(self, *argv: str) -> dict:
-        out = self.runner(["orca", *argv, "--json"])
-        data = json.loads(out) if out.strip() else {}
-        # The orca CLI wraps every --json response in an envelope
-        # {id, ok, result, _meta}; the payload lives under "result"
-        # (proved against the real CLI in the GRE-175 ad hoc test).
-        if isinstance(data, dict) and "ok" in data:
-            if not data.get("ok"):
-                error = data.get("error")
-                if not isinstance(error, dict):
-                    error = {"message": str(error)}
-                raise RuntimeError(
-                    f"orca {' '.join(argv)} failed: "
-                    f"{error.get('code', 'unknown')}: {error.get('message', '')}"
-                )
-            data = data.get("result")
-        if data is None:
-            return {}
-        return data if isinstance(data, dict) else {"items": data}
+    def _orca(self, *argv: str, expect_lifecycle_ok: bool = False) -> dict:
+        result = self.runner(["orca", *argv, "--json"])
+        return unwrap_envelope(argv, result, expect_lifecycle_ok=expect_lifecycle_ok)
 
     def _last_open_attempt(self) -> AttemptRef | None:
         for rec in reversed(list(self._attempts.values())):
@@ -351,7 +404,7 @@ class OrcaRuntimeAdapter:
     def drain(self, kinds: list[EventKind]) -> EventBatch:
         self._ensure_control()
         batch = parse_check_output(
-            self.runner(["orca", "orchestration", "check", "--terminal", self.coordinator, "--peek", "--json"])
+            self.runner(["orca", "orchestration", "check", "--terminal", self.coordinator, "--peek", "--json"]).stdout
         )
         # Only local events that made it into this batch may be consumed by
         # the matching ack; a control-lost filtered out by `kinds` must

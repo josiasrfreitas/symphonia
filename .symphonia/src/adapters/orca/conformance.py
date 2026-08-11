@@ -24,7 +24,7 @@ from ..runtime_adapter import (
     RoleSpec,
 )
 from ..runtime_adapter import AttemptRef, ContextRef, WorkspaceRef
-from .adapter import MessageWorkerRefused, OrcaRuntimeAdapter, _AttemptRecord
+from .adapter import MessageWorkerRefused, OrcaRuntimeAdapter, RunResult, _AttemptRecord
 from .events import gate_events, parse_check_output
 from .fake import FakeRuntime, FakeRuntimeAdapter, Rig, ScriptedOrcaCli
 
@@ -352,7 +352,10 @@ class RealCliContract(unittest.TestCase):
     """
 
     def _adapter_answering(self, fixture: str) -> OrcaRuntimeAdapter:
-        return OrcaRuntimeAdapter(coordinator="orchestrator", run_id="run-1", runner=lambda argv: fixture)
+        return OrcaRuntimeAdapter(
+            coordinator="orchestrator", run_id="run-1",
+            runner=lambda argv: RunResult(stdout=fixture, stderr="", returncode=0),
+        )
 
     def test_check_peek_unwraps_envelope(self):
         batch = parse_check_output(self.REAL_CHECK_PEEK)

@@ -44,6 +44,7 @@ from ..runtime_adapter import (
     TierEvidence,
     WorkspaceRef,
 )
+from .adapter import RunResult
 from .launcher import TIER_MODELS
 
 
@@ -439,7 +440,7 @@ class ScriptedOrcaCli:
         self.rt = rt
         self._ws_by_path: dict[str, str] = {}
 
-    def __call__(self, argv: Sequence[str]) -> str:
+    def __call__(self, argv: Sequence[str]) -> RunResult:
         argv = list(argv)
 
         def flag(name: str) -> str:
@@ -466,7 +467,7 @@ class ScriptedOrcaCli:
         }
         if command not in handlers:
             raise RuntimeError(f"scripted CLI does not know: {' '.join(argv)}")
-        return json.dumps(
+        stdout = json.dumps(
             {
                 "id": self.rt._next("req"),
                 "ok": True,
@@ -474,6 +475,7 @@ class ScriptedOrcaCli:
                 "_meta": {"runtimeId": "scripted"},
             }
         )
+        return RunResult(stdout=stdout, stderr="", returncode=0)
 
     def _worktree_create(self, name: str, ticket_key: str) -> dict:
         ws_id = self.rt.create_workspace(ticket_key)
