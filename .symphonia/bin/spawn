@@ -87,7 +87,6 @@ _events = _load("symphonia_pkg.orca.events", PACKAGE / "adapters" / "orca" / "ev
 _linear_pkg = types.ModuleType("symphonia_pkg.linear")
 _linear_pkg.__path__ = [str(PACKAGE / "adapters" / "linear")]
 sys.modules["symphonia_pkg.linear"] = _linear_pkg
-_linear_client = _load("symphonia_pkg.linear.client", PACKAGE / "adapters" / "linear" / "client.py")
 _linear = _load("symphonia_pkg.linear.adapter", PACKAGE / "adapters" / "linear" / "adapter.py")
 # A sibling script, loaded the same way for the same reason: no import
 # statement can name a file with no `.py` suffix in a dot-directory.

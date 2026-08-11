@@ -95,6 +95,7 @@ class Comment:
     author: ActorId
     author_name: str
     created_at: str
+    """``created_at`` is ISO-8601, as the provider returns it."""
 
 
 @dataclass(frozen=True)
@@ -172,7 +173,7 @@ class TrackerAdapter(Protocol):
     def set_delivery(self, id: str, **delivery: object) -> None: ...
     def set_gate(self, id: str, waiting: bool) -> None:
         """Put or lift the sign that a Human Gate is waiting. Human Gate is a
-        workflow concept, not a Linear one — every provider must expose it."""
+        workflow concept, not a provider one — every provider must expose it."""
         ...
 
     # Communication

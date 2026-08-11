@@ -99,8 +99,7 @@ class FakeClient:
                 nodes = [r for r in nodes if v["label"] in r["labels"]]
             return {"issues": self._page([self._node(r, "inverseRelations" in gql) for r in nodes])}
         if "comments(first: 100)" in gql:
-            return {"issue": {"comments": self._page(
-                [c for c in db.comments if c["issue"] == v["id"]])}}
+            return {"issue": {"comments": self._page([c for c in db.comments if c["issue"] == v["id"]])}}
         if "attachments(first: 100)" in gql:
             return {"issue": {"attachments": self._page([a for a in db.attachments if a["issue"] == v["id"]])}}
         if "team(id: $id) { states" in gql:

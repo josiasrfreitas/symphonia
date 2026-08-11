@@ -3,8 +3,8 @@
 TLDR: loads `bin/spawn` the same way it loads its own dependencies —
 `importlib` by file path, since the package lives in a dot-directory no
 import statement can name — then drives `build_brief` with a fake tracker
-and a fake GraphQL client so no network call and no `LINEAR_API_KEY` are
-needed. Checks: the `io:brief-template` block fills correctly, comments
+so no network call and no `LINEAR_API_KEY` are needed. Checks: the
+`io:brief-template` block fills correctly, comments
 carry an author and a date, and a missing placeholder value fails loudly
 instead of shipping a Brief with a hole in it. Run either way:
 
@@ -49,7 +49,7 @@ RoleName = SPAWN.RoleName
 
 
 class FakeTracker:
-    def __init__(self, item: Item, comments: list[Comment] = ()):
+    def __init__(self, item: Item, comments: tuple[Comment, ...] = ()):
         self._item = item
         self._comments = list(comments)
 

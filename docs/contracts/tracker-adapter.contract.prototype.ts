@@ -211,6 +211,7 @@ export type Comment = {
   id: string;
   author: ActorId;
   authorName: string;
+  /** ISO-8601, as the provider returns it. */
   createdAt: string;
   body: string;
 };
