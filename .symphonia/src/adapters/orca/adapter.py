@@ -622,6 +622,16 @@ class OrcaRuntimeAdapter:
             "--result", json.dumps({"reason": reason}),
         )
 
+    def list_terminals(self) -> set[str]:
+        """Every terminal handle currently live in Orca, across every
+        workspace — `sweep`'s only way to tell a role's pane is gone without
+        walking each worktree by hand. `terminal list` with no `--worktree`
+        selector returns every live terminal, not just the coordinator's own
+        (verified against the real CLI, 2026-08-11)."""
+
+        listed = self._orca("terminal", "list")
+        return {str(t.get("handle")) for t in listed.get("terminals", []) if t.get("handle")}
+
     # --- events ---
 
     def _to_event(self, message, kinds: list[EventKind]) -> RuntimeEvent | None:

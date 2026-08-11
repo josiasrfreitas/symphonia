@@ -108,5 +108,24 @@ class SettleTask(unittest.TestCase):
         ]])
 
 
+class ListTerminals(unittest.TestCase):
+    """`sweep`'s only way to tell a role's pane is gone: no `--worktree`
+    selector at all, unlike `_close_orphan_shell`'s call (GRE-189)."""
+
+    def test_argv_and_return(self):
+        runner = RecordingRunner([_proc(_ok({"terminals": [
+            {"handle": "term-1", "title": "x", "command": "y"},
+            {"handle": "term-2", "title": "", "command": ""},
+        ]}))])
+        adapter = _adapter(runner)
+        self.assertEqual(adapter.list_terminals(), {"term-1", "term-2"})
+        self.assertEqual(runner.clean_calls(), [["terminal", "list"]])
+
+    def test_a_handle_less_row_is_dropped_not_stringified_as_none(self):
+        runner = RecordingRunner([_proc(_ok({"terminals": [{"title": "x", "command": "y"}]}))])
+        adapter = _adapter(runner)
+        self.assertEqual(adapter.list_terminals(), set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

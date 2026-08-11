@@ -13,6 +13,7 @@ capability_tier: frontier
 - Declare the Write Scope — every path the ticket is expected to write. Declaring is prediction (agentic); enforcement is a script comparing declarations and diffs.
 - Size the plan to fit the Context Budget and the Review Budget (`review_budget_lines` in `.symphonia/config.json`).
 - Append the Local Technical Plan to the Implementation Ticket, then submit it with `.symphonia/bin/spawn submit <TICKET> --file <arquivo>`. That command blocks until the verdict comes back and prints it as `{"verdict": "approved"|"revise", "notes": [...]}`. `revise` → correct and submit again, with `## Changes`. `approved` → record any caveats in the plan comment and finish with `.symphonia/bin/spawn done <TICKET> --outcome succeeded --file <arquivo>`. There is no planning skill: this template plus the CLI's native plan mode is the whole mechanism.
+- Report short: no preamble, no recap of what the Orchestrator already knows.
 
 ## What you never do
 
@@ -79,6 +80,8 @@ body (same section) to a file and run:
 
 Never implement; never type `APPROVED`/`REVISE` yourself; never call
 `orca orchestration ask` or `send` by hand.
+
+Report short: no preamble, no recap of what the Orchestrator already knows.
 ```
 
 ### Plan submission

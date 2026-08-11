@@ -10,13 +10,18 @@
 .symphonia/bin/spawn review-spec      <TICKET>
 .symphonia/bin/spawn review-standards <TICKET>
 .symphonia/bin/spawn status          [<TICKET>]
-.symphonia/bin/spawn retire           <TICKET> <role>
+.symphonia/bin/spawn retire           <TICKET> <role>  # manual: same teardown a worker_done already ran for you
+.symphonia/bin/spawn sweep           [<TICKET>]         # audits for a role whose world is already gone, tears it down
 .symphonia/bin/spawn wait            [--ack <delivery_id>] [--timeout-ms <ms>]
 .symphonia/bin/spawn verdict          <TICKET> approved|revise [--notes <text>|--notes-file <path>]
 ```
 
 One argument, the Ticket Key. No flags. `--tier` exists but is a human
 override — never pass it yourself.
+
+Every report a role sends back — `worker_done`, an escalation, an answer to
+your questions — should be short: no preamble, no recap of what you already
+know.
 
 ## The role's own two commands
 
@@ -60,18 +65,30 @@ Spawn every ready role first, then wait once. Never wait between spawns.
 `wait` wraps `orca orchestration check --wait`; you never call that raw. For
 the planner it also drives the plan gate by itself: a plan submission
 (`question`) lights the `human-gate` label, and a `worker_done` after an
-approved verdict retires the planner — both are printed in `wait`'s output
-as `actions`, never something you decide by reading the message.
+approved verdict tears down the planner. Any other role's `worker_done` —
+implementer, either reviewer, on either outcome — ends that role the same
+way, directly: no gate state to transition, so there is nothing left for you
+to retire by hand. Both are printed in `wait`'s output as `actions`
+(`retire_planner`/`retire_role`), never something you decide by reading the
+message.
 
 Then, for every message `wait` reports that is not already a gate action:
 
 | Message | What it means | What you do |
 |---|---|---|
-| `worker_done` + `succeeded` (non-planner role) | The role finished and wrote its handoff | Present the Human Gate if there is one, then `retire` it and spawn the next role |
-| `worker_done` + `failed` | The role gave up; Orca marked the Task failed | Read its handoff, decide retry or escalate to the human |
+| `worker_done` + `succeeded` (non-planner role) | The role finished, wrote its handoff, and `wait` already ended it | Present the Human Gate if there is one, then spawn the next role |
+| `worker_done` + `failed` | The role gave up; Orca marked the Task failed, and `wait` already ended it | Read its handoff, decide retry or escalate to the human |
 | `question`, a real plan submission, from the planner | A plan is waiting on a verdict | `.symphonia/bin/spawn verdict <TICKET> approved\|revise [--notes ...]` — never `orca orchestration reply` by hand |
 | `question`, anything else (a clarifying question from the planner, or any question from another role) | The gate does not apply — it is not a plan submission | `orca orchestration reply --id <message id> --body <answer>` directly; there is no `spawn` verb for this, and no raw `check --wait` is needed to see it — `spawn wait`'s `events` already carries it |
 | `escalation` | The role has ownership but needs you to intervene | Read, act, and usually raise a Needs Attention flag |
+
+`retire`/`sweep` are for what `wait` cannot see: a role that never got to
+report at all — the app quit, a machine lost power, a worktree was deleted
+by hand. `retire <TICKET> <role>` ends one you can name yourself, and redoes
+its best-effort work even on a role already ended — it never assumes. `sweep
+[<TICKET>]` finds every record whose terminal or worktree is already gone
+and ends those without you having to name them; a record `wait` (or a prior
+`sweep`) already ended is left alone and not reported.
 
 Acknowledge and keep waiting in one call:
 
