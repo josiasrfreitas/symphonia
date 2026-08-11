@@ -40,7 +40,9 @@ do not have to remember it.
 ## What each spawn does for you
 
 Creates the ticket's worktree as a child of your own in Orca lineage, off the
-repo default base in git (never your current branch). Launches the role at its
+repo default base in git (never your current branch), and runs
+`.symphonia/bin/setup-worktree` on it — a fresh checkout has no `.env`,
+because a `git worktree add` never brings a gitignored file. Launches the role at its
 Capability Tier with permissions that never prompt. Labels the worktree, the
 terminal and the board column with the phase. Creates the Task, injects the
 dispatch, and records everything so `status` can report it.
@@ -130,6 +132,7 @@ ownership to anyone. Every transition goes through you.
 | `adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
 | `adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
 | `roles/*.md` | What each role does and never does, and (for the planner) the I/O shapes it reads and writes |
+| `bin/setup-worktree` | What a fresh checkout needs and git does not bring: the env files |
 | `config.json` | The calibration numbers |
 
 Adding a provider is a `PROVIDERS` entry in `launcher.py`. Changing a model is

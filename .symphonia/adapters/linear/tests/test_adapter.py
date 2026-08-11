@@ -396,6 +396,8 @@ class TestApiKeyComesFromTheEnvironmentOrAFile(unittest.TestCase):
         import os
         import tempfile
 
+        from adapters import env as ENV
+
         self.os = os
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -405,6 +407,13 @@ class TestApiKeyComesFromTheEnvironmentOrAFile(unittest.TestCase):
             if self.previous is not None else None
         )
         self.addCleanup(os.environ.pop, "SYMPHONIA_ENV", None)
+        # The loader's other two candidates are real paths on this machine —
+        # the developer's own ~/.symphonia/.env and the repo's .env — and
+        # either one would decide this test instead of the fixture.
+        for attribute in ("SHARED_ENV", "REPO"):
+            self.addCleanup(setattr, ENV, attribute, getattr(ENV, attribute))
+        ENV.SHARED_ENV = Path(self.tmp.name) / "shared-absent.env"
+        ENV.REPO = Path(self.tmp.name) / "repo-absent"
 
     def env_file(self, text: str) -> str:
         path = Path(self.tmp.name) / ".env"

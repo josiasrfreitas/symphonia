@@ -46,6 +46,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import importlib.machinery
 import importlib.util
 import types
 
@@ -54,9 +55,15 @@ PACKAGE = Path(__file__).resolve().parent.parent
 
 def _load(name: str, path: Path) -> types.ModuleType:
     """The package lives in a dot-directory, which no import statement can
-    name, so its two modules are loaded by file location instead."""
+    name, so its modules are loaded by file location instead.
 
-    spec = importlib.util.spec_from_file_location(name, path)
+    The loader is passed explicitly because one of them (`bin/setup-worktree`)
+    has no `.py` suffix, and `spec_from_file_location` returns None for a
+    suffix it does not recognize."""
+
+    spec = importlib.util.spec_from_file_location(
+        name, path, loader=importlib.machinery.SourceFileLoader(name, str(path)),
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -82,6 +89,9 @@ _linear_pkg.__path__ = [str(PACKAGE / "adapters" / "linear")]
 sys.modules["symphonia_pkg.linear"] = _linear_pkg
 _linear_client = _load("symphonia_pkg.linear.client", PACKAGE / "adapters" / "linear" / "client.py")
 _linear = _load("symphonia_pkg.linear.adapter", PACKAGE / "adapters" / "linear" / "adapter.py")
+# A sibling script, loaded the same way for the same reason: no import
+# statement can name a file with no `.py` suffix in a dot-directory.
+_setup_worktree = _load("symphonia_pkg.setup_worktree", PACKAGE / "bin" / "setup-worktree")
 
 RoleName = _contract.RoleName
 Access = _contract.Access
@@ -294,6 +304,13 @@ def create_worktree(ticket: str) -> tuple[str, str]:
             orca("terminal", "close", "--terminal", str(term.get("handle")), "--tab")
         except SystemExit as exc:
             print(f"note: leftover shell not closed ({exc})", file=sys.stderr)
+
+    # The env files are gitignored, so the new checkout does not have them —
+    # it looks complete and fails the first time something reads `.env`.
+    # Called here rather than relying on Orca's repo setup hook, which is a
+    # per-machine setting and is empty until someone fills it in: a spawn must
+    # not depend on a checkbox. Running it twice is harmless.
+    print(json.dumps(_setup_worktree.setup(Path(path))), file=sys.stderr)
     return wt_id, path
 
 
