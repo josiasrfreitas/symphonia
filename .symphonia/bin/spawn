@@ -337,6 +337,7 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None, cl
     values = {
         "ticket_key": ticket,
         "role": role.value,
+        "role_file": f".symphonia/roles/{ROLE_FILES[role]}",
         "workspace": workspace,
         "branch": _current_branch(workspace),
         "title": item.title,
@@ -525,17 +526,77 @@ def retire(ticket: str, role_value: str) -> dict:
 
 # --- the plan gate ---------------------------------------------------------
 
+IDLE = _gate.IDLE
+
+
+def _flag_malformed(tracker, ticket: str, reason: str) -> None:
+    tracker.set_attention(
+        ticket,
+        _attention.Attention(
+            needs=True, code=_attention.AttentionCode.MALFORMED_REPORT, reason=reason,
+        ),
+    )
+
+
+def _apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str | None]]:
+    """The gate's decision for one event, isolated from the tracker/Linear
+    calls `wait` makes: mutates `rec`'s `gate_state`/`question_id` in place
+    and returns the `(action, reason)` pairs to execute — `reason` is only
+    set for `flag_malformed`. No network call happens here, so this is what
+    a unit test drives.
+
+    A `plan-question` is only a gate event when its body is a real plan
+    submission (`reports.is_plan_submission`) — a clarifying question from
+    the planner is not a submission, does not light the label, and is left
+    for the caller to treat as an ordinary message instead. A body that
+    starts `## Plan` but does not otherwise parse is flagged rather than
+    silently accepted or silently ignored.
+    """
+
+    state = rec.get("gate_state", IDLE)
+
+    if event.kind == "plan-question":
+        if not _reports.is_plan_submission(event.question):
+            return []
+        try:
+            _reports.parse_plan_submission(event.question)
+        except _reports.MalformedReport as exc:
+            return [(_gate.FLAG_MALFORMED, str(exc))]
+        result = _gate.transition(state, event, last_question_id=rec.get("last_question_id"))
+        if result.question_id:
+            rec["question_id"] = result.question_id
+            rec["last_question_id"] = result.question_id
+    elif event.kind == "worker-done":
+        raw = raw_by_id.get(event.message_id)
+        result = _gate.transition(state, event, payload=(raw.payload if raw else {}))
+    else:
+        result = _gate.transition(state, event)
+
+    rec["gate_state"] = result.state
+    divergence = (
+        f"gate event {event.kind!r} did not match the recorded gate_state {state!r}"
+    )
+    return [
+        (action, divergence if action == _gate.FLAG_MALFORMED else None)
+        for action in result.actions
+    ]
+
 
 def wait(*, ack: str | None, timeout_ms: int) -> dict:
     """The one loop the Orchestrator uses to hear back from every role.
     Wraps `orca orchestration check --wait`, then runs each gate event
-    through `plan_gate.transition` and executes the actions it returns —
-    label the ticket, retire the planner, flag a divergence — never the
-    Orchestrator reading a message and deciding by itself.
+    through `_apply_gate_event`/`plan_gate.transition` and executes the
+    actions it returns — label the ticket, retire the planner, flag a
+    divergence — never the Orchestrator reading a message and deciding by
+    itself.
 
     Replay-safe: an unacked Delivery replays the same batch, but every
-    action is guarded by the recorded `gate_state`, so a repeat is a no-op
-    (see `plan_gate.py`).
+    action is guarded by the recorded `gate_state` (and, for plan-question,
+    by the event's own id), so a repeat is a no-op (see `plan_gate.py`).
+
+    The Linear tracker is built lazily, only when a gate action actually
+    needs it — a `wait` that observes no gate action (the common case for
+    every role but the planner) must work even without `LINEAR_API_KEY` set.
     """
 
     argv = [
@@ -551,11 +612,18 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     # the same helper serves both call sites without a second parser.
     batch = _events.parse_check_output(json.dumps(batch_raw))
     events = _events.gate_events(batch.messages)
+    raw_by_id = {m.id: m for m in batch.messages}
 
     data = state_read()
     by_dispatch = {rec["dispatch"]: key for key, rec in data.items()}
-    tracker = _linear.LinearTracker()
     actions_taken = []
+
+    _tracker: list = []
+
+    def tracker():
+        if not _tracker:
+            _tracker.append(_linear.LinearTracker())
+        return _tracker[0]
 
     for event in events:
         dispatch_id = getattr(event, "dispatch_id", None)
@@ -564,37 +632,28 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
             continue  # the gate governs only the planner's own dispatch
         rec = data[key]
         ticket = rec["ticket"]
-        state = rec.get("gate_state", _gate.IDLE)
-        result = _gate.transition(state, event)
-        rec["gate_state"] = result.state
-        if event.kind == "plan-question":
-            rec["question_id"] = event.message_id
-        for action in result.actions:
+        for action, reason in _apply_gate_event(rec, event, raw_by_id):
             if action == _gate.LABEL_ON:
-                tracker.set_gate(ticket, True)
+                tracker().set_gate(ticket, True)
             elif action == _gate.LABEL_OFF:
-                tracker.set_gate(ticket, False)
+                tracker().set_gate(ticket, False)
             elif action == _gate.RETIRE_PLANNER:
                 retire(ticket, GATE_ROLE.value)
             elif action == _gate.FLAG_MALFORMED:
-                tracker.set_attention(
-                    ticket,
-                    _attention.Attention(
-                        needs=True,
-                        code=_attention.AttentionCode.MALFORMED_REPORT,
-                        reason=(
-                            f"gate event {event.kind!r} did not match the recorded "
-                            f"gate_state {state!r}"
-                        ),
-                    ),
-                )
+                _flag_malformed(tracker(), ticket, reason or "malformed gate report")
             actions_taken.append({"ticket": ticket, "action": action})
     state_write(data)
     return {
         "delivery_id": batch.delivery_id,
+        # Every mailbox message, not just the ones typed as gate events —
+        # an escalation or a non-planner question must stay visible to the
+        # Orchestrator even though the gate itself has nothing to do with it.
         "events": [
-            dict(kind=event.kind, **{k: v for k, v in vars(event).items() if k != "kind"})
-            for event in events
+            {
+                "id": m.id, "type": m.type, "subject": m.subject,
+                "body": m.body, "payload": m.payload, "sender": m.sender,
+            }
+            for m in batch.messages
         ],
         "actions": actions_taken,
     }
@@ -626,7 +685,7 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
 
     token = "APPROVED" if decision == "approved" else "REVISE"
     note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
-    body = token + ("\n\n" + "\n".join(f"- {line}" for line in note_lines) if note_lines else "")
+    body = _reports.format_approval_reply(token, note_lines)
 
     orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
     _linear.LinearTracker().set_gate(ticket, False)

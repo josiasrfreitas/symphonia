@@ -19,6 +19,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 PACKAGE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE))
@@ -103,7 +104,14 @@ class TestBuildBrief(unittest.TestCase):
             RoleName.PLANNER, "GRE-181", "/tmp/gre-181",
             tracker=self.tracker, client=FakeClient([]),
         )
-        self.assertIn("### Comentários\n\nNone.", brief)
+        self.assertIn("### Comments\n\nNone.", brief)
+
+    def test_role_file_is_resolved_by_role_not_hardcoded(self):
+        brief = SPAWN.build_brief(
+            RoleName.PLANNER, "GRE-181", "/tmp/gre-181",
+            tracker=self.tracker, client=self.client,
+        )
+        self.assertIn("Read `.symphonia/roles/planner.md` in full", brief)
 
     def test_missing_handoff_says_first_role(self):
         brief = SPAWN.build_brief(
@@ -117,6 +125,97 @@ class TestExtractBlockFailureIsLoud(unittest.TestCase):
     def test_role_file_with_no_brief_template_raises(self):
         with self.assertRaises(LookupError):
             SPAWN._reports.extract_block("# No I/O section here.", "md io:brief-template")
+
+
+class TestApplyGateEventQuestionFiltering(unittest.TestCase):
+    """A1: `wait`'s gate must only react to a real plan submission — a
+    clarifying question from the planner must not light the label."""
+
+    def _question(self, body, message_id="q-1"):
+        return SimpleNamespace(kind="plan-question", message_id=message_id, question=body)
+
+    def test_non_submission_question_is_not_a_gate_event(self):
+        rec = {"gate_state": SPAWN.IDLE}
+        actions = SPAWN._apply_gate_event(rec, self._question("Should I use A or B?"), {})
+        self.assertEqual(actions, [])
+        self.assertEqual(rec["gate_state"], SPAWN.IDLE)
+        self.assertNotIn("question_id", rec)
+
+    def test_real_submission_lights_the_label(self):
+        rec = {"gate_state": SPAWN.IDLE}
+        body = "## Plan\nGRE-1 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+        actions = SPAWN._apply_gate_event(rec, self._question(body, "q-1"), {})
+        self.assertEqual(actions, [(SPAWN._gate.LABEL_ON, None)])
+        self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
+        self.assertEqual(rec["question_id"], "q-1")
+        self.assertEqual(rec["last_question_id"], "q-1")
+
+    def test_body_that_starts_plan_but_fails_to_parse_is_flagged(self):
+        rec = {"gate_state": SPAWN.IDLE}
+        body = "## Plan\nGRE-1 — pointer\n\n## Changes\nNone.\n"  # missing Decisions
+        actions = SPAWN._apply_gate_event(rec, self._question(body), {})
+        self.assertEqual(len(actions), 1)
+        action, reason = actions[0]
+        self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
+        self.assertIn("Decisions", reason)
+        self.assertEqual(rec["gate_state"], SPAWN.IDLE)  # never toggled
+
+
+class TestApplyGateEventReplayVsResubmission(unittest.TestCase):
+    """A2: replay of an unacked Delivery must not relight the label or
+    revert an already-decided verdict; a genuine resubmission after REVISE
+    must."""
+
+    SUBMISSION = "## Plan\nGRE-1 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+
+    def _question(self, message_id):
+        return SimpleNamespace(kind="plan-question", message_id=message_id, question=self.SUBMISSION)
+
+    def test_replay_after_approval_does_not_relight_the_label(self):
+        rec = {"gate_state": SPAWN._gate.VERDICT_APPROVED, "last_question_id": "q-1"}
+        actions = SPAWN._apply_gate_event(rec, self._question("q-1"), {})
+        self.assertEqual(actions, [])
+        self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_APPROVED)
+
+    def test_replay_after_revise_does_not_relight_the_label(self):
+        rec = {"gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
+        actions = SPAWN._apply_gate_event(rec, self._question("q-1"), {})
+        self.assertEqual(actions, [])
+        self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_REVISE)
+
+    def test_resubmission_after_revise_lights_the_label(self):
+        rec = {"gate_state": SPAWN._gate.VERDICT_REVISE, "last_question_id": "q-1"}
+        actions = SPAWN._apply_gate_event(rec, self._question("q-2"), {})
+        self.assertEqual(actions, [(SPAWN._gate.LABEL_ON, None)])
+        self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
+        self.assertEqual(rec["last_question_id"], "q-2")
+
+
+class TestApplyGateEventWorkerDoneUsesRawPayload(unittest.TestCase):
+    """A1: the planner's worker_done must be parsed through
+    `reports.parse_planner_done`, not accepted on gate_state alone."""
+
+    def _done(self, message_id="d-1", outcome="succeeded"):
+        summary = "## Plan\npointer\n\n## Approval\n1 round.\n\n## Deviations\nNone.\n"
+        return SimpleNamespace(
+            kind="worker-done", message_id=message_id, outcome=outcome, summary=summary,
+        )
+
+    def test_approved_and_matching_payload_retires(self):
+        rec = {"gate_state": SPAWN._gate.VERDICT_APPROVED}
+        raw = SimpleNamespace(payload={"planApproved": True, "approvalRounds": 1})
+        actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
+        self.assertEqual(actions, [(SPAWN._gate.RETIRE_PLANNER, None)])
+        self.assertEqual(rec["gate_state"], SPAWN._gate.RETIRED)
+
+    def test_approved_state_with_planApproved_false_payload_is_flagged_not_retired(self):
+        rec = {"gate_state": SPAWN._gate.VERDICT_APPROVED}
+        raw = SimpleNamespace(payload={"planApproved": False, "approvalRounds": 1})
+        actions = SPAWN._apply_gate_event(rec, self._done(), {"d-1": raw})
+        self.assertEqual(len(actions), 1)
+        action, _ = actions[0]
+        self.assertEqual(action, SPAWN._gate.FLAG_MALFORMED)
+        self.assertEqual(rec["gate_state"], SPAWN._gate.VERDICT_APPROVED)
 
 
 if __name__ == "__main__":

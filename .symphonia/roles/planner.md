@@ -22,12 +22,11 @@ capability_tier: frontier
 
 ## I/O
 
-Rule that governs every shape below: **if a script decides on a field, it is
-payload (or a fixed-position token); if a human or the next phase reads it,
-it is a body section.** Full statement in `.symphonia/README.md`, "Rules the
-package encodes" — this file and `adapters/reports.py` only point to it.
+The payload × body rule governs every shape below — see
+`.symphonia/README.md`, "Rules the package encodes"; this file and
+`adapters/reports.py` only point to it, never restate it.
 
-### O Execution Brief (entrada)
+### Execution Brief (input)
 
 What `.symphonia/bin/spawn plan` extracts, fills from the ticket, and
 injects at launch — you open with this already in hand, zero tool call
@@ -39,39 +38,40 @@ role's contract lives in the role's own file.
 # Execution Brief — {ticket_key}
 
 - **Role:** {role}
-- **Worktree:** {workspace}
+- **Workspace:** {workspace}
 - **Branch:** {branch}
 
-## Seu contrato
+## Your contract
 
-Leia `.symphonia/roles/planner.md` por inteiro antes de agir — ele vale por
-cima de qualquer coisa neste documento.
+Read `{role_file}` in full before acting — it governs above anything in
+this document.
 
-## O ticket
+## The ticket
 
 **{ticket_key} — {title}**
 {url}
 
 {description}
 
-### Comentários
+### Comments
 
 {comments}
 
-## Handoff anterior
+## Prior handoff
 
 {handoff_files}
 
-## Como terminar
+## How to finish
 
-Submeta o Local Technical Plan como comentário no ticket, então mande a
-Submissão do plano (seção abaixo) e espere o veredito. `REVISE` → corrija e
-submeta de novo, com `## Changes`. `APPROVED` → registre as ressalvas no
-comentário do plano e mande `worker_done` no formato "worker_done" abaixo.
-Nunca implemente; nunca digite `APPROVED`/`REVISE` você mesmo.
+Submit the Local Technical Plan as a comment on the ticket, then send it in
+the Plan submission format from `{role_file}` (section `## I/O`) and wait
+for the verdict. `REVISE` → correct and submit again, with `## Changes`.
+`APPROVED` → record any caveats in the plan comment and send `worker_done`
+in the format from that same section. Never implement; never type
+`APPROVED`/`REVISE` yourself.
 ```
 
-### Submissão do plano
+### Plan submission
 
 The message you send to ask for a verdict. The first line is exactly
 `## Plan`; a script (`is_plan_submission`) recognizes a submission by that
@@ -88,7 +88,7 @@ GRE-181 — Local Technical Plan on the ticket: comment 786809ca-8db0-4ba0-8a2b-
 None.
 ```
 
-### Resposta de aprovação
+### Approval reply
 
 The coordinator's reply. `spawn verdict` writes this — you never type it.
 The first non-empty line is exactly one token, `APPROVED` or `REVISE`; the

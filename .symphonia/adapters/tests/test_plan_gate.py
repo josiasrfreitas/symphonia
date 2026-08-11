@@ -31,8 +31,8 @@ from adapters.plan_gate import (
 )
 
 
-def question():
-    return SimpleNamespace(kind="plan-question")
+def question(message_id: str = "q-1"):
+    return SimpleNamespace(kind="plan-question", message_id=message_id)
 
 
 def reply(token: str, notes: str = ""):
@@ -40,20 +40,28 @@ def reply(token: str, notes: str = ""):
     return SimpleNamespace(kind="approval-reply", body=body)
 
 
-def done(outcome: str):
-    return SimpleNamespace(kind="worker-done", outcome=outcome)
+DONE_BODY = "## Plan\npointer\n\n## Approval\n1 round.\n\n## Deviations\nNone.\n"
+
+
+def done(outcome: str, *, approved: bool = True, rounds: int = 1):
+    payload = {"planApproved": approved, "approvalRounds": rounds}
+    return SimpleNamespace(
+        kind="worker-done", message_id="d-1", outcome=outcome, summary=DONE_BODY,
+    ), payload
 
 
 class TestHappyPath(unittest.TestCase):
     def test_submit_approve_done_retires(self):
         state = IDLE
-        result = transition(state, question())
+        result = transition(state, question("q-1"), last_question_id=None)
         self.assertEqual((result.state, result.actions), (SUBMITTED, (LABEL_ON,)))
+        self.assertEqual(result.question_id, "q-1")
 
         result = transition(result.state, reply("APPROVED"))
         self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, (LABEL_OFF,)))
 
-        result = transition(result.state, done("succeeded"))
+        event, payload = done("succeeded")
+        result = transition(result.state, event, payload=payload)
         self.assertEqual((result.state, result.actions), (RETIRED, (RETIRE_PLANNER,)))
 
 
@@ -63,13 +71,16 @@ class TestReviseRoundTrip(unittest.TestCase):
         result = transition(state, reply("REVISE", "fix the write scope"))
         self.assertEqual((result.state, result.actions), (VERDICT_REVISE, (LABEL_OFF,)))
 
-        result = transition(result.state, question())
+        # A genuine resubmission carries a NEW question id — the planner
+        # asked again after correcting the plan.
+        result = transition(result.state, question("q-2"), last_question_id="q-1")
         self.assertEqual((result.state, result.actions), (SUBMITTED, (LABEL_ON,)))
+        self.assertEqual(result.question_id, "q-2")
 
 
 class TestReplayIsIdempotent(unittest.TestCase):
     def test_repeated_submission_does_not_relight_the_label(self):
-        result = transition(SUBMITTED, question())
+        result = transition(SUBMITTED, question("q-1"), last_question_id="q-1")
         self.assertEqual((result.state, result.actions), (SUBMITTED, ()))
 
     def test_repeated_approval_reply_is_a_no_op(self):
@@ -77,8 +88,22 @@ class TestReplayIsIdempotent(unittest.TestCase):
         self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, ()))
 
     def test_repeated_worker_done_after_retirement_does_not_retire_twice(self):
-        result = transition(RETIRED, done("succeeded"))
+        event, payload = done("succeeded")
+        result = transition(RETIRED, event, payload=payload)
         self.assertEqual((result.state, result.actions), (RETIRED, ()))
+
+    def test_replay_of_the_submission_after_approval_does_not_relight_the_label(self):
+        """A2: an unacked Delivery can replay the original plan-question
+        message after the verdict already moved the state to
+        verdict-approved. The replayed event carries the SAME id as the
+        submission that produced this state — it must be a no-op, not a
+        fresh SUBMITTED transition."""
+        result = transition(VERDICT_APPROVED, question("q-1"), last_question_id="q-1")
+        self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, ()))
+
+    def test_replay_of_the_submission_after_revise_does_not_relight_the_label(self):
+        result = transition(VERDICT_REVISE, question("q-1"), last_question_id="q-1")
+        self.assertEqual((result.state, result.actions), (VERDICT_REVISE, ()))
 
 
 class TestDivergenceIsFlagged(unittest.TestCase):
@@ -87,17 +112,27 @@ class TestDivergenceIsFlagged(unittest.TestCase):
         self.assertEqual((result.state, result.actions), (SUBMITTED, (FLAG_MALFORMED,)))
 
     def test_succeeded_done_without_recorded_approval_is_flagged(self):
-        result = transition(SUBMITTED, done("succeeded"))
+        event, payload = done("succeeded")
+        result = transition(SUBMITTED, event, payload=payload)
         self.assertEqual((result.state, result.actions), (SUBMITTED, (FLAG_MALFORMED,)))
 
     def test_failed_done_is_left_for_the_human(self):
-        result = transition(SUBMITTED, done("failed"))
+        event, payload = done("failed")
+        result = transition(SUBMITTED, event, payload=payload)
         self.assertEqual((result.state, result.actions), (SUBMITTED, ()))
+
+    def test_approved_done_with_payload_disagreeing_is_flagged_not_retired(self):
+        """A1: worker_done now goes through `parse_planner_done`, closing
+        the payload side of the divergence check — a `planApproved: false`
+        payload after an APPROVED verdict must not retire the planner."""
+        event, payload = done("succeeded", approved=False)
+        result = transition(VERDICT_APPROVED, event, payload=payload)
+        self.assertEqual((result.state, result.actions), (VERDICT_APPROVED, (FLAG_MALFORMED,)))
 
 
 class TestRetiredPlannerCannotReopen(unittest.TestCase):
     def test_plan_question_after_retirement_is_ignored(self):
-        result = transition(RETIRED, question())
+        result = transition(RETIRED, question("q-2"), last_question_id="q-1")
         self.assertEqual((result.state, result.actions), (RETIRED, ()))
 
 

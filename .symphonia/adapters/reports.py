@@ -142,6 +142,18 @@ def parse_approval_reply(body: str) -> ApprovalVerdict:
     return ApprovalVerdict(approved=token_line == "APPROVED", notes=notes)
 
 
+def format_approval_reply(token: str, notes: tuple[str, ...] | list[str] = ()) -> str:
+    """The one place that writes the approval-reply shape ``parse_approval_reply``
+    reads — ``spawn verdict`` calls this instead of assembling the token and
+    the note list by hand, so the contract has a single house instead of one
+    per caller."""
+
+    if token not in _VALID_TOKENS:
+        raise ValueError(f"unknown approval token {token!r}; use one of {_VALID_TOKENS}")
+    lines = [line.strip() for line in notes if line.strip()]
+    return token + ("\n\n" + "\n".join(f"- {line}" for line in lines) if lines else "")
+
+
 # --- (c) planner worker_done -------------------------------------------------
 
 

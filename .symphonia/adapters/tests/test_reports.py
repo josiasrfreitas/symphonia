@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from adapters.reports import (
     MalformedReport,
     extract_block,
+    format_approval_reply,
     is_plan_submission,
     parse_approval_reply,
     parse_plan_submission,
@@ -114,6 +115,27 @@ class TestMalformedSubmission(unittest.TestCase):
         body = "## Plans\nGRE-1 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
         with self.assertRaises(MalformedReport):
             parse_plan_submission(body)
+
+
+class TestFormatApprovalReplyRoundTrips(unittest.TestCase):
+    """A3: `spawn verdict` formats through this instead of hand-assembling
+    the token/notes shape — round-trips through `parse_approval_reply`."""
+
+    def test_approved_with_notes_round_trips(self):
+        body = format_approval_reply("APPROVED", ["Ship it, but note the retry counter too."])
+        verdict = parse_approval_reply(body)
+        self.assertTrue(verdict.approved)
+        self.assertEqual(verdict.notes, ("Ship it, but note the retry counter too.",))
+
+    def test_revise_with_no_notes_round_trips(self):
+        body = format_approval_reply("REVISE", [])
+        verdict = parse_approval_reply(body)
+        self.assertFalse(verdict.approved)
+        self.assertEqual(verdict.notes, ())
+
+    def test_unknown_token_rejected(self):
+        with self.assertRaises(ValueError):
+            format_approval_reply("MAYBE", [])
 
 
 class TestMalformedApproval(unittest.TestCase):

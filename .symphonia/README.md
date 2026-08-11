@@ -12,7 +12,7 @@
 | `dag/` | Home of the Execution DAG tooling (`dag validate` / `dag brief` / `dag graph`). Placeholder for now. |
 | `guardrails/` | Guardrail scripts: Write Scope collision/audit, Review Budget meter, Context Budget gate. Skeletons for now. |
 | `reconcile/` | Reconciliation: how a run compares tracker vs runtime and acts only on the difference. |
-| `adapters/` | The shared Python interfaces: Tracker Adapter contract, Runtime Adapter contract, structured Needs Attention codes. |
+| `adapters/` | The shared Python interfaces: Tracker Adapter contract, Runtime Adapter contract, structured Needs Attention codes, role I/O parsing (`reports.py`), and the plan gate state machine (`plan_gate.py`). |
 | `hooks/` | Harness hooks (the `Stop` hook that drives the context gate). |
 | `skills/` | Source content of the three shipped skills: `/orchestrate`, `/wayfinder`, `/handoff`. The installed skill files only point here. |
 

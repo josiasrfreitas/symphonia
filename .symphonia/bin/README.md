@@ -52,7 +52,8 @@ Then, for every message `wait` reports that is not already a gate action:
 |---|---|---|
 | `worker_done` + `succeeded` (non-planner role) | The role finished and wrote its handoff | Present the Human Gate if there is one, then `retire` it and spawn the next role |
 | `worker_done` + `failed` | The role gave up; Orca marked the Task failed | Read its handoff, decide retry or escalate to the human |
-| `question` from the planner | A plan is waiting on a verdict | `.symphonia/bin/spawn verdict <TICKET> approved\|revise [--notes ...]` — never `orca orchestration reply` by hand |
+| `question`, a real plan submission, from the planner | A plan is waiting on a verdict | `.symphonia/bin/spawn verdict <TICKET> approved\|revise [--notes ...]` — never `orca orchestration reply` by hand |
+| `question`, anything else (a clarifying question from the planner, or any question from another role) | The gate does not apply — it is not a plan submission | `orca orchestration reply --id <message id> --body <answer>` directly; there is no `spawn` verb for this, and no raw `check --wait` is needed to see it — `spawn wait`'s `events` already carries it |
 | `escalation` | The role has ownership but needs you to intervene | Read, act, and usually raise a Needs Attention flag |
 
 Acknowledge and keep waiting in one call:
