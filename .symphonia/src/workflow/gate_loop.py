@@ -1,19 +1,25 @@
-"""The gate's decision for one event, isolated from the tracker/Linear calls
-`wait` makes.
+"""The gate loop: turns a batch of typed events into gate actions and
+executes them, over the pure `adapters/plan_gate.py` state machine, which
+this module builds around and never touches.
 
 TLDR: `apply_gate_event` is `spawn._apply_gate_event`, moved here and made
-public — same body, same behavior. It knows nothing about Orca or Linear:
-no network call happens here, so this is what a unit test drives, over the
-pure `adapters/plan_gate.py` state machine, which this module builds around
-and never touches.
+public — same body, same behavior. `run` is the attribution/execution loop
+that used to live inside `wait`: it maps each event to the registry record
+it belongs to, applies `apply_gate_event`, and executes what comes back.
+Neither function makes an Orca or Linear call directly — the registry, the
+tracker and `retire` all arrive by injection, so a test drives this with a
+plain dict and a fake tracker instead of loading the CLI or monkeypatching
+`spawn`.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Callable
 
 from adapters import attention as _attention
 from adapters import plan_gate as _gate
 from adapters import reports as _reports
+from adapters.tracker_adapter import TrackerAdapter
 
 IDLE = _gate.IDLE
 
@@ -119,3 +125,76 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
         (action, divergence if action == _gate.FLAG_MALFORMED else None)
         for action in result.actions
     ]
+
+
+def run(
+    events,
+    raw_by_id: dict,
+    data: dict,
+    *,
+    tracker: Callable[[], TrackerAdapter],
+    retire: Callable[[str], None],
+    gate_role: str,
+) -> tuple[list[dict], list[dict]]:
+    """Attribute each event to the registry record it belongs to, apply
+    `apply_gate_event`, and execute the actions it returns — label the
+    ticket, retire the role, flag a divergence. Mutates `data` in place and
+    returns `(actions_taken, unattributed)`; it never reads or writes the
+    registry itself — the caller does both, under the same lock, so this
+    only ever touches the copy it was handed.
+
+    `tracker` is a zero-argument factory, not a tracker: a `wait` that
+    observes no gate action (the common case for every role but the
+    planner) must keep working without `LINEAR_API_KEY` set, so the tracker
+    is built at most once, and only if an action actually needs it. `retire`
+    takes the ticket alone — the caller closes over the role — and
+    `gate_role` is the role value this loop is scoped to: an event
+    attributed to any other role's dispatch is left alone.
+    """
+
+    by_dispatch = {rec["dispatch"]: key for key, rec in data.items()}
+    # Attribution falls back to the task id because a REFUSED lifecycle
+    # message is exactly the one whose `dispatchId` may be missing — that is
+    # what it was refused for. Measured: the refusal keeps the rest of the
+    # payload, `taskId` included, so it can still be traced to its role.
+    by_task = {rec["task"]: key for key, rec in data.items()}
+    actions_taken = []
+
+    _tracker: list = []
+
+    def resolved_tracker() -> TrackerAdapter:
+        if not _tracker:
+            _tracker.append(tracker())
+        return _tracker[0]
+
+    unattributed = []
+    for event in events:
+        dispatch_id = getattr(event, "dispatch_id", None)
+        key = by_dispatch.get(dispatch_id) or by_task.get(getattr(event, "task_id", None))
+        if key is None:
+            # Neither id maps to a spawn this package started: it completes
+            # nothing and would otherwise vanish. Reported, never swallowed.
+            unattributed.append({
+                "message": event.message_id, "kind": event.kind,
+                "dispatch": dispatch_id, "task": getattr(event, "task_id", None),
+            })
+            continue
+        if not key.endswith(f"/{gate_role}"):
+            continue  # the gate governs only the gate role's own dispatch
+        rec = data[key]
+        ticket = rec["ticket"]
+        for action, reason in apply_gate_event(rec, event, raw_by_id):
+            if action == _gate.LABEL_ON:
+                resolved_tracker().set_gate(ticket, True)
+            elif action == _gate.LABEL_OFF:
+                resolved_tracker().set_gate(ticket, False)
+            elif action == _gate.RETIRE_PLANNER:
+                retire(ticket)
+                # `retire` re-reads and rewrites the registry on its own;
+                # without this the caller's `state_write` would put this
+                # stale copy back and resurrect the retired role.
+                rec["retired"] = True
+            elif action == _gate.FLAG_MALFORMED:
+                _flag_malformed(resolved_tracker(), ticket, reason or "malformed gate report")
+            actions_taken.append({"ticket": ticket, "action": action})
+    return actions_taken, unattributed

@@ -1,10 +1,12 @@
 """Tests for the Orchestrator's side of the gate: `wait` and `verdict`.
 
-TLDR: `_apply_gate_event` is already covered in `test_brief.py`; what this
-file covers is the loop AROUND it — the registry write that follows the loop,
-how an event is attributed to a role, and the order in which `verdict`
-records and delivers a decision. Every case here is a defect found in review
-of the first version, so each one is a regression, not a hypothetical.
+TLDR: `workflow.gate_loop.apply_gate_event`/`.run` are covered in
+`test_brief.py` and `workflow/tests/test_gate_loop.py`; what this file
+covers is the shell around them — the lock that serializes `wait` and
+`verdict`, how an event is attributed to a role, and the order in which
+`verdict` records and delivers a decision. Every case here is a defect
+found in review of the first version, so each one is a regression, not a
+hypothetical.
 
 No network: `SPAWN.orca` and `SPAWN._linear.LinearTracker` are replaced.
 Run either way:
@@ -14,10 +16,12 @@ Run either way:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -35,11 +39,14 @@ class FakeTracker:
     def __init__(self, fail: bool = False):
         self.gate_calls, self.attention = [], []
         self.fail = fail
+        self.on_set_gate = None  # optional hook, fired after a real call is recorded
 
     def set_gate(self, ticket, on):
         if self.fail:
             raise RuntimeError("linear unreachable")
         self.gate_calls.append((ticket, on))
+        if self.on_set_gate is not None:
+            self.on_set_gate(ticket, on)
 
     def set_attention(self, ticket, attention):
         self.attention.append((ticket, attention))
@@ -219,6 +226,93 @@ class TestRegistryLocation(GateLoopCase):
         self.assertEqual(self.spawn.STATE.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.spawn.STATE.parent.stat().st_mode & 0o777, 0o700)
         self.assertFalse(list(self.spawn.STATE.parent.glob("*.tmp")), "no temp file left behind")
+
+
+class TestStateLockClosesTheRace(GateLoopCase):
+    """Acceptance criterion: `wait`/`verdict` concurrent must not lose an
+    update. Two tests — the primitive directly, and the scenario from the
+    issue body reproduced with a real thread."""
+
+    def test_the_lock_primitive_blocks_a_concurrent_writer_then_lets_it_through(self):
+        """Holding the lock via a SEPARATE fd simulates another process:
+        flock conflicts across opens even within the same process (see
+        `state_lock`'s docstring), so this is the deterministic version of
+        the race — no timing dependent on `wait`'s own internals."""
+
+        self.set_state(gate_state=self.spawn._gate.SUBMITTED, question_id="q-1")
+
+        fd = os.open(self.spawn.STATE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            result = {}
+
+            def call_verdict():
+                result["out"] = self.spawn.verdict("GRE-1", "approved", "")
+
+            thread = threading.Thread(target=call_verdict)
+            thread.start()
+            thread.join(timeout=0.3)
+            self.assertTrue(thread.is_alive(), "verdict must block while another opener holds the lock")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "verdict must complete once the lock is released")
+        self.assertEqual(result["out"]["decision"], "APPROVED")
+
+    def test_a_verdict_fired_mid_wait_is_not_reverted(self):
+        """The regression this issue exists to close: `wait` reads a
+        snapshot, a human's `verdict` lands on a DIFFERENT ticket while
+        `wait` is still mid-flight, and `wait`'s own `state_write` — of the
+        stale snapshot it read before the verdict — must not put GRE-1 back
+        the way it found it.
+
+        The verdict is fired from inside `FakeTracker.set_gate`, which
+        `run()` calls from inside `wait`'s own critical section — as close
+        to the real race as a single-process test gets. `on_set_gate` is
+        cleared to a no-op before the verdict actually resolves the ticket
+        gate label, so `verdict`'s own (cosmetic) `set_gate` call does not
+        recurse into a second verdict."""
+
+        self.set_state(gate_state=self.spawn._gate.SUBMITTED, question_id="q-1")
+        data = self.spawn.state_read()
+        data["GRE-2/planner"] = {
+            "ticket": "GRE-2", "role": "planner", "worktree": "/tmp/gre-2",
+            "terminal": "term_2", "task": "task_2", "dispatch": "ctx_2",
+            "capability": "dcap_2", "gate_state": self.spawn.IDLE, "approval_rounds": 0,
+        }
+        self.spawn.state_write(data)
+
+        submission = "## Plan\nGRE-2 — pointer\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+        self.batch = {"deliveryId": "d1", "messages": [self.message(
+            id="q-2", type="question", body=submission,
+            payload={"taskId": "task_2", "dispatchId": "ctx_2"},
+        )]}
+
+        box = {}
+
+        def fire_verdict_once(ticket, on):
+            if box.get("fired"):
+                return
+            box["fired"] = True
+            self.tracker.on_set_gate = None  # do not recurse on the verdict's own cosmetic clear
+            box["thread"] = threading.Thread(
+                target=lambda: box.__setitem__("out", self.spawn.verdict("GRE-1", "approved", ""))
+            )
+            box["thread"].start()
+
+        self.tracker.on_set_gate = fire_verdict_once
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        thread = box.get("thread")
+        self.assertIsNotNone(thread, "the GRE-2 submission must have lit the label and fired the hook")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "the concurrent verdict must complete, not hang")
+
+        rec = self.spawn.state_read()["GRE-1/planner"]
+        self.assertEqual(rec["gate_state"], self.spawn._gate.VERDICT_APPROVED, "wait must not revert the verdict")
+        self.assertNotIn("question_id", rec)
 
 
 if __name__ == "__main__":
