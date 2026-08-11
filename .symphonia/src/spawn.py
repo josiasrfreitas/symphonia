@@ -46,51 +46,20 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import importlib.machinery
-import importlib.util
-import types
+from adapters import attention as _attention
+from adapters import plan_gate as _gate
+from adapters import reports as _reports
+from adapters import runtime_adapter as _contract
+from adapters.linear import adapter as _linear
+from adapters.linear import client as _linear_client
+from adapters.orca import events as _events
+from adapters.orca import launcher as _launcher
+import setup_worktree as _setup_worktree
 
-PACKAGE = Path(__file__).resolve().parent.parent
-
-
-def _load(name: str, path: Path) -> types.ModuleType:
-    """The package lives in a dot-directory, which no import statement can
-    name, so its modules are loaded by file location instead.
-
-    The loader is passed explicitly because one of them (`bin/setup-worktree`)
-    has no `.py` suffix, and `spec_from_file_location` returns None for a
-    suffix it does not recognize."""
-
-    spec = importlib.util.spec_from_file_location(
-        name, path, loader=importlib.machinery.SourceFileLoader(name, str(path)),
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# `launcher` does `from ..runtime_adapter import ...`; a stand-in parent
-# package makes that relative import resolve to the file loaded here.
-_parent = types.ModuleType("symphonia_pkg")
-_parent.__path__ = [str(PACKAGE / "adapters")]
-sys.modules["symphonia_pkg"] = _parent
-_contract = _load("symphonia_pkg.runtime_adapter", PACKAGE / "adapters" / "runtime_adapter.py")
-_attention = _load("symphonia_pkg.attention", PACKAGE / "adapters" / "attention.py")
-_reports = _load("symphonia_pkg.reports", PACKAGE / "adapters" / "reports.py")
-_gate = _load("symphonia_pkg.plan_gate", PACKAGE / "adapters" / "plan_gate.py")
-_orca_pkg = types.ModuleType("symphonia_pkg.orca")
-_orca_pkg.__path__ = [str(PACKAGE / "adapters" / "orca")]
-sys.modules["symphonia_pkg.orca"] = _orca_pkg
-_launcher = _load("symphonia_pkg.orca.launcher", PACKAGE / "adapters" / "orca" / "launcher.py")
-_events = _load("symphonia_pkg.orca.events", PACKAGE / "adapters" / "orca" / "events.py")
-_linear_pkg = types.ModuleType("symphonia_pkg.linear")
-_linear_pkg.__path__ = [str(PACKAGE / "adapters" / "linear")]
-sys.modules["symphonia_pkg.linear"] = _linear_pkg
-_linear = _load("symphonia_pkg.linear.adapter", PACKAGE / "adapters" / "linear" / "adapter.py")
-# A sibling script, loaded the same way for the same reason: no import
-# statement can name a file with no `.py` suffix in a dot-directory.
-_setup_worktree = _load("symphonia_pkg.setup_worktree", PACKAGE / "bin" / "setup-worktree")
+# `.symphonia/`, the package root: two levels up from this file
+# (`src/spawn.py`), one for `src/` and one for the package. Everything below
+# that reads a Resource by path — `roles/`, `config.json` — anchors on this.
+PACKAGE = Path(__file__).resolve().parents[1]
 
 RoleName = _contract.RoleName
 Access = _contract.Access
@@ -118,7 +87,6 @@ asking a second time."""
 # checkouts never race for this file.
 RUNTIME_DIR = Path(os.environ.get("SYMPHONIA_RUNTIME", "~/.symphonia/runtime")).expanduser()
 STATE = RUNTIME_DIR / "spawns.json"
-LEGACY_STATE = PACKAGE / ".runtime" / "spawns.json"
 # The baton between roles is the installed handoff skill's document, in the
 # location that skill owns — not a format this package invents.
 #
@@ -190,21 +158,11 @@ def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
 
 
 def state_read() -> dict:
-    """The live registry: the shared runtime, with any per-checkout
-    `.runtime/` left by a pre-GRE-178 install merged UNDER it.
+    """The live registry, from the shared runtime file."""
 
-    Merged rather than used as a fallback: each checkout got its own legacy
-    file, so "read the legacy one only when the shared one is missing" loses
-    every other checkout's records the moment any verb writes. The shared
-    file always wins on a key collision — it is the one both sides update.
-    """
-
-    merged = {}
-    if LEGACY_STATE.exists():
-        merged.update(json.loads(LEGACY_STATE.read_text()))
     if STATE.exists():
-        merged.update(json.loads(STATE.read_text()))
-    return merged
+        return json.loads(STATE.read_text())
+    return {}
 
 
 def state_write(data: dict) -> None:

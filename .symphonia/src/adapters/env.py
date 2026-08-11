@@ -25,8 +25,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PACKAGE = Path(__file__).resolve().parent.parent
-REPO = PACKAGE.parent
+REPO = Path(__file__).resolve().parents[3]
 
 SHARED_ENV = Path("~/.symphonia/.env").expanduser()
 

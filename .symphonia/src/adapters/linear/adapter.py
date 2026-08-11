@@ -2,8 +2,8 @@
 
 TLDR: ``LinearTracker`` implements the ``TrackerAdapter`` protocol from
 ``..tracker_adapter`` against Linear's GraphQL API. The provider-specific
-identifiers (team, statuses, labels) live in ``config.json`` next to this
-file — nothing here is hardcoded to a status name.
+identifiers (team, statuses, labels) live under the ``"linear"`` key of
+``.symphonia/config.json`` — nothing here is hardcoded to a status name.
 
 The two hostile facts of the provider, and what this file does about them:
 
@@ -100,8 +100,8 @@ class LinearTracker:
     def __init__(self, client: LinearClient | None = None, config: dict | None = None):
         self._c = client or LinearClient()
         self._cfg = config or json.loads(
-            (Path(__file__).parent / "config.json").read_text()
-        )
+            (Path(__file__).resolve().parents[3] / "config.json").read_text()
+        )["linear"]
         self._phase_status = {
             DeliveryPhase(phase): status
             for phase, status in self._cfg["phase_status"].items()
