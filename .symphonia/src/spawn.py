@@ -432,7 +432,10 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
 
     # `--tier` is a human override, not a knob for the Orchestrator: the
     # matrix is the default precisely so no agent has to choose a model.
+    # Read together, same adjacency as the GRE-179 matrix comment
+    # (`launcher.py:161-162`) — one reader of the two tables, not two.
     resolved_tier = _launcher.ROLE_TIERS[role]
+    resolved_access = _launcher.ROLE_ACCESS[role]
     if tier:
         try:
             resolved_tier = _contract.CapabilityTier(tier)
@@ -447,7 +450,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         launch = adapter.launch_role(
             workspace,
             _contract.RoleSpec(
-                role=role, tier=resolved_tier, access=_launcher.ROLE_ACCESS[role], briefing="",
+                role=role, tier=resolved_tier, access=resolved_access, briefing="",
             ),
         )
     except (RuntimeError, _cli.OrcaCliError) as exc:
