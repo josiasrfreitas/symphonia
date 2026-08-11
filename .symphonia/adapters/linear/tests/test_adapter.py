@@ -153,7 +153,8 @@ class FakeClient:
         if "commentCreate" in gql:
             inp = v["input"]
             c = {"id": f"c-{len(db.comments) + 1}", "body": inp["body"],
-                 "user": {"id": "me"}, "issue": inp["issueId"]}
+                 "createdAt": f"2026-08-{len(db.comments) + 1:02d}T00:00:00.000Z",
+                 "user": {"id": "me", "name": "Me"}, "issue": inp["issueId"]}
             db.comments.append(c)
             return {"commentCreate": {"comment": c}}
         if "attachmentCreate" in gql:
@@ -297,6 +298,13 @@ class TestDeliveryState(AdapterTest):
         self.tracker.set_attention(impl, Attention(needs=False))
         self.assertEqual(self.tracker.get_item(impl).delivery.attention, Attention(needs=False))
 
+    def test_gate_label_round_trips(self):
+        impl = self.db.new_issue("Impl", "", "Implementing")
+        self.tracker.set_gate(impl, True)
+        self.assertIn("human-gate", self.db.issues[impl]["labels"])
+        self.tracker.set_gate(impl, False)
+        self.assertNotIn("human-gate", self.db.issues[impl]["labels"])
+
 
 class TestStructure(AdapterTest):
     def setUp(self):
@@ -360,6 +368,14 @@ class TestCommunication(AdapterTest):
         self.tracker.post_comment(self.impl, "two")
         self.assertEqual([c.body for c in self.tracker.list_comments(self.impl)], ["one", "two"])
 
+    def test_comments_carry_author_name_and_created_at(self):
+        posted = self.tracker.post_comment(self.impl, "one")
+        self.assertEqual(posted.author_name, "Me")
+        self.assertTrue(posted.created_at)
+        listed = self.tracker.list_comments(self.impl)[0]
+        self.assertEqual(listed.author_name, "Me")
+        self.assertEqual(listed.created_at, posted.created_at)
+
     def test_render_ref_suppresses_phantom_relations(self):
         ref = ItemRef(id="u", key="SYM-9", url="https://linear.app/x/issue/SYM-9/t")
         self.assertRegex(
@@ -385,6 +401,22 @@ class TestCommunication(AdapterTest):
             self.tracker.read_artifact(art)
 
 
+
+
+class TestProtocolConformance(unittest.TestCase):
+    """A cheap guard against contract drift: every member the ``TrackerAdapter``
+    Protocol declares must exist on ``LinearTracker``, so a promoted method
+    that is only added to one of the two never passes in silence."""
+
+    def test_every_protocol_member_exists_on_linear_tracker(self):
+        from adapters import tracker_adapter
+
+        missing = [
+            name
+            for name in vars(tracker_adapter.TrackerAdapter)
+            if not name.startswith("_") and not hasattr(LinearTracker, name)
+        ]
+        self.assertEqual(missing, [])
 
 
 class TestApiKeyComesFromTheEnvironmentOrAFile(unittest.TestCase):

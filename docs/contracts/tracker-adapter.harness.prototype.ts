@@ -133,6 +133,7 @@ class FakeProvider {
 // ---------------------------------------------------------------------------
 
 const ATTENTION_LABEL = "needs-attention";
+const GATE_LABEL = "human-gate";
 
 /** The phases that exist as their own status on the provider. One to one, by design. */
 const PHASE_STATUSES = [
@@ -320,15 +321,27 @@ class FakeTrackerAdapter implements TrackerAdapter {
     this.db.update(id, { delivery: { ...this.db.get(id).delivery, ...delivery } });
   }
 
+  async setGate(id: string, waiting: boolean): Promise<void> {
+    const row = this.db.get(id);
+    const labels = row.labels.filter((l) => l !== GATE_LABEL);
+    this.db.update(id, { labels: waiting ? [...labels, GATE_LABEL] : labels });
+  }
+
   async postComment(id: string, body: string): Promise<Comment> {
     seq += 1;
-    const comment: Comment = { id: `c-${seq}`, author: "session", createdAt: now(), body };
+    const comment: Comment = {
+      id: `c-${seq}`, author: "session", authorName: "session", createdAt: now(), body,
+    };
     this.db.update(id, { comments: [...this.db.get(id).comments, comment] });
     return comment;
   }
 
   async postResolution(id: string, resolution: { tldr: string; body: string }): Promise<Comment> {
     return this.postComment(id, `## TLDR\n\n${resolution.tldr}\n\n${resolution.body}`);
+  }
+
+  async recordGate(ticket: string, gate: string, decision: string, evidence: string): Promise<Comment> {
+    return this.postComment(ticket, `**TLDR: ${gate} — ${decision}.**\n\n## Evidence\n\n${evidence}`);
   }
 
   async attachArtifact(id: string, artifact: Artifact): Promise<void> {

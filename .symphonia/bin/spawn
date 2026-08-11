@@ -87,7 +87,6 @@ _events = _load("symphonia_pkg.orca.events", PACKAGE / "adapters" / "orca" / "ev
 _linear_pkg = types.ModuleType("symphonia_pkg.linear")
 _linear_pkg.__path__ = [str(PACKAGE / "adapters" / "linear")]
 sys.modules["symphonia_pkg.linear"] = _linear_pkg
-_linear_client = _load("symphonia_pkg.linear.client", PACKAGE / "adapters" / "linear" / "client.py")
 _linear = _load("symphonia_pkg.linear.adapter", PACKAGE / "adapters" / "linear" / "adapter.py")
 # A sibling script, loaded the same way for the same reason: no import
 # statement can name a file with no `.py` suffix in a dot-directory.
@@ -376,46 +375,24 @@ def _handoff_files(ticket: str) -> list[Path]:
     return sorted(Path(os.path.expanduser(HANDOFF_DIR)).glob(f"{ticket.lower()}-*.md"))
 
 
-def _comments_with_dates(client, issue_id: str) -> list[tuple[str, str, str]]:
-    """(author, date, body) for every comment. Queried directly rather than
-    through ``LinearTracker.list_comments`` because the Tracker Adapter's
-    ``Comment`` type carries an author id and a body but no date — widening
-    that provider-neutral contract for one caller's extra field is not worth
-    it, so the Brief asks the same GraphQL client for the field it needs."""
-
-    data = client.query(
-        """query($id: String!) { issue(id: $id) {
-          comments(first: 100) { nodes { body createdAt user { name } } } } }""",
-        {"id": issue_id},
-    )
-    return [
-        (
-            (c.get("user") or {}).get("name") or "unknown",
-            str(c.get("createdAt", ""))[:10],
-            c.get("body", ""),
-        )
-        for c in data["issue"]["comments"]["nodes"]
-    ]
-
-
-def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None, client=None) -> str:
+def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) -> str:
     """Assembles the Execution Brief injected at dispatch: extracts the
     ``io:brief-template`` block from the role's own file and fills it from
     the ticket. The role opens with the ticket already in hand — zero tool
     call needed to fetch it (`orca linear` may be disconnected; this reads
-    the tracker adapter's GraphQL client directly, same as GRE-174)."""
+    the tracker adapter directly, same as GRE-174)."""
 
     ticket = ticket.upper()
     role_path = PACKAGE / "roles" / ROLE_FILES[role]
     template = _reports.extract_block(role_path.read_text(), "md io:brief-template")
 
     tracker = tracker or _linear.LinearTracker()
-    client = client if client is not None else (getattr(tracker, "_c", None) or _linear_client.LinearClient())
 
     item = tracker.get_item(ticket)
-    comments = _comments_with_dates(client, item.ref.id)
+    comments = tracker.list_comments(item.ref.id)
     comment_text = "\n\n".join(
-        f"**{author} · {date}**\n\n{body}" for author, date, body in comments
+        f"**{c.author_name or 'unknown'} · {c.created_at[:10]}**\n\n{c.body}"
+        for c in comments
     ) or "None."
 
     handoff_files = _handoff_files(ticket)
