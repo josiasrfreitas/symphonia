@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-PACKAGE = Path(__file__).resolve().parents[2]
+PACKAGE = Path(__file__).resolve().parents[2]  # .symphonia/src, the sys.path root since the move
 sys.path.insert(0, str(PACKAGE))
 
 from adapters.tracker_adapter import Comment, Item, ItemKind, ItemRef, Openness

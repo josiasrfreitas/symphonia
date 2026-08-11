@@ -15,7 +15,7 @@ import sys
 
 def used_fraction(transcript_path: str, window_size: int) -> float:
     """Return the fraction of the context window already used."""
-    raise NotImplementedError("skeleton — see .symphonia/guardrails/README.md")
+    raise NotImplementedError("skeleton — see .symphonia/src/guardrails/README.md")
 
 
 if __name__ == "__main__":

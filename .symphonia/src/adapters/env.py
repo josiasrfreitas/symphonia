@@ -8,7 +8,7 @@ Where it looks, in order:
 
 1. ``SYMPHONIA_ENV``, if set — an explicit path always wins.
 2. ``~/.symphonia/.env`` — the shared one, and the only one that reaches
-   every role. This mirrors the registry decision in ``bin/spawn``: a role
+   every role. This mirrors the registry decision in ``src/spawn.py``: a role
    runs inside the ticket's worktree, which is a DIFFERENT checkout of this
    repository, so a file living in the Orchestrator's checkout is invisible
    to it.

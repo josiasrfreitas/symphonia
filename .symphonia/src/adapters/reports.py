@@ -1,5 +1,5 @@
 """Neutral parser for role I/O, and the block-extraction helper the package
-shares with ``bin/spawn``.
+shares with ``src/spawn.py``.
 
 TLDR: ``extract_block`` pulls one tagged fenced code block out of a role
 file's markdown — the same helper fills the Execution Brief template in

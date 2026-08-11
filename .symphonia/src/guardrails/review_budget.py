@@ -12,7 +12,7 @@ import sys
 
 def measure(diff_stat: str) -> int:
     """Return total changed lines from `git diff --stat` output."""
-    raise NotImplementedError("skeleton — see .symphonia/guardrails/README.md")
+    raise NotImplementedError("skeleton — see .symphonia/src/guardrails/README.md")
 
 
 if __name__ == "__main__":

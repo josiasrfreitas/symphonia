@@ -32,7 +32,7 @@ The payload × body rule governs every shape below — see
 
 What `.symphonia/bin/spawn plan` extracts, fills from the ticket, and
 injects at launch — you open with this already in hand, zero tool call
-needed to fetch it. `build_brief()` in `bin/spawn` does the filling; the
+needed to fetch it. `build_brief()` in `src/spawn.py` does the filling; the
 skeleton lives here because the Brief is the planner's input contract, and a
 role's contract lives in the role's own file.
 

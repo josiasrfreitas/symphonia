@@ -6,13 +6,13 @@
 
 Every folder here is 100% one of three things:
 
-- **Source** — what is written, reviewed, and imported or executed. Lives under `src/`: the Python package (`adapters/`, `guardrails/`, `dag/`, `reconcile/`) and the two scripts (`spawn.py`, `setup_worktree.py`) behind the thin `bin/` entrypoints.
+- **Source** — what is written, reviewed, and imported or executed. Lives under `src/`: the Python package (`adapters/`, `guardrails/`, `dag/`, `reconcile/`) and the two scripts (`spawn.py`, `setup_worktree.py`) behind the thin `bin/` entrypoints. `bin/` itself is Source too — the two thin executable entrypoints, kept outside `src/` as the stable CLI surface (per ADR-0001), with their body living in `src/`.
 - **Resource** — content Source reads but never executes: `roles/`, `skills/`, `config.json`, `DEPENDENCIES.md`. Siblings of `src/`, not inside it.
 - **Artifact** — what a run produces: the spawn registry, handoff documents, transcripts, an instantiated DAG. Never committed, and lives outside every checkout (`~/.symphonia/runtime/`, `~/orca/.context`).
 
 READMEs are the one exception: documentation of the folder they sit in, not content of any of the three categories.
 
-`src/` lives inside `.symphonia/`, not at the repo root — see `docs/adr/0001-package-lives-in-the-dot-directory.md` for why, and what that costs (one explicit `sys.path` bootstrap, documented and used nowhere else).
+`src/` lives inside `.symphonia/`, not at the repo root — see `docs/adr/0001-package-lives-in-the-dot-directory.md` for why, and what that costs: one production `sys.path` bootstrap, shared by the two `bin/` entrypoints; the test files repeat the same one-line insertion to import from that same root.
 
 ## Layout
 

@@ -14,12 +14,12 @@ import sys
 
 def collision(scopes: dict[str, list[str]]) -> list[tuple[str, str, str]]:
     """Return (ticket_a, ticket_b, shared_path) for every collision."""
-    raise NotImplementedError("skeleton — see .symphonia/guardrails/README.md")
+    raise NotImplementedError("skeleton — see .symphonia/src/guardrails/README.md")
 
 
 def audit(declared: list[str], changed: list[str]) -> list[str]:
     """Return every changed path not covered by the declared Write Scope."""
-    raise NotImplementedError("skeleton — see .symphonia/guardrails/README.md")
+    raise NotImplementedError("skeleton — see .symphonia/src/guardrails/README.md")
 
 
 if __name__ == "__main__":
