@@ -93,6 +93,8 @@ class Comment:
     id: str
     body: str
     author: ActorId
+    author_name: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -168,10 +170,18 @@ class TrackerAdapter(Protocol):
     def set_phase(self, id: str, phase: DeliveryPhase) -> None: ...
     def set_attention(self, id: str, attention: Attention) -> None: ...
     def set_delivery(self, id: str, **delivery: object) -> None: ...
+    def set_gate(self, id: str, waiting: bool) -> None:
+        """Put or lift the sign that a Human Gate is waiting. Human Gate is a
+        workflow concept, not a Linear one — every provider must expose it."""
+        ...
 
     # Communication
     def post_comment(self, id: str, body: str) -> Comment: ...
     def post_resolution(self, id: str, *, tldr: str, body: str) -> Comment: ...
+    def record_gate(self, ticket: str, gate: str, decision: str, evidence: str) -> Comment:
+        """The tracker half of automatic gate recording: one templated
+        comment on the ticket, TLDR first."""
+        ...
     def attach_artifact(self, id: str, artifact: Artifact) -> None: ...
 
     # Rendering

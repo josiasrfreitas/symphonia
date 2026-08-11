@@ -210,6 +210,7 @@ export type CloseOutcome = "resolved" | "out-of-scope" | "abandoned";
 export type Comment = {
   id: string;
   author: ActorId;
+  authorName: string;
   createdAt: string;
   body: string;
 };
@@ -276,6 +277,10 @@ export interface TrackerAdapter {
   setAttention(id: string, attention: Attention): Promise<void>;
   setDelivery(id: string, delivery: Partial<Delivery>): Promise<void>;
 
+  /** Put or lift the sign that a Human Gate is waiting. Human Gate is a workflow
+   * concept, not a provider one — every adapter must expose it. */
+  setGate(id: string, waiting: boolean): Promise<void>;
+
   postComment(id: string, body: string): Promise<Comment>;
 
   /**
@@ -285,6 +290,15 @@ export interface TrackerAdapter {
    * possible enforcement: a resolution without one cannot be expressed.
    */
   postResolution(id: string, resolution: { tldr: string; body: string }): Promise<Comment>;
+
+  /** The tracker half of automatic gate recording: one templated comment on the
+   * ticket, TLDR first. */
+  recordGate(
+    ticket: string,
+    gate: string,
+    decision: string,
+    evidence: string,
+  ): Promise<Comment>;
 
   attachArtifact(id: string, artifact: Artifact): Promise<void>;
 

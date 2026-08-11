@@ -325,11 +325,18 @@ class LinearTracker:
         node = self._issue(id)
         data = self._c.query(
             """query($id: String!) { issue(id: $id) {
-              comments(first: 100) { pageInfo { hasNextPage } nodes { id body user { id } } } } }""",
+              comments(first: 100) { pageInfo { hasNextPage }
+                nodes { id body createdAt user { id name } } } } }""",
             {"id": node["id"]},
         )
         return [
-            Comment(id=c["id"], body=c["body"], author=(c["user"] or {}).get("id", ""))
+            Comment(
+                id=c["id"],
+                body=c["body"],
+                author=(c["user"] or {}).get("id", ""),
+                author_name=(c["user"] or {}).get("name", ""),
+                created_at=c["createdAt"],
+            )
             for c in self._one_page(data["issue"]["comments"], "comments")
         ]
 
@@ -532,7 +539,8 @@ class LinearTracker:
         node = self._issue(id)
         data = self._c.query(
             """mutation($input: CommentCreateInput!) {
-              commentCreate(input: $input) { comment { id body user { id } } } }""",
+              commentCreate(input: $input) {
+                comment { id body createdAt user { id name } } } }""",
             {"input": {"issueId": node["id"], "body": body}},
         )
         comment = data["commentCreate"]["comment"]
@@ -540,6 +548,8 @@ class LinearTracker:
             id=comment["id"],
             body=comment["body"],
             author=(comment["user"] or {}).get("id", ""),
+            author_name=(comment["user"] or {}).get("name", ""),
+            created_at=comment["createdAt"],
         )
 
     def post_resolution(self, id: str, *, tldr: str, body: str) -> Comment:
