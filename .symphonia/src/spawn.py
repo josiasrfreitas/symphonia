@@ -554,6 +554,21 @@ def retire(ticket: str, role_value: str) -> dict:
     if rec is None:
         raise SystemExit(f"no spawn recorded for {key}")
 
+    # A role can name its own terminal here — `retire GRE-188 planner` run
+    # from inside the planner's own pane. Nothing below guards against it:
+    # `stop_worker` and `close_terminal` would kill the process running this
+    # very function, so the caller loses its terminal mid-command and never
+    # sees the task get settled, or any error explaining what happened.
+    # Refuse instead. Retiring is the Orchestrator's verb, and it runs from
+    # a terminal that is nobody's role.
+    own_terminal = os.environ.get("ORCA_TERMINAL_HANDLE", "")
+    if own_terminal and own_terminal == rec.get("terminal"):
+        raise SystemExit(
+            f"{key} is the role running this command; retiring it would close "
+            f"this terminal mid-command and lose whatever it has not reported "
+            f"yet. Report first and let the Orchestrator retire you."
+        )
+
     effects = []
     try:
         adapter.stop_worker(rec["dispatch"])
