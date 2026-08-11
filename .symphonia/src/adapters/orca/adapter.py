@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Sequence
 
 from ..attention import Attention, AttentionCode
@@ -203,7 +205,6 @@ class OrcaRuntimeAdapter:
     coordinator: str
     run_id: str
     runner: Runner = subprocess_runner
-    repo: str = ""
     bind_control: bool = True
     """Whether `_ensure_control` actually runs `run-current`/`run-use`
     before each call. Defaults True — the coordinator loop and the
@@ -260,14 +261,84 @@ class OrcaRuntimeAdapter:
 
     # --- workspaces ---
 
-    def create_workspace(self, ticket_key: TicketKey, *, branch: str) -> WorkspaceRef:
+    def default_base(self) -> str:
+        """The repo's default base, read from git rather than assumed
+        (GRE-184 M2, retroported from ``spawn.default_base`` unedited). A
+        git call, not an orca one — it never goes through ``self.runner``,
+        which is scoped to `orca` argv (see ``Runner``'s docstring); like
+        ``spawn.py``'s own git calls, it stays a plain subprocess."""
+
+        proc = subprocess.run(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True,
+        )
+        base = proc.stdout.strip()
+        if not base:
+            raise RuntimeError(
+                "cannot resolve origin/HEAD; run `git remote set-head origin -a` "
+                "so the ticket branch has a known base"
+            )
+        return base
+
+    def _close_orphan_shell(self, workspace_id: str) -> None:
+        """A bare ``worktree create`` leaves one untitled fallback shell
+        (measured on GRE-179, retroported here unedited from
+        ``spawn.create_worktree``). Best-effort: cosmetic, and the shell's
+        tab can already be gone by the time this asks — a tidy sidebar is
+        never worth failing a workspace that otherwise came up fine."""
+
+        listed = self._orca("terminal", "list", "--worktree", f"id:{workspace_id}")
+        for term in listed.get("terminals", []):
+            if term.get("title") or term.get("command"):
+                continue
+            try:
+                self._orca("terminal", "close", "--terminal", str(term.get("handle")), "--tab")
+            except OrcaCliError as exc:
+                print(f"note: leftover shell not closed ({exc})", file=sys.stderr)
+
+    def create_workspace(self, ticket_key: TicketKey, *, base_branch: str) -> WorkspaceRef:
+        """One checkout per Ticket Key: child of the coordinator in Orca
+        lineage, off ``base_branch`` in git — the argv measured from
+        ``spawn.create_worktree`` (GRE-184 M2). Worktree setup
+        (``setup_worktree.setup``) is a separate subprocess boundary and
+        stays the caller's job, same as it always has."""
+
         self._ensure_control()
-        argv = ["worktree", "create", "--name", branch, "--comment", ticket_key]
-        if self.repo:
-            argv += ["--repo", self.repo]
-        created = self._orca(*argv)
-        path = _required(str(created.get("path", created.get("worktreePath", ""))), "worktree path")
-        return WorkspaceRef(ticket_key=ticket_key, path=path, branch=branch)
+        name = ticket_key.strip().lower()
+        created = self._orca(
+            "worktree", "create",
+            "--name", name,
+            "--parent-worktree", "active",
+            "--base-branch", base_branch,
+            "--setup", "run",
+            "--linear-issue", ticket_key,
+            "--comment", f"symphonia ticket {ticket_key}",
+        )
+        wt = created.get("worktree", created)
+        wt_id = _required(str(wt.get("id", "")), "worktree id")
+        path = _required(str(wt.get("path", "")), "worktree path")
+        branch = str(wt.get("branch") or name)
+        self._close_orphan_shell(wt_id)
+        return WorkspaceRef(ticket_key=ticket_key, id=wt_id, path=path, branch=branch)
+
+    def find_workspace(self, ticket_key: TicketKey) -> WorkspaceRef | None:
+        """(id, path, branch) of this ticket's worktree, or None —
+        retroported from ``spawn.find_worktree``. Matched on the path, not
+        the display name: composed verbs rewrite the display name with the
+        current phase, so a ``name:`` lookup would stop finding the ticket
+        the moment a phase change lands."""
+
+        self._ensure_control()
+        name = ticket_key.strip().lower()
+        listed = self._orca("worktree", "list")
+        items = listed.get("worktrees", listed.get("items", []))
+        for wt in items:
+            path = str(wt.get("path", ""))
+            if Path(path).name == name:
+                wt_id = str(wt.get("id", ""))
+                branch = str(wt.get("branch") or name)
+                return WorkspaceRef(ticket_key=ticket_key, id=wt_id, path=path, branch=branch)
+        return None
 
     def destroy_workspace(self, workspace: WorkspaceRef) -> None:
         self._ensure_control()

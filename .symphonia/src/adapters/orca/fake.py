@@ -216,6 +216,7 @@ class FakeRuntimeAdapter:
         self._contexts: dict[str, _FakeContext] = {}
         self._attempts: dict[str, _FakeAttempt] = {}
         self._ws_ids: dict[str, str] = {}
+        self._ws_by_ticket: dict[TicketKey, WorkspaceRef] = {}
         self._pending_questions: set[str] = set()
         self._local_events: list[RuntimeEvent] = []
         self._delivered_locals: list[RuntimeEvent] = []
@@ -247,15 +248,22 @@ class FakeRuntimeAdapter:
 
     # --- workspaces ---
 
-    def create_workspace(self, ticket_key: TicketKey, *, branch: str) -> WorkspaceRef:
+    def create_workspace(self, ticket_key: TicketKey, *, base_branch: str) -> WorkspaceRef:
         self._ensure_control()
         ws_id = self.rt.create_workspace(ticket_key)
         self.rt.run_setup(ws_id)  # setup finishes before this call resolves
         for proc in self.rt.live_in(ws_id):  # and the stray shell is closed
             self.rt.kill_process(proc.id)
-        path = f"/workspaces/{ticket_key.lower()}"
+        name = ticket_key.lower()
+        path = f"/workspaces/{name}"
         self._ws_ids[path] = ws_id
-        return WorkspaceRef(ticket_key=ticket_key, path=path, branch=branch)
+        ref = WorkspaceRef(ticket_key=ticket_key, id=ws_id, path=path, branch=name)
+        self._ws_by_ticket[ticket_key] = ref
+        return ref
+
+    def find_workspace(self, ticket_key: TicketKey) -> WorkspaceRef | None:
+        self._ensure_control()
+        return self._ws_by_ticket.get(ticket_key)
 
     def destroy_workspace(self, workspace: WorkspaceRef) -> None:
         self._ensure_control()
@@ -266,6 +274,7 @@ class FakeRuntimeAdapter:
                 "An abandoned role may still be writing here."
             )
         self.rt.workspaces.pop(self._ws_ids[workspace.path], None)
+        self._ws_by_ticket.pop(workspace.ticket_key, None)
 
     # --- role contexts ---
 
@@ -448,9 +457,11 @@ class ScriptedOrcaCli:
 
         command = tuple(a for a in argv[1:] if not a.startswith("--"))[:2]
         handlers = {
-            ("worktree", "create"): lambda: self._worktree_create(flag("--name"), flag("--comment")),
+            ("worktree", "create"): lambda: self._worktree_create(flag("--name"), flag("--linear-issue")),
+            ("worktree", "list"): lambda: self._worktree_list(),
             ("worktree", "rm"): lambda: self._worktree_rm(flag("--worktree")),
             ("terminal", "create"): lambda: self._terminal_create(flag("--worktree"), flag("--title"), flag("--command")),
+            ("terminal", "list"): lambda: self._terminal_list(flag("--worktree")),
             ("terminal", "close"): lambda: self._terminal_close(flag("--terminal")),
             ("orchestration", "run-current"): lambda: {
                 "run": {"terminal": self.rt.control_holder} if self.rt.control_holder else None
@@ -478,13 +489,23 @@ class ScriptedOrcaCli:
         return RunResult(stdout=stdout, stderr="", returncode=0)
 
     def _worktree_create(self, name: str, ticket_key: str) -> dict:
+        # Faithful to the real CLI (GRE-184 M2): the stray fallback shell is
+        # left behind here, not pre-cleaned — the caller is the one that
+        # lists and closes it, same as `spawn.create_worktree` always did.
         ws_id = self.rt.create_workspace(ticket_key)
         self.rt.run_setup(ws_id)
-        for proc in self.rt.live_in(ws_id):  # orca returns a prepared worktree
-            self.rt.kill_process(proc.id)
         path = f"/workspaces/{name}"
         self._ws_by_path[path] = ws_id
-        return {"path": path}
+        return {"worktree": {"id": ws_id, "path": path, "branch": name}}
+
+    def _worktree_list(self) -> dict:
+        items = []
+        for path, ws_id in self._ws_by_path.items():
+            ws = self.rt.workspaces.get(ws_id)
+            if ws is None:
+                continue
+            items.append({"id": ws_id, "path": path})
+        return {"worktrees": items}
 
     def _worktree_rm(self, selector: str) -> dict:
         path = selector.removeprefix("path:")
@@ -499,6 +520,19 @@ class ScriptedOrcaCli:
         serving = self.rt.staging.get(role_name, requested)
         pid = self.rt.spawn(ws_id, command, title, requested=requested, serving=serving)
         return {"terminal": pid}
+
+    def _terminal_list(self, selector: str) -> dict:
+        ws_id = selector.removeprefix("id:")
+        terms = []
+        for proc in self.rt.live_in(ws_id):
+            if proc.display_name == "fallback shell":
+                # Blank title/command is what marks a bare fallback shell as
+                # orphaned in the real CLI's response, not this fake's
+                # internal command string.
+                terms.append({"handle": proc.id, "title": "", "command": ""})
+            else:
+                terms.append({"handle": proc.id, "title": proc.display_name, "command": proc.command})
+        return {"terminals": terms}
 
     def _terminal_close(self, terminal: str) -> dict:
         self.rt.kill_process(terminal)
