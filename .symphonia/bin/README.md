@@ -1,8 +1,8 @@
 # The spawn interface
 
-**TLDR: `spawn` is the only way a role starts, and `check --wait` is the only way you hear back. Between those two, the Orchestrator makes no choice about models, permissions, worktrees or launch paths — they are all decided in `adapters/orca/launcher.py`. If you are about to type a raw `orca terminal create` or `orca orchestration worker-start`, stop: that is the failure this interface exists to prevent.**
+**TLDR: `spawn` is the only way a role starts, `spawn wait` is the only way you hear back, and `spawn submit`/`spawn done` are the only way a role answers. Between those two, the Orchestrator makes no choice about models, permissions, worktrees or launch paths — they are all decided in `adapters/orca/launcher.py`. If you are about to type a raw `orca terminal create` or `orca orchestration worker-start`, stop: that is the failure this interface exists to prevent.**
 
-## The five commands
+## The Orchestrator's commands
 
 ```
 .symphonia/bin/spawn plan             <TICKET>   # starts the ticket: creates its worktree
@@ -18,6 +18,21 @@
 One argument, the Ticket Key. No flags. `--tier` exists but is a human
 override — never pass it yourself.
 
+## The role's own two commands
+
+Not yours. A ROLE runs these inside its own dispatched terminal — they are
+the return half of the same interface, so no role ever types
+`orca orchestration` by hand:
+
+```
+.symphonia/bin/spawn submit <TICKET> --file <body.md> [--max-wait-ms <ms>]
+.symphonia/bin/spawn done   <TICKET> --outcome succeeded|failed --file <body.md> [--files-modified a,b]
+```
+
+`submit` sends a plan for a verdict and blocks until it arrives, printing it
+parsed. `done` sends the single `worker_done` a dispatch allows — checking
+the body first, because there is no second one.
+
 `plan` refuses if the ticket already has a worktree; every other verb refuses
 if it does not. The order of the workflow is enforced by the commands, so you
 do not have to remember it.
@@ -25,7 +40,9 @@ do not have to remember it.
 ## What each spawn does for you
 
 Creates the ticket's worktree as a child of your own in Orca lineage, off the
-repo default base in git (never your current branch). Launches the role at its
+repo default base in git (never your current branch), and runs
+`.symphonia/bin/setup-worktree` on it — a fresh checkout has no `.env`,
+because a `git worktree add` never brings a gitignored file. Launches the role at its
 Capability Tier with permissions that never prompt. Labels the worktree, the
 terminal and the board column with the phase. Creates the Task, injects the
 dispatch, and records everything so `status` can report it.
@@ -64,6 +81,26 @@ Acknowledge and keep waiting in one call:
 
 ## Things that will bite you
 
+**`--payload` and the structured flags are mutually exclusive.** Measured on
+Orca 1.4.168: `orca orchestration send --type worker_done --task-id ...
+--dispatch-id ... --outcome ... --payload '{"x":1}'` is refused with
+`invalid_argument` and nothing is sent. The injected preamble teaches the
+structured form, so anything the gate needs beyond those three fields forces
+one single `--payload` carrying all of them. `spawn done` is where that shape
+lives; a role following the preamble literally reports nothing.
+
+**A refused `worker_done` still arrives as a `worker_done`.** Orca rewrites
+the subject and body and adds `_orcaLifecycleRejection: {code, reason}` to the
+payload — and answers `ok: true` in the envelope, with a non-zero exit code.
+`wait` flags it as Needs Attention; a hand-rolled reader would count it as a
+completion that completed nothing.
+
+**An injected dispatch mints a capability, printed only in the preamble.**
+Without `--dispatch-capability`, a lifecycle message is refused with
+`dispatch_capability_invalid` and the dispatch stays open forever. `spawn`
+captures the token at dispatch; the dispatch row's `capability_hash` is null
+and cannot be read back later.
+
 **Nothing pushes.** `worker_done` is mail into the Run mailbox. A finished
 worker changes nothing on your screen; the message sits there until you
 `check`. Delivery is FIFO and replays the same batch until you `--ack` it, so
@@ -95,6 +132,7 @@ ownership to anyone. Every transition goes through you.
 | `adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
 | `adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
 | `roles/*.md` | What each role does and never does, and (for the planner) the I/O shapes it reads and writes |
+| `bin/setup-worktree` | What a fresh checkout needs and git does not bring: the env files |
 | `config.json` | The calibration numbers |
 
 Adding a provider is a `PROVIDERS` entry in `launcher.py`. Changing a model is

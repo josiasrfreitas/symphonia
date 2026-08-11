@@ -161,11 +161,15 @@ def format_approval_reply(token: str, notes: tuple[str, ...] | list[str] = ()) -
 class PlannerReport:
     plan_pointer: str
     deviations: tuple[str, ...]
-    plan_approved: bool
-    approval_rounds: int
 
 
-def parse_planner_done(body: str, payload: dict) -> PlannerReport:
+def parse_planner_done(body: str) -> PlannerReport:
+    """The body only. ``planApproved`` and ``approvalRounds`` used to be read
+    from the payload and are now derived from the recorded gate state by
+    ``spawn done`` — a role asserting "the plan was approved" was a claim the
+    script already had the answer to, and the only thing that claim could add
+    was a disagreement."""
+
     sections = _sections(body)
     plan_pointer = _require_section(sections, "Plan", "planner worker_done")
     _require_section(sections, "Approval", "planner worker_done")
@@ -179,24 +183,30 @@ def parse_planner_done(body: str, payload: dict) -> PlannerReport:
             if line.strip().startswith("- ")
         )
     )
+    return PlannerReport(plan_pointer=plan_pointer.strip(), deviations=deviations)
 
-    if "planApproved" not in payload:
-        raise MalformedReport(
-            "planner worker_done: payload is missing required field 'planApproved'"
-        )
-    if "approvalRounds" not in payload:
-        raise MalformedReport(
-            "planner worker_done: payload is missing required field 'approvalRounds'"
-        )
-    plan_approved = bool(payload["planApproved"])
-    if not plan_approved:
-        raise MalformedReport(
-            "planner worker_done: payload['planApproved'] is not true; "
-            "this report may only be sent after APPROVED"
-        )
-    return PlannerReport(
-        plan_pointer=plan_pointer.strip(),
-        deviations=deviations,
-        plan_approved=plan_approved,
-        approval_rounds=int(payload["approvalRounds"]),
+
+def set_approval_rounds(body: str, approval_rounds: int) -> str:
+    """Rewrite only the ``## Approval`` section, in place, from the round
+    count the gate observed.
+
+    Only that section: the rest of the body is the role's, and a report may
+    carry sections this module never heard of (``## Risks``, ``## Handoff``).
+    Rebuilding the whole body from the parsed fields would drop them, and a
+    dispatch grants exactly one ``worker_done``, so nothing dropped here can
+    be sent again."""
+
+    rounds = f"{approval_rounds} rodada." if approval_rounds == 1 else f"{approval_rounds} rodadas."
+    lines = body.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "## Approval")
+    except StopIteration:
+        raise MalformedReport("planner worker_done: missing required section '## Approval'")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines)
     )
+    # Blank lines before the next heading are separators, not content.
+    tail = lines[end:]
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[: start + 1] + [rounds] + [""] * bool(tail) + tail)

@@ -4,3 +4,9 @@
 
 # Machine-local Claude Code settings
 .claude/settings.local.json
+
+# Secrets. The package reads .env from ~/.symphonia/.env first (shared with
+# every role, in any worktree); this one only covers the repo checkout.
+.env
+.env.*
+!.env.example

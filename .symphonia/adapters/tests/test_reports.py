@@ -23,6 +23,7 @@ from adapters.reports import (
     is_plan_submission,
     parse_approval_reply,
     parse_plan_submission,
+    set_approval_rounds,
     parse_planner_done,
 )
 
@@ -72,22 +73,43 @@ class TestApprovalReplyGolden(unittest.TestCase):
 
 class TestPlannerDoneGolden(unittest.TestCase):
     def test_parses_plan_pointer_and_deviations_from_the_body(self):
-        report = parse_planner_done(
-            _example("md io:example-done"),
-            {"planApproved": True, "approvalRounds": 1},
-        )
+        report = parse_planner_done(_example("md io:example-done"))
         self.assertIn("85dfe356-d077-436c-895c-ffc8f4bf1264", report.plan_pointer)
         self.assertEqual(report.deviations, ())
-        self.assertTrue(report.plan_approved)
-        self.assertEqual(report.approval_rounds, 1)
 
-    def test_approval_rounds_comes_from_payload_not_body(self):
-        """The rule from the README: a script-decided field is payload, and
-        the body is never the source of truth for it, even when it repeats
-        the number for a human to read."""
-        body = _example("md io:example-done").replace("1 round.", "1 round.")
-        report = parse_planner_done(body, {"planApproved": True, "approvalRounds": 4})
-        self.assertEqual(report.approval_rounds, 4)
+    def test_the_body_carries_no_approval_facts(self):
+        """`planApproved` and `approvalRounds` are decided by the gate and
+        written into the payload by `spawn done`; the parser must not offer
+        them, so nothing downstream can read a role's claim by mistake."""
+        report = parse_planner_done(_example("md io:example-done"))
+        self.assertFalse(hasattr(report, "plan_approved"))
+        self.assertFalse(hasattr(report, "approval_rounds"))
+
+    def test_the_round_count_is_rewritten_in_place(self):
+        written = set_approval_rounds(_example("md io:example-done"), 2)
+        self.assertIn("2 rodadas.", written)
+        report = parse_planner_done(written)
+        self.assertIn("85dfe356-d077-436c-895c-ffc8f4bf1264", report.plan_pointer)
+
+    def test_one_round_is_singular(self):
+        self.assertIn("1 rodada.", set_approval_rounds(_example("md io:example-done"), 1))
+
+    def test_sections_the_package_does_not_know_survive(self):
+        """A dispatch grants one worker_done, so anything dropped here can
+        never be sent again — only `## Approval` may be touched."""
+
+        body = (
+            "## Plan\nGRE-1 — p\n\n## Approval\n9 rodadas.\n\n"
+            "## Deviations\nNone.\n\n## Risks\n- o retry pode duplicar\n"
+        )
+        written = set_approval_rounds(body, 2)
+        self.assertIn("## Risks\n- o retry pode duplicar", written)
+        self.assertIn("2 rodadas.", written)
+        self.assertNotIn("9 rodadas.", written)
+
+    def test_a_body_without_the_section_is_refused(self):
+        with self.assertRaises(MalformedReport):
+            set_approval_rounds("## Plan\np\n\n## Deviations\nNone.\n", 1)
 
 
 class TestIsPlanSubmission(unittest.TestCase):
@@ -154,19 +176,13 @@ class TestMalformedPlannerDone(unittest.TestCase):
     def test_missing_section_names_it(self):
         body = "## Plan\npointer\n\n## Deviations\nNone.\n"
         with self.assertRaises(MalformedReport) as ctx:
-            parse_planner_done(body, {"planApproved": True, "approvalRounds": 1})
+            parse_planner_done(body)
         self.assertIn("Approval", str(ctx.exception))
 
-    def test_missing_payload_field_names_it(self):
-        body = _example("md io:example-done")
+    def test_empty_body_names_the_first_missing_section(self):
         with self.assertRaises(MalformedReport) as ctx:
-            parse_planner_done(body, {"approvalRounds": 1})
-        self.assertIn("planApproved", str(ctx.exception))
-
-    def test_payload_not_approved_raises(self):
-        body = _example("md io:example-done")
-        with self.assertRaises(MalformedReport):
-            parse_planner_done(body, {"planApproved": False, "approvalRounds": 1})
+            parse_planner_done("")
+        self.assertIn("Plan", str(ctx.exception))
 
 
 if __name__ == "__main__":
