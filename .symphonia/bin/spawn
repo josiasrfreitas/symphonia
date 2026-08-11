@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """The whole spawn interface the Orchestrator is allowed to use.
 
-TLDR: five verbs, one argument each — a Ticket Key. The Orchestrator never
-picks a model, a permission flag, a worktree or a launch path; every one of
-those is decided here. If a command below does not express what you need,
-that is a package change, not an improvisation at the terminal.
+TLDR: the four role verbs take one argument each — a Ticket Key — plus
+`status`, `retire`, and the plan gate pair `wait`/`verdict`. The Orchestrator
+never picks a model, a permission flag, a worktree or a launch path; every
+one of those is decided here. If a command below does not express what you
+need, that is a package change, not an improvisation at the terminal.
 
     .symphonia/bin/spawn plan             GRE-181
     .symphonia/bin/spawn implement        GRE-181
@@ -12,16 +13,26 @@ that is a package change, not an improvisation at the terminal.
     .symphonia/bin/spawn review-standards GRE-181
     .symphonia/bin/spawn status          [GRE-181]
     .symphonia/bin/spawn retire           GRE-181 planner
+    .symphonia/bin/spawn wait             [--ack <delivery_id>] [--timeout-ms <ms>]
+    .symphonia/bin/spawn verdict          GRE-181 approved|revise [--notes <text>|--notes-file <path>]
 
 `plan` derives a worktree from the repo's default base; every later role
 reuses that same worktree, so one Ticket Key means one checkout from plan to
 PR. Roles are Orca dispatches (attached), not child worktrees: they report
 `worker_done` to the Orchestrator's Run.
+
+`wait` is the one loop that hears back from every role — it also drives the
+plan gate: it turns mailbox messages into typed events (`adapters/orca/events.py`),
+runs each through `adapters/plan_gate.py`, and executes what comes back
+(label the ticket, retire the planner, flag a divergence). `verdict` is how
+the human's decision reaches the planner: it never comes from an agent
+typing `APPROVED`/`REVISE` into a reply by hand.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import uuid
@@ -50,13 +61,25 @@ _parent = types.ModuleType("symphonia_pkg")
 _parent.__path__ = [str(PACKAGE / "adapters")]
 sys.modules["symphonia_pkg"] = _parent
 _contract = _load("symphonia_pkg.runtime_adapter", PACKAGE / "adapters" / "runtime_adapter.py")
+_attention = _load("symphonia_pkg.attention", PACKAGE / "adapters" / "attention.py")
+_reports = _load("symphonia_pkg.reports", PACKAGE / "adapters" / "reports.py")
+_gate = _load("symphonia_pkg.plan_gate", PACKAGE / "adapters" / "plan_gate.py")
 _orca_pkg = types.ModuleType("symphonia_pkg.orca")
 _orca_pkg.__path__ = [str(PACKAGE / "adapters" / "orca")]
 sys.modules["symphonia_pkg.orca"] = _orca_pkg
 _launcher = _load("symphonia_pkg.orca.launcher", PACKAGE / "adapters" / "orca" / "launcher.py")
+_events = _load("symphonia_pkg.orca.events", PACKAGE / "adapters" / "orca" / "events.py")
+_linear_pkg = types.ModuleType("symphonia_pkg.linear")
+_linear_pkg.__path__ = [str(PACKAGE / "adapters" / "linear")]
+sys.modules["symphonia_pkg.linear"] = _linear_pkg
+_linear_client = _load("symphonia_pkg.linear.client", PACKAGE / "adapters" / "linear" / "client.py")
+_linear = _load("symphonia_pkg.linear.adapter", PACKAGE / "adapters" / "linear" / "adapter.py")
 
 RoleName = _contract.RoleName
 Access = _contract.Access
+GATE_ROLE = RoleName.PLANNER
+"""Only the planner's completion is a Human Gate today; `wait` only reacts
+to gate events keyed to this role's dispatch."""
 
 STATE = PACKAGE / ".runtime" / "spawns.json"
 # The baton between roles is the installed handoff skill's document, in the
@@ -249,6 +272,88 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
     return "\n".join(lines)
 
 
+# --- the Execution Brief (planner input) ----------------------------------
+
+
+def _current_branch(workspace: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", workspace, "branch", "--show-current"],
+        capture_output=True, text=True,
+    )
+    return proc.stdout.strip() or "(unknown)"
+
+
+def _handoff_files(ticket: str) -> list[Path]:
+    return sorted(Path(os.path.expanduser(HANDOFF_DIR)).glob(f"{ticket.lower()}-*.md"))
+
+
+def _comments_with_dates(client, issue_id: str) -> list[tuple[str, str, str]]:
+    """(author, date, body) for every comment. Queried directly rather than
+    through ``LinearTracker.list_comments`` because the Tracker Adapter's
+    ``Comment`` type carries an author id and a body but no date — widening
+    that provider-neutral contract for one caller's extra field is not worth
+    it, so the Brief asks the same GraphQL client for the field it needs."""
+
+    data = client.query(
+        """query($id: String!) { issue(id: $id) {
+          comments(first: 100) { nodes { body createdAt user { name } } } } }""",
+        {"id": issue_id},
+    )
+    return [
+        (
+            (c.get("user") or {}).get("name") or "unknown",
+            str(c.get("createdAt", ""))[:10],
+            c.get("body", ""),
+        )
+        for c in data["issue"]["comments"]["nodes"]
+    ]
+
+
+def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None, client=None) -> str:
+    """Assembles the Execution Brief injected at dispatch: extracts the
+    ``io:brief-template`` block from the role's own file and fills it from
+    the ticket. The role opens with the ticket already in hand — zero tool
+    call needed to fetch it (`orca linear` may be disconnected; this reads
+    the tracker adapter's GraphQL client directly, same as GRE-174)."""
+
+    ticket = ticket.upper()
+    role_path = PACKAGE / "roles" / ROLE_FILES[role]
+    template = _reports.extract_block(role_path.read_text(), "md io:brief-template")
+
+    tracker = tracker or _linear.LinearTracker()
+    client = client if client is not None else (getattr(tracker, "_c", None) or _linear_client.LinearClient())
+
+    item = tracker.get_item(ticket)
+    comments = _comments_with_dates(client, item.ref.id)
+    comment_text = "\n\n".join(
+        f"**{author} · {date}**\n\n{body}" for author, date, body in comments
+    ) or "None."
+
+    handoff_files = _handoff_files(ticket)
+    handoff_text = "\n".join(f"- {p}" for p in handoff_files) or (
+        "None — this is the first role on this ticket."
+    )
+
+    values = {
+        "ticket_key": ticket,
+        "role": role.value,
+        "role_file": f".symphonia/roles/{ROLE_FILES[role]}",
+        "workspace": workspace,
+        "branch": _current_branch(workspace),
+        "title": item.title,
+        "url": item.ref.url,
+        "description": item.body or "(no description)",
+        "comments": comment_text,
+        "handoff_files": handoff_text,
+    }
+    try:
+        return template.format(**values)
+    except KeyError as exc:
+        raise SystemExit(
+            f"Brief template in {role_path} references unknown placeholder {exc}"
+        )
+
+
 def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None = None) -> dict:
     ticket = ticket.upper()
     found = find_worktree(ticket)
@@ -303,9 +408,14 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     # never assumed.
     orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle", "--timeout-ms", "120000")
 
+    # The planner's input is the Execution Brief, injected: the issue is
+    # read and formatted here, never left for the role to go fetch. Every
+    # other role still gets the `work_spec()` pointer until its own cycle
+    # brings it a Brief (legacy, migrated one role at a time).
+    spec = build_brief(role, ticket, path) if role is RoleName.PLANNER else work_spec(role, ticket, path)
     task = orca(
         "orchestration", "task-create",
-        "--spec", work_spec(role, ticket, path),
+        "--spec", spec,
     )["task"]["id"]
     dispatch = orca(
         "orchestration", "dispatch", "--task", task, "--to", terminal, "--inject",
@@ -414,6 +524,179 @@ def retire(ticket: str, role_value: str) -> dict:
     }
 
 
+# --- the plan gate ---------------------------------------------------------
+
+IDLE = _gate.IDLE
+
+
+def _flag_malformed(tracker, ticket: str, reason: str) -> None:
+    tracker.set_attention(
+        ticket,
+        _attention.Attention(
+            needs=True, code=_attention.AttentionCode.MALFORMED_REPORT, reason=reason,
+        ),
+    )
+
+
+def _apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str | None]]:
+    """The gate's decision for one event, isolated from the tracker/Linear
+    calls `wait` makes: mutates `rec`'s `gate_state`/`question_id` in place
+    and returns the `(action, reason)` pairs to execute — `reason` is only
+    set for `flag_malformed`. No network call happens here, so this is what
+    a unit test drives.
+
+    A `plan-question` is only a gate event when its body is a real plan
+    submission (`reports.is_plan_submission`) — a clarifying question from
+    the planner is not a submission, does not light the label, and is left
+    for the caller to treat as an ordinary message instead. A body that
+    starts `## Plan` but does not otherwise parse is flagged rather than
+    silently accepted or silently ignored.
+    """
+
+    state = rec.get("gate_state", IDLE)
+
+    if event.kind == "plan-question":
+        if not _reports.is_plan_submission(event.question):
+            return []
+        try:
+            _reports.parse_plan_submission(event.question)
+        except _reports.MalformedReport as exc:
+            return [(_gate.FLAG_MALFORMED, str(exc))]
+        result = _gate.transition(state, event, last_question_id=rec.get("last_question_id"))
+        if result.question_id:
+            rec["question_id"] = result.question_id
+            rec["last_question_id"] = result.question_id
+    elif event.kind == "worker-done":
+        raw = raw_by_id.get(event.message_id)
+        result = _gate.transition(state, event, payload=(raw.payload if raw else {}))
+    else:
+        result = _gate.transition(state, event)
+
+    rec["gate_state"] = result.state
+    divergence = (
+        f"gate event {event.kind!r} did not match the recorded gate_state {state!r}"
+    )
+    return [
+        (action, divergence if action == _gate.FLAG_MALFORMED else None)
+        for action in result.actions
+    ]
+
+
+def wait(*, ack: str | None, timeout_ms: int) -> dict:
+    """The one loop the Orchestrator uses to hear back from every role.
+    Wraps `orca orchestration check --wait`, then runs each gate event
+    through `_apply_gate_event`/`plan_gate.transition` and executes the
+    actions it returns — label the ticket, retire the planner, flag a
+    divergence — never the Orchestrator reading a message and deciding by
+    itself.
+
+    Replay-safe: an unacked Delivery replays the same batch, but every
+    action is guarded by the recorded `gate_state` (and, for plan-question,
+    by the event's own id), so a repeat is a no-op (see `plan_gate.py`).
+
+    The Linear tracker is built lazily, only when a gate action actually
+    needs it — a `wait` that observes no gate action (the common case for
+    every role but the planner) must work even without `LINEAR_API_KEY` set.
+    """
+
+    argv = [
+        "orchestration", "check", "--wait",
+        "--types", "worker_done,escalation,question",
+        "--timeout-ms", str(timeout_ms),
+    ]
+    if ack:
+        argv += ["--ack", ack]
+    batch_raw = orca(*argv)
+    # `orca()` already unwraps the envelope; `parse_check_output` expects the
+    # raw JSON text of `check --peek/--wait --json`, so it is fed back in —
+    # the same helper serves both call sites without a second parser.
+    batch = _events.parse_check_output(json.dumps(batch_raw))
+    events = _events.gate_events(batch.messages)
+    raw_by_id = {m.id: m for m in batch.messages}
+
+    data = state_read()
+    by_dispatch = {rec["dispatch"]: key for key, rec in data.items()}
+    actions_taken = []
+
+    _tracker: list = []
+
+    def tracker():
+        if not _tracker:
+            _tracker.append(_linear.LinearTracker())
+        return _tracker[0]
+
+    for event in events:
+        dispatch_id = getattr(event, "dispatch_id", None)
+        key = by_dispatch.get(dispatch_id)
+        if key is None or not key.endswith(f"/{GATE_ROLE.value}"):
+            continue  # the gate governs only the planner's own dispatch
+        rec = data[key]
+        ticket = rec["ticket"]
+        for action, reason in _apply_gate_event(rec, event, raw_by_id):
+            if action == _gate.LABEL_ON:
+                tracker().set_gate(ticket, True)
+            elif action == _gate.LABEL_OFF:
+                tracker().set_gate(ticket, False)
+            elif action == _gate.RETIRE_PLANNER:
+                retire(ticket, GATE_ROLE.value)
+            elif action == _gate.FLAG_MALFORMED:
+                _flag_malformed(tracker(), ticket, reason or "malformed gate report")
+            actions_taken.append({"ticket": ticket, "action": action})
+    state_write(data)
+    return {
+        "delivery_id": batch.delivery_id,
+        # Every mailbox message, not just the ones typed as gate events —
+        # an escalation or a non-planner question must stay visible to the
+        # Orchestrator even though the gate itself has nothing to do with it.
+        "events": [
+            {
+                "id": m.id, "type": m.type, "subject": m.subject,
+                "body": m.body, "payload": m.payload, "sender": m.sender,
+            }
+            for m in batch.messages
+        ],
+        "actions": actions_taken,
+    }
+
+
+def verdict(ticket: str, decision: str, notes: str) -> dict:
+    """The human's decision, as argv — never typed by an agent. Formats the
+    response in the contract's format (b), replies to the recorded
+    `question_id`, and lifts the `human-gate` label. `retire` does not
+    happen here: it happens in `wait`, when the planner's `worker_done`
+    arrives with the approved gate_state already recorded — one path for
+    both APPROVED and APPROVED-with-caveats, and it never kills a planner
+    still blocked inside its `ask`."""
+
+    ticket = ticket.upper()
+    if decision not in ("approved", "revise"):
+        raise SystemExit(f"unknown decision {decision!r}; use 'approved' or 'revise'")
+
+    key = f"{ticket}/{GATE_ROLE.value}"
+    data = state_read()
+    rec = data.get(key)
+    if rec is None or not rec.get("question_id"):
+        raise SystemExit(
+            f"no pending plan submission recorded for {ticket}; "
+            f"`spawn wait` must observe the submission before a verdict can be given"
+        )
+    if decision == "revise" and not notes.strip():
+        raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
+
+    token = "APPROVED" if decision == "approved" else "REVISE"
+    note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
+    body = _reports.format_approval_reply(token, note_lines)
+
+    orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
+    _linear.LinearTracker().set_gate(ticket, False)
+
+    rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
+    rec.pop("question_id", None)
+    data[key] = rec
+    state_write(data)
+    return {"ticket": ticket, "decision": token}
+
+
 # --- CLI -----------------------------------------------------------------
 
 VERBS = {
@@ -440,6 +723,14 @@ def main() -> int:
     p = sub.add_parser("retire")
     p.add_argument("ticket")
     p.add_argument("role")
+    p = sub.add_parser("wait")
+    p.add_argument("--ack", help="Delivery id to acknowledge before waiting again.")
+    p.add_argument("--timeout-ms", type=int, default=900000)
+    p = sub.add_parser("verdict")
+    p.add_argument("ticket")
+    p.add_argument("decision", choices=["approved", "revise"])
+    p.add_argument("--notes", default="")
+    p.add_argument("--notes-file")
 
     args = parser.parse_args()
     if args.verb in VERBS:
@@ -451,6 +742,13 @@ def main() -> int:
         print(json.dumps(status(args.ticket), indent=2))
     elif args.verb == "retire":
         print(json.dumps(retire(args.ticket, args.role), indent=2))
+    elif args.verb == "wait":
+        print(json.dumps(wait(ack=args.ack, timeout_ms=args.timeout_ms), indent=2))
+    elif args.verb == "verdict":
+        notes = args.notes
+        if args.notes_file:
+            notes = (notes + "\n" + Path(args.notes_file).read_text()).strip()
+        print(json.dumps(verdict(args.ticket, args.decision, notes), indent=2))
     return 0
 
 

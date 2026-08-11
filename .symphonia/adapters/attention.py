@@ -38,6 +38,9 @@ class AttentionCode(enum.Enum):
     """Changed lines exceed ``review_budget_lines``; a split needs approval."""
     TIER_UNVERIFIED = "tier-unverified"
     """The Capability Tier check could not confirm what the role ran at."""
+    MALFORMED_REPORT = "malformed-report"
+    """A role's message did not follow its I/O contract; a script found the
+    mismatch, never a model reading prose."""
 
     # Role reports, translated by the Orchestrator
     ROLE_REPORTED = "role-reported"
