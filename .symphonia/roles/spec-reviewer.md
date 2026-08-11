@@ -1,6 +1,7 @@
 ---
 role: spec-reviewer
 capability_tier: high
+access: read
 ---
 
 # Spec Reviewer

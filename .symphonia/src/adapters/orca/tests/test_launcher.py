@@ -1,9 +1,12 @@
 """Conformance tests for the launch interface (GRE-179).
 
-TLDR: locks the three things that are silent when they break — the role
-matrix drifting away from what the role files declare, a worker launched in a
-mode that can stop at a permission prompt, and a read-only role launched
-somewhere it could write. Run either way:
+TLDR: locks the two things that are silent when they break — a worker
+launched in a mode that can stop at a permission prompt, and a read-only
+role launched somewhere it could write. What tier/access a role launches at
+is no longer a second table here to drift from the role files (GRE-186 S1):
+these tests read the same `RolePolicy` catalog `spawn.py` does, via
+`workflow.roles.load_policies`, and pass it to `build_launch` explicitly.
+Run either way:
 
     cd .symphonia/src && python3 -m unittest adapters.orca.tests.test_launcher
     python3 .symphonia/src/adapters/orca/tests/test_launcher.py
@@ -21,42 +24,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from adapters.orca.launcher import (
     DEFAULT_PROVIDER,
     PROVIDERS,
-    ROLE_ACCESS,
-    ROLE_TIERS,
-    TIER_MODELS,
     build_launch,
     observed_models,
     tier_matches,
 )
 from adapters.runtime_adapter import Access, CapabilityTier, RoleName
+from workflow.roles import load_policies
 
 ROLES_DIR = Path(__file__).resolve().parents[4] / "roles"
-
-
-def declared_tier(role: RoleName) -> str:
-    """The `capability_tier` a role file declares in its frontmatter."""
-
-    text = (ROLES_DIR / f"{role.value}.md").read_text()
-    for line in text.splitlines():
-        if line.startswith("capability_tier:"):
-            return line.split(":", 1)[1].strip()
-    raise AssertionError(f"{role.value}.md declares no capability_tier")
-
-
-class TestMatrixAgreesWithRoleFiles(unittest.TestCase):
-    """A role file and the launcher are two statements of the same decision.
-    When they disagree, the role file is the one humans read and the launcher
-    is the one that runs — so the drift is invisible until a ticket is
-    planned by the wrong model."""
-
-    def test_every_role_declares_the_tier_it_launches_at(self):
-        for role in RoleName:
-            with self.subTest(role=role.value):
-                self.assertEqual(declared_tier(role), ROLE_TIERS[role].value)
-
-    def test_every_tier_has_a_model(self):
-        for tier in CapabilityTier:
-            self.assertIn(tier, TIER_MODELS, f"{tier.value} would launch nothing")
+POLICIES = load_policies(ROLES_DIR)
 
 
 class TestNothingLaunchesIntoAPrompt(unittest.TestCase):
@@ -65,8 +41,11 @@ class TestNothingLaunchesIntoAPrompt(unittest.TestCase):
     produces no orchestration message and no dispatch state change."""
 
     def test_every_role_launches_unattended(self):
-        for role in RoleName:
-            plan = build_launch(role, session_id="s", workspace="/tmp/w")
+        for role, policy in POLICIES.items():
+            plan = build_launch(
+                role, session_id="s", workspace="/tmp/w",
+                tier=policy.tier, access=policy.access,
+            )
             with self.subTest(role=role.value):
                 self.assertIn("bypassPermissions", plan.command)
 
@@ -78,10 +57,13 @@ class TestNothingLaunchesIntoAPrompt(unittest.TestCase):
 
 class TestReadOnlyIsStructural(unittest.TestCase):
     def test_read_roles_cannot_reach_write_tools(self):
-        for role, access in ROLE_ACCESS.items():
-            plan = build_launch(role, session_id="s", workspace="/tmp/w")
+        for role, policy in POLICIES.items():
+            plan = build_launch(
+                role, session_id="s", workspace="/tmp/w",
+                tier=policy.tier, access=policy.access,
+            )
             with self.subTest(role=role.value):
-                if access is Access.READ:
+                if policy.access is Access.READ:
                     self.assertIn("--disallowedTools", plan.command)
                     for tool in ("Edit", "Write", "NotebookEdit"):
                         self.assertIn(tool, plan.command)
@@ -92,13 +74,21 @@ class TestReadOnlyIsStructural(unittest.TestCase):
         """Better to fail the launch than to start a reviewer that can edit
         the code it is judging."""
 
-        read_role = next(r for r, a in ROLE_ACCESS.items() if a is Access.READ)
+        read_role = next(r for r, p in POLICIES.items() if p.access is Access.READ)
         with self.assertRaises(ValueError):
-            build_launch(read_role, session_id="s", workspace="/tmp/w", provider="codex")
+            build_launch(
+                read_role, session_id="s", workspace="/tmp/w",
+                tier=POLICIES[read_role].tier, access=Access.READ, provider="codex",
+            )
 
     def test_unknown_provider_is_refused(self):
         with self.assertRaises(ValueError):
-            build_launch(RoleName.PLANNER, session_id="s", workspace="/tmp/w", provider="nope")
+            build_launch(
+                RoleName.PLANNER, session_id="s", workspace="/tmp/w",
+                tier=POLICIES[RoleName.PLANNER].tier,
+                access=POLICIES[RoleName.PLANNER].access,
+                provider="nope",
+            )
 
 
 class TestTierIsObservable(unittest.TestCase):
@@ -107,7 +97,11 @@ class TestTierIsObservable(unittest.TestCase):
     at launch is what makes that file addressable."""
 
     def test_transcript_path_is_derived_from_the_session_id(self):
-        plan = build_launch(RoleName.PLANNER, session_id="abc", workspace="/tmp/w")
+        policy = POLICIES[RoleName.PLANNER]
+        plan = build_launch(
+            RoleName.PLANNER, session_id="abc", workspace="/tmp/w",
+            tier=policy.tier, access=policy.access,
+        )
         self.assertTrue(str(plan.transcript).endswith("abc.jsonl"))
 
     def test_models_are_read_from_the_transcript(self):
@@ -133,7 +127,11 @@ class TestArgvIsShellSafe(unittest.TestCase):
         """`orca terminal create --command` takes one string, so a value with
         spaces must not split into two arguments."""
 
-        plan = build_launch(RoleName.SPEC_REVIEWER, session_id="s", workspace="/tmp/w")
+        policy = POLICIES[RoleName.SPEC_REVIEWER]
+        plan = build_launch(
+            RoleName.SPEC_REVIEWER, session_id="s", workspace="/tmp/w",
+            tier=policy.tier, access=policy.access,
+        )
         self.assertIn("'Edit Write NotebookEdit'", plan.command)
 
 

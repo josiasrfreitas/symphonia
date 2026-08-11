@@ -55,26 +55,13 @@ TIER_EFFORT: dict[CapabilityTier, str] = {
     CapabilityTier.FAST: "low",
 }
 
-# --- Role -> (tier, access) ---------------------------------------------
+# --- tier/access -----------------------------------------------------------
 #
-# The matrix decided on GRE-179: planner Fable, implementer Sonnet, reviewer
-# Opus. Roles carry the same declaration in their `.symphonia/roles/*.md`
-# frontmatter; this table is what actually launches, and the conformance
-# test asserts the two agree.
-
-ROLE_TIERS: dict[RoleName, CapabilityTier] = {
-    RoleName.PLANNER: CapabilityTier.FRONTIER,
-    RoleName.IMPLEMENTER: CapabilityTier.STANDARD,
-    RoleName.SPEC_REVIEWER: CapabilityTier.HIGH,
-    RoleName.STANDARDS_REVIEWER: CapabilityTier.HIGH,
-}
-
-ROLE_ACCESS: dict[RoleName, Access] = {
-    RoleName.PLANNER: Access.WRITE,
-    RoleName.IMPLEMENTER: Access.WRITE,
-    RoleName.SPEC_REVIEWER: Access.READ,
-    RoleName.STANDARDS_REVIEWER: Access.READ,
-}
+# The matrix decided on GRE-179 (planner Fable, implementer Sonnet, reviewer
+# Opus) now lives only in each role's `.symphonia/roles/*.md` frontmatter,
+# read by `workflow.roles.load_policies` — no second table here to drift out
+# of sync with it (GRE-186 S1). `build_launch` takes `tier`/`access` from the
+# caller's `RolePolicy`; it no longer has a default of its own.
 
 # Tools a read-access role may never call. Read access is enforced by the
 # launch command, not by asking the model to behave: a reviewer that cannot
@@ -142,15 +129,16 @@ def build_launch(
     *,
     session_id: str,
     workspace: str,
+    tier: CapabilityTier,
+    access: Access,
     provider: str = DEFAULT_PROVIDER,
-    tier: CapabilityTier | None = None,
-    access: Access | None = None,
 ) -> LaunchPlan:
     """The one function that writes an agent command line.
 
-    ``tier``/``access`` default to the role matrix. The Runtime Adapter
-    passes the ``RoleSpec`` values explicitly, so a caller holding a spec
-    stays authoritative over its own declaration."""
+    ``tier``/``access`` are always the caller's ``RolePolicy`` — no default
+    here to drift from the role file frontmatter (GRE-186 S1). The Runtime
+    Adapter passes the ``RoleSpec`` values it was given, so a caller holding
+    a spec stays authoritative over its own declaration."""
 
     grammar = PROVIDERS.get(provider)
     if grammar is None:
@@ -158,8 +146,6 @@ def build_launch(
             f"no launch grammar for provider {provider!r}; "
             f"known: {', '.join(sorted(PROVIDERS))}"
         )
-    tier = tier or ROLE_TIERS[role]
-    access = access or ROLE_ACCESS[role]
 
     argv: list[str] = [grammar.executable, grammar.model_flag, TIER_MODELS[tier]]
     if grammar.effort_flag:
