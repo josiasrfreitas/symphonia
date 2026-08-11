@@ -302,7 +302,21 @@ class GateEventReading(unittest.TestCase):
 class RealCliContract(unittest.TestCase):
     """Frozen samples captured from the REAL orca CLI (2026-08-10, ad hoc
     test after the envelope bug). If the CLI's response contract changes,
-    these fixtures — not the scripted fake — are what must disagree."""
+    these fixtures — not the scripted fake — are what must disagree.
+
+    Honesty note (GRE-184 PR-B review): this PR changed five response
+    shapes in ``fake.py`` — ``worktree create``, ``worktree list``,
+    ``terminal create``, ``task-create``, and ``dispatch`` — without adding
+    a matching ``REAL_*`` fixture for any of them. No recorded sample backs
+    those shapes; their only provenance is the argv observed from
+    ``spawn.py`` running against the real CLI. A fixture copied out of the
+    fake would be worse than having none, since it would read as authority
+    echoing itself. The dispatch preamble deserves special mention: the
+    ``_capability_of`` regex (``adapter.py``) is only ever exercised in this
+    suite against a string the fake synthesizes, never against a real
+    preamble. It does work in production — it minted a capability four
+    times in one wave the day this note was written — but that fact lives
+    nowhere but this comment, and the next reader deserves to know it."""
 
     # orca orchestration dispatch-show --task task_75ed1fd7b0b9 --json
     REAL_DISPATCH_SHOW = """
