@@ -42,10 +42,16 @@ TIER_MODELS: dict[CapabilityTier, str] = {
     CapabilityTier.FAST: "haiku",
 }
 
+# Effort is not a second capability dial: the tier already bought the model.
+# Medium is the house default for every role — the brief carries the thinking
+# the role would otherwise have to rediscover. Sonnet is the one exception:
+# it writes the code, and the extra reasoning is what keeps it from drifting
+# from the plan (decision: 2026-08-11).
+
 TIER_EFFORT: dict[CapabilityTier, str] = {
-    CapabilityTier.FRONTIER: "high",
-    CapabilityTier.HIGH: "high",
-    CapabilityTier.STANDARD: "medium",
+    CapabilityTier.FRONTIER: "medium",
+    CapabilityTier.HIGH: "medium",
+    CapabilityTier.STANDARD: "high",
     CapabilityTier.FAST: "low",
 }
 
