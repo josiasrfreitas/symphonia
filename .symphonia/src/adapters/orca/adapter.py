@@ -359,30 +359,58 @@ class OrcaRuntimeAdapter:
         current phase, so a ``name:`` lookup would stop finding the ticket
         the moment a phase change lands.
 
-        Known gap (GRE-187): the match is ``Path(path).name == ticket_key``,
-        so it only finds a worktree named exactly after the ticket. A second
-        checkout of the same ticket lands at a path like ``gre-184-2``, and
-        this lookup goes back to returning None for a ticket that in fact
-        already has a workspace — this has happened for real. The fix
-        belongs to GRE-187, not here."""
+        GRE-187: an exact ``Path(path).name == ticket`` match always wins.
+        Without one, Orca dedupes worktree names against its own database
+        and never hands back the bare ticket name once it has been used and
+        freed — a second checkout of the same ticket lands at a path like
+        ``gre-184-2``, permanently (measured live: removing and recreating
+        the worktree still comes back suffixed). So the fallback matches
+        the strict ``<ticket>-<digits>`` suffix pattern — ``gre-1870`` and
+        ``gre-187-foo`` do not match. Exactly one such candidate is used.
+        More than one, with no exact match, is an anomaly, not routine: two
+        live worktrees for the same ticket means picking "the one with the
+        higher suffix" is a silent guess, and a wrong guess sends every
+        role after the planner to a stale tree — the same failure class as
+        a role reporting success without having changed anything. This
+        raises loud instead."""
 
         self._ensure_control()
         name = ticket_key.strip().lower()
         listed = self._orca("worktree", "list")
         items = listed.get("worktrees", listed.get("items", []))
-        for wt in items:
+
+        def _ref(wt: dict) -> WorkspaceRef:
             path = str(wt.get("path", ""))
-            if Path(path).name == name:
-                wt_id = str(wt.get("id", ""))
-                # `worktree list` answers with a full ref
-                # (`refs/heads/josiasrfreitas/gre-188`) while `worktree
-                # create` answers with the branch alone, so the same
-                # workspace described two ways used to disagree on this
-                # field. Strip the ref so both agree — measured 2026-08-11,
-                # sample in `conformance.RealCliContract`.
-                branch = str(wt.get("branch") or name).removeprefix("refs/heads/")
-                return WorkspaceRef(ticket_key=ticket_key, id=wt_id, path=path, branch=branch)
-        return None
+            wt_id = str(wt.get("id", ""))
+            # `worktree list` answers with a full ref
+            # (`refs/heads/josiasrfreitas/gre-188`) while `worktree
+            # create` answers with the branch alone, so the same
+            # workspace described two ways used to disagree on this
+            # field. Strip the ref so both agree — measured 2026-08-11,
+            # sample in `conformance.RealCliContract`.
+            branch = str(wt.get("branch") or name).removeprefix("refs/heads/")
+            return WorkspaceRef(ticket_key=ticket_key, id=wt_id, path=path, branch=branch)
+
+        suffix_re = re.compile(rf"^{re.escape(name)}-\d+$")
+        suffixed = []
+        for wt in items:
+            basename = Path(str(wt.get("path", ""))).name
+            if basename == name:
+                return _ref(wt)
+            if suffix_re.match(basename):
+                suffixed.append(wt)
+
+        if not suffixed:
+            return None
+        if len(suffixed) > 1:
+            paths = ", ".join(str(wt.get("path", "")) for wt in suffixed)
+            raise RuntimeError(
+                f"{ticket_key} has {len(suffixed)} live worktrees and none named "
+                f"exactly after the ticket: {paths}. Remove the stale ones before "
+                "continuing — picking one silently risks sending the next role to "
+                "an obsolete tree."
+            )
+        return _ref(suffixed[0])
 
     def destroy_workspace(self, workspace: WorkspaceRef) -> None:
         self._ensure_control()

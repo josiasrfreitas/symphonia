@@ -96,8 +96,9 @@ class CreateWorkspace(unittest.TestCase):
 
 
 class FindWorkspace(unittest.TestCase):
-    """Same argv and match rule as `spawn.find_worktree`: by `Path(path).name`,
-    never by display name."""
+    """Same argv as `spawn.find_worktree`; match rule is GRE-187's own —
+    exact `Path(path).name` wins, else exactly one `<ticket>-<digits>`
+    suffix match, else anomaly."""
 
     def test_matches_by_path_basename(self):
         runner = RecordingRunner([
@@ -121,6 +122,67 @@ class FindWorkspace(unittest.TestCase):
             coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False,
         )
         self.assertIsNone(adapter.find_workspace("GRE-1"))
+
+    def test_exact_name_wins_over_suffixed(self):
+        runner = RecordingRunner([
+            _proc(_ok({"worktrees": [
+                {"id": "wt-old", "path": "/workspaces/gre-187-2"},
+                {"id": "wt-exact", "path": "/workspaces/gre-187"},
+            ]})),
+        ])
+        adapter = OrcaRuntimeAdapter(
+            coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False,
+        )
+
+        ws = adapter.find_workspace("GRE-187")
+
+        self.assertEqual(ws.id, "wt-exact")
+        self.assertEqual(ws.path, "/workspaces/gre-187")
+
+    def test_lone_suffixed_worktree_is_found(self):
+        runner = RecordingRunner([
+            _proc(_ok({"worktrees": [
+                {"id": "wt-2", "path": "/workspaces/gre-187-2"},
+            ]})),
+        ])
+        adapter = OrcaRuntimeAdapter(
+            coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False,
+        )
+
+        ws = adapter.find_workspace("GRE-187")
+
+        self.assertEqual(ws.id, "wt-2")
+        self.assertEqual(ws.path, "/workspaces/gre-187-2")
+
+    def test_non_digit_suffix_is_not_confused(self):
+        runner = RecordingRunner([
+            _proc(_ok({"worktrees": [
+                {"id": "wt-a", "path": "/workspaces/gre-1870"},
+                {"id": "wt-b", "path": "/workspaces/gre-187-foo"},
+            ]})),
+        ])
+        adapter = OrcaRuntimeAdapter(
+            coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False,
+        )
+
+        self.assertIsNone(adapter.find_workspace("GRE-187"))
+
+    def test_two_suffixed_and_no_exact_raises_listing_both(self):
+        runner = RecordingRunner([
+            _proc(_ok({"worktrees": [
+                {"id": "wt-2", "path": "/workspaces/gre-187-2"},
+                {"id": "wt-3", "path": "/workspaces/gre-187-3"},
+            ]})),
+        ])
+        adapter = OrcaRuntimeAdapter(
+            coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            adapter.find_workspace("GRE-187")
+
+        self.assertIn("/workspaces/gre-187-2", str(ctx.exception))
+        self.assertIn("/workspaces/gre-187-3", str(ctx.exception))
 
 
 class DefaultBase(unittest.TestCase):
