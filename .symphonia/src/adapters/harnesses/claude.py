@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,14 +119,22 @@ DEFAULT_PROVIDER = "claude"
 
 @dataclass(frozen=True)
 class LaunchPlan:
-    """Everything a spawn needs, decided before anything is created."""
+    """Everything a spawn needs, decided before anything is created.
+
+    ``argv`` is the unjoined command — turning that into one shell string
+    for `orca terminal create --command` is the caller's job, not this
+    module's (GRE-186 S3: `_shell_join` now lives in `adapters/orca/adapter.py`,
+    the one place that actually calls that CLI). A field here named
+    ``command`` holding a pre-joined string used to collide, in meaning,
+    with `PreparedLaunch.command` (the *unjoined* argv tuple the Protocol
+    hands the runtime) — dropped rather than renamed once nothing but a
+    test read it."""
 
     role: RoleName
     tier: CapabilityTier
     access: Access
     provider: str
     session_id: str
-    command: str
     transcript: Path | None = None
     argv: tuple[str, ...] = field(default=())
 
@@ -144,9 +151,10 @@ def build_launch(
     """The one function that writes an agent command line.
 
     ``tier``/``access`` are always the caller's ``RolePolicy`` — no default
-    here to drift from the role file frontmatter (GRE-186 S1). The Runtime
-    Adapter passes the ``RoleSpec`` values it was given, so a caller holding
-    a spec stays authoritative over its own declaration."""
+    here to drift from the role file frontmatter (GRE-186 S1). ``ClaudeHarness
+    .prepare()`` is the one production caller, and it passes the
+    ``RolePolicy`` values it was given directly, so a caller holding a
+    policy stays authoritative over its own declaration."""
 
     grammar = PROVIDERS.get(provider)
     if grammar is None:
@@ -175,29 +183,19 @@ def build_launch(
         access=access,
         provider=provider,
         session_id=session_id,
-        command=_shell_join(argv),
         transcript=transcript_path(workspace, session_id) if provider == "claude" else None,
         argv=tuple(argv),
     )
 
 
-def _shell_join(argv: list[str]) -> str:
-    """`orca terminal create --command` takes one string, so the argv is
-    joined here — quoting anything the shell would otherwise split."""
-
-    out = []
-    for part in argv:
-        out.append(f"'{part}'" if re.search(r"[\s()*?\"$]", part) else part)
-    return " ".join(out)
-
-
 # --- Deterministic tier verification -------------------------------------
 #
-# The Runtime Adapter reports `tier_verification=False` because Orca records
-# the launch command and never the answering model. The transcript does:
-# every assistant turn carries `"model":"<name>"`. Pinning `--session-id`
-# makes the transcript path predictable, which turns "we asked for Sonnet"
-# into "Sonnet answered" — read from a file, never from the agent's word.
+# Orca records the launch command and never the answering model — that gap
+# is why the Runtime Adapter carries no tier evidence of its own (GRE-186
+# S3). The transcript does: every assistant turn carries `"model":"<name>"`.
+# Pinning `--session-id` makes the transcript path predictable, which turns
+# "we asked for Sonnet" into "Sonnet answered" — read from a file, never
+# from the agent's word.
 
 
 def transcript_path(workspace: str, session_id: str) -> Path:
@@ -237,17 +235,17 @@ def tier_matches(tier: CapabilityTier, models: list[str]) -> bool:
 # --- HarnessAdapter -------------------------------------------------------
 #
 # `ClaudeHarness` wraps everything above behind `adapters.harness_adapter`'s
-# neutral Protocol (GRE-186 S2): `build_launch` is still the one function
-# that writes an agent command line, `observed_models`/`tier_matches` are
-# still what turns a transcript into evidence. `OrcaRuntimeAdapter.launch_role`
-# still calls `build_launch` directly, not through this class — inverting
-# that call is GRE-186 S3, a separate round.
+# neutral Protocol: `build_launch` is still the one function that writes an
+# agent command line, `observed_models`/`tier_matches` are still what turns
+# a transcript into evidence. `OrcaRuntimeAdapter.open_context` never calls
+# `build_launch` — the inversion GRE-186 S3 closes: `ClaudeHarness.prepare()`
+# is the one production caller now, and `open_context` only ever sees the
+# `PreparedLaunch` it hands back.
 
 # The path `handoff_hint()` names — the skill that produces a role's handoff
-# document. Duplicated from `spawn.HANDOFF_SKILL` rather than imported: the
-# core (`spawn.py`) still owns the full baton instructions in this round
-# (GRE-186 S2), and only splices in a harness's hint starting GRE-186 S3.
-# The two must read identically until then.
+# document. The one place this string is spelled (GRE-186 S3): `spawn.py`
+# owns the baton instructions' structure, but splices this harness's own
+# hint in rather than knowing the skill's path itself.
 HANDOFF_SKILL = "~/.claude/skills/handoff/SKILL.md"
 
 
@@ -285,11 +283,12 @@ class ClaudeHarness:
         return PreparedLaunch(command=plan.argv, session=session)
 
     def observe(self, session: HarnessSession, requested: CapabilityTier) -> TierEvidence:
-        """The `verify_tier` semantics `OrcaRuntimeAdapter` has always had,
-        moved behind the Protocol: no transcript reference, or a transcript
-        that has not answered yet, is `requested`, never a guess. Once it
-        has answered, a match is `observed`; a divergence is `observed` too
-        — the evidence is honest either way, only the tier differs."""
+        """The tier-checking semantics `OrcaRuntimeAdapter.verify_tier` used
+        to own, before GRE-186 S3 moved them here: no transcript reference,
+        or a transcript that has not answered yet, is `requested`, never a
+        guess. Once it has answered, a match is `observed`; a divergence is
+        `observed` too — the evidence is honest either way, only the tier
+        differs."""
 
         if not session.observation_ref:
             return TierEvidence(

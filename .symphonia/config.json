@@ -3,6 +3,7 @@
   "review_budget_lines": 400,
   "context_gate_used_fraction": 0.4,
   "stop_check_from_stop": 3,
+  "handoff_dir": "~/orca/.context",
   "linear": {
     "team_key": "SYM",
     "root_issue": "SYM-1",

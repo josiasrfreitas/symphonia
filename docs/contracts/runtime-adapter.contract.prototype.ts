@@ -113,6 +113,13 @@ export type Access = "write" | "read";
  *   unavailable the check could not be run at all. Never silently downgraded to
  *               `requested` — not knowing and knowing-only-the-request are different
  *               facts, and the tuning loop compares them.
+ *
+ * Implementation note (GRE-186 S3): the shipped Python runtime moved this vocabulary onto
+ * a separate, narrower harness contract (`adapters/harness_adapter.py`'s `TierEvidence`) —
+ * the runtime adapter itself carries no tier evidence at all now, only role and access.
+ * This prototype's `RuntimeAdapter.launchRole`/`verifyTier` (below) still model tier
+ * evidence as the runtime's own concern; that split is the target design this file has not
+ * been reworked to reflect, not a contradiction to resolve here.
  */
 export type TierEvidence =
   | { strength: "requested"; tier: CapabilityTier; at: string }
@@ -135,7 +142,9 @@ export type TierEvidence =
  *
  * `tierEvidence` rides on the envelope rather than being fetched separately because the
  * tuning loop compares executions after the fact, and an execution whose tier was never
- * confirmed has to be legible as such in its own record.
+ * confirmed has to be legible as such in its own record. (GRE-186 S3: the shipped runtime
+ * reads this from a harness's `observe()` at record-read time rather than carrying it on
+ * the event itself — see the note on `TierEvidence` above.)
  */
 export type ResultEvent = {
   kind: "result";
@@ -291,7 +300,9 @@ export type RoleSpec = {
  * `tierEvidence` here is always `requested` or `unavailable` — never `observed`. A context
  * that has not answered anything has recorded nothing, so the strong check is necessarily
  * a second call after the first dispatch. Returning the weak evidence anyway makes the gap
- * visible at the moment it opens rather than leaving the field absent.
+ * visible at the moment it opens rather than leaving the field absent. (GRE-186 S3: the
+ * shipped runtime's launch returns a bare `ContextRef` — no tier evidence at all, since the
+ * runtime never holds a tier to begin with; see the note on `TierEvidence` above.)
  */
 export type LaunchResult = {
   context: ContextRef;

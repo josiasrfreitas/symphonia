@@ -4,8 +4,7 @@ TLDR: three pieces, all in-memory and deterministic:
 
 - ``FakeRuntime`` — the hostile runtime from the GRE-150 harness: no
   graceful stop, no reaper, a control binding anyone can seize, a capped
-  mailbox, stray shells on workspace creation, and a provider that can
-  silently serve a tier nobody asked for.
+  mailbox, stray shells on workspace creation.
 - ``FakeRuntimeAdapter`` — the contract implemented directly over that
   runtime. This is the double other suites reuse.
 - ``ScriptedOrcaCli`` — the same runtime dressed as the ``orca`` CLI, so
@@ -22,34 +21,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
+from ..harness_adapter import PreparedLaunch
 from ..runtime_adapter import (
     Access,
     AttemptRef,
     AttemptStatus,
-    CapabilityTier,
     ContextRef,
     ControlLostEvent,
     EscalationEvent,
     EventBatch,
     EventKind,
     KillReceipt,
-    LaunchResult,
     Liveness,
     QuestionEvent,
     ResultEvent,
     RoleName,
-    RoleSpec,
     RuntimeCapabilities,
     RuntimeEvent,
     TicketKey,
-    TierEvidence,
     WorkspaceRef,
 )
 from .adapter import ROLE_BADGE, RunResult
 # `harnesses.claude` is the one documented exception to "nothing outside
 # `adapters/harnesses/` reads its internals" (GRE-186 S2): this fake needs
-# the same tier->model table the real harness launches with, so a scripted
-# `orca terminal create --command` can tell which tier a command asked for.
+# the same tier->model table the real harness launches with, so
+# `_requested_tier` can assert a scripted `orca terminal create --command`
+# names a model the harness would actually produce (a test double may know
+# the harness it validates).
 from ..harnesses.claude import TIER_MODELS
 
 
@@ -61,12 +59,6 @@ class FakeProcess:
     display_name: str
     alive: bool = True
     quiet_ms: int = 0
-    # What the provider recorded once the process answered; None on a
-    # provider that records only requests — the entire point of GRE-163.
-    recorded_answered_tier: CapabilityTier | None = None
-    recorded_requested_tier: CapabilityTier = CapabilityTier.FAST
-    # Truth, visible to the rig and to nobody else.
-    actually_serving: CapabilityTier = CapabilityTier.FAST
 
 
 @dataclass
@@ -98,8 +90,6 @@ class FakeRuntime:
         self.tasks: dict[str, str] = {}
         self.dispatches: dict[str, dict] = {}
         self.sent: list[dict] = []
-        # Tiers the provider will silently serve, keyed by role name string.
-        self.staging: dict[str, CapabilityTier] = {}
 
     def _next(self, prefix: str) -> str:
         self.seq += 1
@@ -118,29 +108,13 @@ class FakeRuntime:
     def run_setup(self, ws_id: str) -> None:
         self.workspaces[ws_id].setup_done = True
 
-    def spawn(
-        self,
-        ws_id: str,
-        command: str,
-        display_name: str,
-        requested: CapabilityTier,
-        serving: CapabilityTier,
-    ) -> str:
+    def spawn(self, ws_id: str, command: str, display_name: str) -> str:
         pid = self._next("proc")
-        self.processes[pid] = FakeProcess(
-            id=pid,
-            workspace_id=ws_id,
-            command=command,
-            display_name=display_name,
-            recorded_requested_tier=requested,
-            actually_serving=serving,
-        )
+        self.processes[pid] = FakeProcess(id=pid, workspace_id=ws_id, command=command, display_name=display_name)
         return pid
 
-    def answer(self, pid: str, records_answers: bool) -> None:
-        proc = self.processes[pid]
-        proc.quiet_ms = 0
-        proc.recorded_answered_tier = proc.actually_serving if records_answers else None
+    def answer(self, pid: str) -> None:
+        self.processes[pid].quiet_ms = 0
 
     def go_quiet(self, pid: str, ms: int) -> None:
         self.processes[pid].quiet_ms = ms
@@ -187,20 +161,13 @@ class FakeRuntime:
 
 # --- the reusable double -----------------------------------------------------
 
-# The fake provider's own launch table — a provider that is not Orca.
-FAKE_COMMANDS: dict[CapabilityTier, str] = {
-    CapabilityTier.HIGH: "agent-a --model opus --effort high",
-    CapabilityTier.STANDARD: "agent-a --model sonnet --effort medium",
-    CapabilityTier.FAST: "agent-a --model haiku --effort low",
-}
-
 
 @dataclass
 class _FakeContext:
     ref: ContextRef
     pid: str
     access: Access
-    requested_tier: CapabilityTier
+    launch: PreparedLaunch
 
 
 @dataclass
@@ -212,17 +179,13 @@ class _FakeAttempt:
 
 
 class FakeRuntimeAdapter:
-    """``RuntimeAdapter`` implemented directly over ``FakeRuntime``.
+    """``RuntimeAdapter`` implemented directly over ``FakeRuntime``. Carries
+    no tier evidence of its own (GRE-186 S3) — that is a harness's job now,
+    never the runtime's, real or fake."""
 
-    ``records_answers=True`` models the provider that records the tier that
-    actually answered (``tier_verification`` on); False models the one that
-    records only what was requested — the accepted GRE-163 debt.
-    """
-
-    def __init__(self, rt: FakeRuntime, coordinator: str, records_answers: bool = True):
+    def __init__(self, rt: FakeRuntime, coordinator: str):
         self.rt = rt
         self.coordinator = coordinator
-        self.records_answers = records_answers
         self._contexts: dict[str, _FakeContext] = {}
         self._attempts: dict[str, _FakeAttempt] = {}
         self._ws_ids: dict[str, str] = {}
@@ -235,9 +198,7 @@ class FakeRuntimeAdapter:
 
     @property
     def capabilities(self) -> RuntimeCapabilities:
-        return RuntimeCapabilities(
-            tier_verification=self.records_answers, cooperative_completion=True
-        )
+        return RuntimeCapabilities(cooperative_completion=True)
 
     def _last_open_attempt(self) -> AttemptRef | None:
         for rec in reversed(list(self._attempts.values())):
@@ -288,9 +249,11 @@ class FakeRuntimeAdapter:
 
     # --- role contexts ---
 
-    def launch_role(self, workspace: WorkspaceRef, spec: RoleSpec) -> LaunchResult:
+    def open_context(
+        self, workspace: WorkspaceRef, *, role: RoleName, access: Access, launch: PreparedLaunch
+    ) -> ContextRef:
         self._ensure_control()
-        if spec.access is Access.WRITE:
+        if access is Access.WRITE:
             writer = next(
                 (
                     c
@@ -301,32 +264,19 @@ class FakeRuntimeAdapter:
             )
             if writer is not None:
                 raise RuntimeError(
-                    f"refusing to launch {spec.role.value} into {workspace.ticket_key}: "
+                    f"refusing to launch {role.value} into {workspace.ticket_key}: "
                     f"{writer.ref.role.value} already holds write access. "
                     "The runtime cannot detect the collision."
                 )
         context_id = self.rt._next("fctx")
-        serving = self.rt.staging.get(spec.role.value, spec.tier)
         pid = self.rt.spawn(
             self._ws_ids[workspace.path],
-            FAKE_COMMANDS[spec.tier],
-            f"{workspace.ticket_key}/{spec.role.value}/{context_id}",
-            requested=spec.tier,
-            serving=serving,
+            " ".join(launch.command),
+            f"{workspace.ticket_key}/{role.value}/{context_id}",
         )
-        ref = ContextRef(id=context_id, role=spec.role, workspace=workspace)
-        self._contexts[context_id] = _FakeContext(ref=ref, pid=pid, access=spec.access, requested_tier=spec.tier)
-        return LaunchResult(context=ref, tier_evidence=self.verify_tier(ref))
-
-    def verify_tier(self, context: ContextRef) -> TierEvidence:
-        record = self._contexts.get(context.id)
-        if record is None:
-            return TierEvidence(kind="unverifiable", detail="no such context")
-        proc = self.rt.processes[record.pid]
-        # "observed" only from a field written after the process answered.
-        if self.records_answers and proc.recorded_answered_tier is not None:
-            return TierEvidence(kind="observed", tier=proc.recorded_answered_tier)
-        return TierEvidence(kind="requested", tier=proc.recorded_requested_tier)
+        ref = ContextRef(id=context_id, role=role, workspace=workspace)
+        self._contexts[context_id] = _FakeContext(ref=ref, pid=pid, access=access, launch=launch)
+        return ref
 
     def close_role(self, context: ContextRef) -> None:
         self._ensure_control()
@@ -429,10 +379,14 @@ _MODEL_TIERS = {model: tier for tier, model in TIER_MODELS.items()}
 def _requested_tier(command: str):
     """Which tier a launch command asks for, read out of its `--model`.
 
-    Matched on the model rather than the whole string because the command
-    also carries effort, permission and session flags (GRE-179) — a fake
-    that compared the entire line would break every time the launcher
-    gained a flag, which is exactly the drift it exists to catch.
+    The runtime carries no tier of its own now (GRE-186 S3) — this exists
+    purely to catch a broken harness handing the scripted CLI a command
+    that names no real model, never to feed a "requested vs. served"
+    comparison the runtime no longer makes. Matched on the model rather
+    than the whole string because the command also carries effort,
+    permission and session flags (GRE-179) — a fake that compared the
+    entire line would break every time the launcher gained a flag, which
+    is exactly the drift it exists to catch.
     """
 
     parts = command.split()
@@ -442,16 +396,6 @@ def _requested_tier(command: str):
     if model not in _MODEL_TIERS:
         raise AssertionError(f"launch command names unknown model {model!r}")
     return _MODEL_TIERS[model]
-
-
-# Which role a title names, read out of its badge prefix (GRE-184 M3): the
-# real-CLI-shaped title (`f"{emoji} {phase} · {ticket}"`) carries no context
-# id, only the badge — the same table `adapter.launch_role` built it from.
-_BADGE_PREFIX_TO_ROLE = {f"{emoji} {phase}": role for role, (emoji, phase, _) in ROLE_BADGE.items()}
-
-
-def _role_of(title: str) -> RoleName | None:
-    return next((role for prefix, role in _BADGE_PREFIX_TO_ROLE.items() if title.startswith(prefix)), None)
 
 
 class ScriptedOrcaCli:
@@ -556,10 +500,8 @@ class ScriptedOrcaCli:
 
     def _terminal_create(self, selector: str, title: str, command: str) -> dict:
         ws_id = selector.removeprefix("id:")
-        requested = _requested_tier(command)
-        role = _role_of(title)
-        serving = self.rt.staging.get(role.value, requested) if role else requested
-        pid = self.rt.spawn(ws_id, command, title, requested=requested, serving=serving)
+        _requested_tier(command)  # asserts the harness named a real, known model
+        pid = self.rt.spawn(ws_id, command, title)
         return {"terminal": {"handle": pid}}
 
     def _terminal_list(self, selector: str) -> dict:
@@ -632,18 +574,18 @@ class ScriptedOrcaCli:
 class Rig:
     """What the conformance suite may do to the world that the adapter
     cannot: make processes answer or go quiet, deliver worker messages,
-    stage a silent tier downgrade, steal the control binding."""
+    steal the control binding. Tier-evidence staging left with GRE-186 S3 —
+    that scenario is a harness's conformance now, not the runtime's."""
 
-    def __init__(self, rt: FakeRuntime, records_answers: bool):
+    def __init__(self, rt: FakeRuntime):
         self.rt = rt
-        self.records_answers = records_answers
 
     def _proc_for(self, context: ContextRef) -> FakeProcess:
         marker = f"/{context.id}"
         for p in self.rt.processes.values():
             if p.display_name.endswith(marker):
                 return p
-        # Real-CLI-shaped titles (GRE-184 M3, OrcaRuntimeAdapter.launch_role)
+        # Real-CLI-shaped titles (GRE-184 M3, OrcaRuntimeAdapter.open_context)
         # carry no context id, only the role's badge — good enough because
         # the walkthrough never keeps two live contexts of the same role
         # alive at once.
@@ -652,16 +594,10 @@ class Rig:
         return next(p for p in self.rt.processes.values() if p.alive and p.display_name.startswith(prefix))
 
     def answer(self, context: ContextRef) -> None:
-        self.rt.answer(self._proc_for(context).id, self.records_answers)
+        self.rt.answer(self._proc_for(context).id)
 
     def go_quiet(self, context: ContextRef, ms: int) -> None:
         self.rt.go_quiet(self._proc_for(context).id, ms)
-
-    def serving_truth(self, context: ContextRef) -> CapabilityTier:
-        return self._proc_for(context).actually_serving
-
-    def stage(self, role: RoleName, tier: CapabilityTier) -> None:
-        self.rt.staging[role.value] = tier
 
     def post_result(self, attempt: AttemptRef, outcome: str, summary: str) -> None:
         self.rt.post("worker_done", summary, {"dispatchId": attempt.attempt_id, "outcome": outcome})

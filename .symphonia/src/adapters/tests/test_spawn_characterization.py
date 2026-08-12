@@ -310,6 +310,10 @@ class SpawnStatusAndRetire(CharacterizationCase):
     as failed."""
 
     def _seed(self, extra=None):
+        # Deliberately the pre-GRE-186 S3 record shape: `model_requested`,
+        # no `session`/`tier_evidence`. `test_status_argv` doubles as the
+        # tolerant-read test C1 of the S3 verdict asks for — this seed is
+        # exactly the old shape `status()` must read without raising.
         self.spawn.state_write({
             "GRE-1/planner": {
                 "ticket": "GRE-1", "role": "planner", "worktree": "/workspaces/gre-1",
@@ -330,6 +334,11 @@ class SpawnStatusAndRetire(CharacterizationCase):
             ["orchestration", "dispatch-show", "--task", "task-9"],
         ])
         self.assertEqual(out[0]["dispatch_status"], "dispatched")
+        # A record with no `session`/`tier_evidence` (every record before
+        # this round) reads as `unverifiable`, never a guess and never a
+        # crash on a missing key.
+        self.assertEqual(out[0]["evidence_kind"], "unverifiable")
+        self.assertIn("pre-GRE-186", out[0]["evidence_detail"])
 
     def test_retire_argv(self):
         self._seed()
@@ -422,6 +431,31 @@ class SpawnSubmitSingleRound(CharacterizationCase):
             "--question", SUBMISSION, "--timeout-ms", "60000",
         ]])
         self.assertEqual(out["verdict"], "approved")
+
+
+class WorkSpecBatonText(CharacterizationCase):
+    """C4 of the GRE-186 S3 verdict: the characterization scenarios above
+    recompute `work_spec()` by calling the function itself, so its text has
+    no oracle anywhere else — and this round rewrote exactly that text (the
+    baton rule's `handoff_dir` now comes from `config.json`, and the skill
+    path from `_harness().handoff_hint()`, not a core constant). Fixed here
+    so a future edit to either source is caught."""
+
+    def test_write_role_gets_the_baton_rule_with_handoff_dir_and_harness_hint(self):
+        spec = self.spawn.work_spec(self.RoleName.IMPLEMENTER, "GRE-1", "/workspaces/gre-1")
+        self.assertIn("~/orca/.context/gre-1-implementer-<YYYY-MM-DD>.md", spec)
+        self.assertIn(
+            "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)", spec
+        )
+        self.assertIn("Do NOT hand ownership to anyone and do NOT launch another agent", spec)
+
+    def test_read_role_gets_the_read_only_line_and_no_skill_path(self):
+        spec = self.spawn.work_spec(self.RoleName.SPEC_REVIEWER, "GRE-1", "/workspaces/gre-1")
+        self.assertIn(
+            "You are read-only by construction: Edit/Write are disabled at launch.", spec
+        )
+        self.assertNotIn("SKILL.md", spec)
+        self.assertNotIn("handoff document", spec)
 
 
 if __name__ == "__main__":

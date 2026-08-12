@@ -11,14 +11,14 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from unittest import mock
 
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from adapters.harness_adapter import HarnessSession, PreparedLaunch
 from adapters.orca.adapter import OrcaCliError, OrcaRuntimeAdapter, RunResult
-from adapters.runtime_adapter import Access, CapabilityTier, ContextRef, RoleName, RoleSpec, WorkspaceRef
+from adapters.runtime_adapter import Access, ContextRef, RoleName, WorkspaceRef
 
 FIXED_UUID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -58,6 +58,16 @@ PLAN_COMMAND = (
     "claude --model fable --effort medium --permission-mode bypassPermissions "
     f"--session-id {FIXED_UUID}"
 )
+# The `PreparedLaunch` a harness's `prepare()` would have handed `open_context`
+# (GRE-186 S3): unjoined argv — `_shell_join` inside `open_context` is what
+# turns it back into `PLAN_COMMAND` for `--command`.
+PLAN_LAUNCH = PreparedLaunch(
+    command=(
+        "claude", "--model", "fable", "--effort", "medium",
+        "--permission-mode", "bypassPermissions", "--session-id", str(FIXED_UUID),
+    ),
+    session=HarnessSession(id=str(FIXED_UUID), observation_ref=None),
+)
 
 
 class SetPhase(unittest.TestCase):
@@ -73,40 +83,33 @@ class SetPhase(unittest.TestCase):
         ]])
 
 
-class LaunchRole(unittest.TestCase):
+class OpenContext(unittest.TestCase):
     def test_argv_matches_spawn_launch(self):
         runner = RecordingRunner([
             _proc(_ok({"terminal": {"handle": "term-1"}})),
             _proc(_ok({})),
         ])
         adapter = OrcaRuntimeAdapter(coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False)
-        spec = RoleSpec(role=RoleName.PLANNER, tier=CapabilityTier.STANDARD, access=Access.WRITE, briefing="brief")
 
-        with mock.patch("adapters.orca.adapter.uuid.uuid4", return_value=FIXED_UUID):
-            with mock.patch(
-                "adapters.orca.adapter.build_launch",
-                return_value=mock.Mock(command=PLAN_COMMAND, session_id=str(FIXED_UUID), transcript=None),
-            ):
-                result = adapter.launch_role(WORKSPACE, spec)
+        context = adapter.open_context(
+            WORKSPACE, role=RoleName.PLANNER, access=Access.WRITE, launch=PLAN_LAUNCH
+        )
 
         self.assertEqual(runner.clean_calls(), [
             ["terminal", "create", "--worktree", "id:wt-1",
              "--title", "🧭 planning · GRE-201", "--command", PLAN_COMMAND],
             ["terminal", "wait", "--terminal", "term-1", "--for", "tui-idle", "--timeout-ms", "120000"],
         ])
-        self.assertEqual(result.context.role, RoleName.PLANNER)
+        self.assertEqual(context.role, RoleName.PLANNER)
 
 
 class Dispatch(unittest.TestCase):
     def _launched(self, runner: RecordingRunner) -> ContextRef:
         adapter = OrcaRuntimeAdapter(coordinator="orchestrator", run_id="run-1", runner=runner, bind_control=False)
-        spec = RoleSpec(role=RoleName.PLANNER, tier=CapabilityTier.STANDARD, access=Access.WRITE, briefing="brief")
-        with mock.patch(
-            "adapters.orca.adapter.build_launch",
-            return_value=mock.Mock(command=PLAN_COMMAND, session_id="s-1", transcript=None),
-        ):
-            result = adapter.launch_role(WORKSPACE, spec)
-        return adapter, result.context
+        context = adapter.open_context(
+            WORKSPACE, role=RoleName.PLANNER, access=Access.WRITE, launch=PLAN_LAUNCH
+        )
+        return adapter, context
 
     def test_happy_path_argv(self):
         runner = RecordingRunner([
