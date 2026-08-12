@@ -91,7 +91,10 @@ its best-effort work even on a role already ended — it never assumes. `sweep
 and ends those without you having to name them; a record `wait` (or a prior
 `sweep`) already ended is left alone and not reported.
 
-Acknowledge and keep waiting in one call:
+The ack is automatic (GRE-187): every `wait` persists the Delivery id it saw
+to a receipt on disk, and the next `wait` reads it back and sends it as the
+ack, with no flag needed. `--ack <delivery_id>` still exists, and still wins
+over the receipt, but it is now only for re-acking a specific id by hand:
 
 ```bash
 .symphonia/bin/spawn wait --ack <delivery_id> --timeout-ms 900000
@@ -121,12 +124,23 @@ and cannot be read back later.
 
 **Nothing pushes.** `worker_done` is mail into the Run mailbox. A finished
 worker changes nothing on your screen; the message sits there until you
-`check`. Delivery is FIFO and replays the same batch until you `--ack` it, so
-an unacked old batch hides every newer message behind it.
+`check`. Delivery is FIFO and replays the same batch until it is acked, so
+an unacked old batch hides every newer message behind it. Losing the
+terminal's stdout no longer loses the ack: the pending Delivery id is
+persisted to disk (`workflow/journal`'s receipt) before it is processed, so
+reopening the terminal and calling `wait` again picks it up and acks it —
+no id to recover from old output, and `spawn status` (no ticket) shows it
+under `pending_delivery` if you want to check without waiting.
 
-**A timeout is not a failure.** `check --wait` returning `count: 0` is a
-checkpoint. Planning and implementation routinely run 15–60 minutes. Keep
-waiting unless the terminal is gone or the human tells you to stop.
+**A timeout is not a failure — but an instant empty return might not be one
+either.** `check --wait` returning `count: 0` after the full `--timeout-ms`
+is a checkpoint; keep waiting unless the terminal is gone or the human tells
+you to stop. But an empty, `delivery_id`-less batch that comes back in a
+couple of seconds instead of blocking (measured live, ondas 9–10) is
+content-identical to a real timeout — the only tell is `wait`'s
+`elapsed_ms`, now returned alongside `delivery_id`. A tiny `elapsed_ms` with
+nothing in it means reconnect and call `wait` again, not that there is
+nothing to wait for.
 
 **A silent worker is not necessarily working.** Use `spawn status <TICKET>`:
 it reports the dispatch state and the declared tier's evidence — what kind

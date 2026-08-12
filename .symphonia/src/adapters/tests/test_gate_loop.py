@@ -6,8 +6,9 @@ covers is the shell around them — the lock that serializes `wait` and
 `verdict`, how an event is attributed to a role, and the order in which
 `verdict` records and delivers a decision. Most cases here are defects
 found in review of earlier versions, so each of those is a regression, not
-a hypothetical; the `TestBriefVerb` cases cover the `brief` verb itself,
-new feature rather than a regression.
+a hypothetical; the `TestBriefVerb` and `TestWaitPersistsDelivery` cases
+cover the `brief` verb and the delivery journal/receipt respectively — both
+new feature, not a regression.
 
 No network: `SPAWN.orca` and `SPAWN._linear.LinearTracker` are replaced.
 Run either way:
@@ -211,6 +212,99 @@ class TestWaitCountsRounds(GateLoopCase):
         self.assertEqual(second["question_id"], "q-2", "the verdict must follow the planner")
         self.assertEqual(second["approval_rounds"], 1, "re-asking is not a new round")
         self.assertEqual(self.tracker.gate_calls, [("GRE-1", True)], "label lit once")
+
+
+class TestWaitPersistsDelivery(GateLoopCase):
+    """GRE-187 stage A: the Delivery id no longer has to survive in a
+    terminal's stdout to be ackable. New feature, not a regression — like
+    `TestBriefVerb` above."""
+
+    def test_wait_writes_the_receipt_for_the_delivery_it_saw(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        self.assertEqual(self.spawn._journal.read_receipt(self.spawn.RUNTIME_DIR), "d1")
+
+    def test_second_wait_without_ack_sends_the_persisted_id(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+        self.calls.clear()
+
+        self.batch = {"deliveryId": "d2", "messages": []}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        check_call = self.calls[0]
+        self.assertIn("--ack", check_call)
+        self.assertEqual(check_call[check_call.index("--ack") + 1], "d1")
+
+    def test_explicit_ack_wins_over_the_persisted_receipt(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)  # persists a receipt for d1
+        self.calls.clear()
+
+        self.batch = {"deliveryId": "d2", "messages": []}
+        out = self.spawn.wait(ack="by-hand", timeout_ms=1)
+
+        check_call = self.calls[0]
+        self.assertEqual(check_call[check_call.index("--ack") + 1], "by-hand")
+        self.assertEqual(out["acked"], "by-hand")
+
+    def test_empty_delivery_id_persists_no_receipt_and_no_journal(self):
+        self.batch = {"deliveryId": "", "messages": []}
+
+        out = self.spawn.wait(ack=None, timeout_ms=1)
+
+        self.assertIsNone(out["acked"])
+        self.assertIsNone(self.spawn._journal.read_receipt(self.spawn.RUNTIME_DIR))
+        self.assertFalse((self.spawn.RUNTIME_DIR / "events.jsonl").exists())
+
+    def test_replay_of_the_same_unacked_delivery_auto_acks_and_does_not_double_count(self):
+        """Simulates the crash the receipt exists to survive: the terminal
+        dies after `wait` persists the receipt but before the ack is
+        visibly consumed, and Orca redelivers the identical batch. The next
+        `wait` must auto-ack it, and the gate's own replay-safety (already
+        proven in `TestWaitCountsRounds`) must keep `approval_rounds` from
+        counting the same submission twice."""
+
+        submission = (
+            "## Plan\nGRE-1 — comment abc\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+        )
+        question = self.message(
+            id="q-1", type="question", body=submission,
+            payload={"taskId": "task_1", "dispatchId": "ctx_1"},
+        )
+        self.batch = {"deliveryId": "d1", "messages": [question]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+        first = self.spawn.state_read()["GRE-1/planner"]
+        self.assertEqual(first["approval_rounds"], 1)
+        self.calls.clear()
+
+        # Same delivery, same message — Orca redelivering because the
+        # previous ack never landed.
+        out = self.spawn.wait(ack=None, timeout_ms=1)
+
+        check_call = self.calls[0]
+        self.assertEqual(check_call[check_call.index("--ack") + 1], "d1")
+        self.assertEqual(out["acked"], "d1")
+        second = self.spawn.state_read()["GRE-1/planner"]
+        self.assertEqual(second["approval_rounds"], 1, "replay must not double-count")
+
+    def test_journal_line_carries_the_full_body(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        lines = (self.spawn.RUNTIME_DIR / "events.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["body"], DONE_BODY)
+
+    def test_wait_return_value_carries_acked_and_elapsed_ms(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+
+        out = self.spawn.wait(ack=None, timeout_ms=1)
+
+        self.assertIsNone(out["acked"])
+        self.assertIsInstance(out["elapsed_ms"], int)
+        self.assertGreaterEqual(out["elapsed_ms"], 0)
 
 
 class TestVerdictOrdering(GateLoopCase):
