@@ -147,7 +147,10 @@ next role never has two files to choose between. A wave's cut of work goes
 to the ticket through `spawn brief`, never through a tracker client typed
 by hand — `build_brief` already composes every ticket comment into the
 next role's Execution Brief, so posting through the package is the whole
-job.
+job. `build_brief` runs at dispatch, not on a schedule: a comment posted
+after a role is already standing does not reach it — there is no channel
+to a live role. Posting and re-dispatching are a pair, in that order; the
+cut lands in the brief of the *next* dispatch, never the current one.
 
 **An empty `succeeded` is refused, not registered.** `spawn done <TICKET>
 --outcome succeeded` from a write-access, non-planner role is refused

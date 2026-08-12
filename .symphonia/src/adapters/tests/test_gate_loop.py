@@ -4,9 +4,10 @@ TLDR: `workflow.gate_loop.apply_gate_event`/`.run` are covered in
 `test_brief.py` and `workflow/tests/test_gate_loop.py`; what this file
 covers is the shell around them — the lock that serializes `wait` and
 `verdict`, how an event is attributed to a role, and the order in which
-`verdict` records and delivers a decision. Every case here is a defect
-found in review of the first version, so each one is a regression, not a
-hypothetical.
+`verdict` records and delivers a decision. Most cases here are defects
+found in review of earlier versions, so each of those is a regression, not
+a hypothetical; the `TestBriefVerb` cases cover the `brief` verb itself,
+new feature rather than a regression.
 
 No network: `SPAWN.orca` and `SPAWN._linear.LinearTracker` are replaced.
 Run either way:
@@ -326,6 +327,13 @@ class TestBriefVerb(GateLoopCase):
         missing = str(Path(self.tmp.name) / "does-not-exist.md")
         with self.assertRaises(SystemExit):
             self.spawn.brief("GRE-1", missing)
+        self.assertEqual(self.tracker.comments, [])
+
+    def test_a_directory_is_refused_before_any_post(self):
+        directory = Path(self.tmp.name) / "cut-dir"
+        directory.mkdir()
+        with self.assertRaises(SystemExit):
+            self.spawn.brief("GRE-1", str(directory))
         self.assertEqual(self.tracker.comments, [])
 
     def test_an_empty_file_is_refused_before_any_post(self):

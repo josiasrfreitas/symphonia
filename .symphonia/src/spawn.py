@@ -934,7 +934,7 @@ def brief(ticket: str, body_path: str) -> dict:
 
     ticket = ticket.upper()
     path = Path(body_path)
-    if not path.exists():
+    if not path.is_file():
         raise SystemExit(f"{body_path} does not exist; nothing to post")
     body = path.read_text()
     if not body.strip():
