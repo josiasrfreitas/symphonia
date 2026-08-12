@@ -520,7 +520,11 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         # Honest by construction (decision 3 of the GRE-186 S3 verdict):
         # `requested` is what launch itself can ever prove; nothing reads
         # this before `status()` calls `harness.observe()` for the strong
-        # check.
+        # check. Deliberately never re-read afterwards either: this records
+        # what was known at launch, and `observe()` is the live source of
+        # what's known now — reading the record back in its place would
+        # trade a live value for a stale one, the dishonesty this ticket
+        # exists to kill.
         "tier_evidence": {
             "kind": "requested",
             "tier": policy.tier.value,

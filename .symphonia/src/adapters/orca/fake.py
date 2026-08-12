@@ -377,16 +377,19 @@ _MODEL_TIERS = {model: tier for tier, model in TIER_MODELS.items()}
 
 
 def _requested_tier(command: str):
-    """Which tier a launch command asks for, read out of its `--model`.
+    """Raise unless a launch command's `--model` names a real, known model.
 
     The runtime carries no tier of its own now (GRE-186 S3) — this exists
     purely to catch a broken harness handing the scripted CLI a command
     that names no real model, never to feed a "requested vs. served"
-    comparison the runtime no longer makes. Matched on the model rather
-    than the whole string because the command also carries effort,
-    permission and session flags (GRE-179) — a fake that compared the
-    entire line would break every time the launcher gained a flag, which
-    is exactly the drift it exists to catch.
+    comparison the runtime no longer makes. The tier is returned for a
+    caller that wants it, but the assertion is the point: both failure
+    branches below raise explicitly, so the sole call site (`_terminal_
+    create`) can call this for its side effect alone and discard the
+    result. Matched on the model rather than the whole string because the
+    command also carries effort, permission and session flags (GRE-179) —
+    a fake that compared the entire line would break every time the
+    launcher gained a flag, which is exactly the drift it exists to catch.
     """
 
     parts = command.split()

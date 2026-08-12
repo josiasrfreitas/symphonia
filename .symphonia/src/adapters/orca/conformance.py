@@ -131,7 +131,7 @@ class ConformanceMixin:
 
         # 8. no graceful stop, and the zombie's late result: a fenced
         # attempt cannot be completed by the zombie that was doing it.
-        # Killing `fix` also frees `impl`'s write-access context — step 9
+        # Killing `fix` also frees `impl`'s write-access context — step 10
         # relies on that to relaunch a writer into the same workspace.
         with self.subTest(step=8):
             receipt = a.kill(fix)
