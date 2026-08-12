@@ -62,6 +62,10 @@ this document.
 
 ## Prior handoff
 
+If this lists a file, it is the handoff from the role before you — read it
+in full before doing anything else. It is all the context you get beyond
+this brief.
+
 {handoff_files}
 
 ## How to finish

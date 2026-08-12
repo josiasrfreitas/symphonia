@@ -439,35 +439,16 @@ class SpawnSubmitSingleRound(CharacterizationCase):
         self.assertEqual(out["verdict"], "approved")
 
 
-class BriefBatonText(CharacterizationCase):
-    """C4 of the GRE-186 S3 verdict, carried over onto the Brief: the
-    characterization scenarios above recompute `build_brief()` by calling
-    the function itself, so its text has no oracle anywhere else. GRE-187
-    moved the baton rule (produce the handoff, never launch the next role)
-    off `work_spec()` — deleted — and into each write role's own
-    `io:brief-template`, filled from `handoff_dir`/`handoff_hint`, now
-    values `build_brief()` supplies. Fixed here so a future edit to either
-    source is caught."""
-
-    def test_write_role_gets_the_baton_rule_with_handoff_dir_and_harness_hint(self):
-        brief = self.expected_brief(
-            self.RoleName.IMPLEMENTER, "GRE-1", "/workspaces/gre-1", branch="gre-1-implement",
-        )
-        self.assertIn("~/orca/.context/gre-1-implementer-<YYYY-MM-DD>.md", brief)
-        self.assertIn(
-            "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)", brief
-        )
-        self.assertIn("Do NOT\nhand ownership to anyone and do NOT launch another agent", brief)
-
-    def test_read_role_gets_the_read_only_line_and_no_skill_path(self):
-        brief = self.expected_brief(
-            self.RoleName.SPEC_REVIEWER, "GRE-1", "/workspaces/gre-1", branch="gre-1-review",
-        )
-        self.assertIn(
-            "You are read-only by construction: Edit/Write are disabled at launch.", brief
-        )
-        self.assertNotIn("SKILL.md", brief)
-        self.assertNotIn("handoff document", brief)
+# `BriefBatonText` (the GRE-186 S3 baton-text scenarios) lived here until
+# the GRE-187 correction round (C8/S6): it called `build_brief()` directly
+# through `expected_brief`, exactly like `test_brief.py`'s
+# `test_implementer_brief_carries_the_baton_rule` and
+# `test_reviewer_briefs_carry_the_read_only_line_and_no_handoff` — same
+# function, same fake tracker, no argv or dispatch path in between. Its own
+# docstring's justification ("the text has no oracle anywhere else") stopped
+# being true once `test_brief.py` grew those two tests, so it was a second
+# oracle for the same claim rather than added coverage. Removed; the two
+# tests in `test_brief.py` are the single house for this text now.
 
 
 if __name__ == "__main__":

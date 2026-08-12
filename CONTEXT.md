@@ -37,7 +37,7 @@ The intent, boundaries, dependencies, acceptance criteria, and global constraint
 _Avoid_: Prompt, specification
 
 **Local Technical Plan**:
-The Planner's repository-grounded execution plan appended to an Implementation Ticket and approved before implementation begins.
+The Planner's repository-grounded execution plan, approved before implementation begins and posted to the Implementation Ticket once approved.
 _Avoid_: Global plan, task prompt
 
 **Unlock**:

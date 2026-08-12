@@ -108,7 +108,10 @@ class TestBuildBrief(unittest.TestCase):
         """GRE-187: `work_spec()` is gone — the baton rule (write the
         handoff, never launch the next role) now lives in the implementer's
         own `io:brief-template`, filled by `build_brief()` from
-        `handoff_dir`/`handoff_hint`."""
+        `handoff_dir`/`handoff_hint`. The single oracle for this text — the
+        GRE-187 correction round (C8/S6) removed the mirror that used to
+        live in `test_spawn_characterization.py::BriefBatonText`, which
+        called this same function through the same fake tracker."""
 
         brief = SPAWN.build_brief(
             RoleName.IMPLEMENTER, "GRE-181", "/tmp/gre-181", tracker=self.tracker,
@@ -121,6 +124,8 @@ class TestBuildBrief(unittest.TestCase):
         self.assertIn(".symphonia/bin/spawn done GRE-181", brief)
 
     def test_reviewer_briefs_carry_the_read_only_line_and_no_handoff(self):
+        """The single oracle for this text — see the note on
+        `test_implementer_brief_carries_the_baton_rule` above."""
         for role in (RoleName.SPEC_REVIEWER, RoleName.STANDARDS_REVIEWER):
             brief = SPAWN.build_brief(role, "GRE-181", "/tmp/gre-181", tracker=self.tracker)
             self.assertIn(

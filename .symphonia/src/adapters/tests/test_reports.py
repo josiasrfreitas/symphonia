@@ -61,6 +61,21 @@ class TestPlanSubmissionGolden(unittest.TestCase):
         self.assertEqual(report.changes, "None.")
 
 
+class TestPlanSubmissionProseRequiresTheLocalTechnicalPlanSection(unittest.TestCase):
+    """GRE-187 correction C4: the example alone showed `## Local Technical
+    Plan` — a planner who read the prose and skipped the example could
+    submit a body without it, and `verdict()` now publishes that section
+    verbatim on approval. The prose must require it too, not just the
+    example."""
+
+    def test_prose_names_the_required_section(self):
+        text = PLANNER_MD.read_text()
+        start = text.index("### Plan submission")
+        end = text.index("```md io:example-submission", start)
+        prose = text[start:end]
+        self.assertIn("## Local Technical Plan", prose)
+
+
 class TestApprovalReplyGolden(unittest.TestCase):
     def test_parses_approved_with_notes(self):
         verdict = parse_approval_reply(_example("md io:example-approval"))

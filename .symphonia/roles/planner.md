@@ -88,7 +88,11 @@ Report short: no preamble, no recap of what the Orchestrator already knows.
 
 The message you send to ask for a verdict. The first line is exactly
 `## Plan`; a script (`is_plan_submission`) recognizes a submission by that
-line alone, never by reading the rest.
+line alone, never by reading the rest. The body must also carry the plan
+itself, in a `## Local Technical Plan` section after `## Changes` — the
+parser does not check for it, but `verdict()` publishes this section
+verbatim to the ticket once the plan is approved, so a submission without
+it publishes an empty plan.
 
 ```md io:example-submission
 ## Plan

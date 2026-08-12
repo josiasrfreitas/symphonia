@@ -267,7 +267,7 @@ def _adapter() -> _cli.OrcaRuntimeAdapter:
 # --- the spawn itself ----------------------------------------------------
 
 
-# --- the Execution Brief (planner input) ----------------------------------
+# --- the Execution Brief (every role's input) ------------------------------
 
 
 def _current_branch(workspace: str) -> str:
@@ -843,9 +843,11 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
 
     # The label is cosmetic next to the verdict; losing Linear must not make
     # a delivered verdict look like a failure.
+    tracker = None
     label = "cleared"
     try:
-        _linear.LinearTracker().set_gate(ticket, False)
+        tracker = _linear.LinearTracker()
+        tracker.set_gate(ticket, False)
     except Exception as exc:  # noqa: BLE001 - any tracker failure, reported not raised
         label = f"NOT cleared ({exc}); clear the human-gate label by hand"
 
@@ -855,15 +857,16 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
         # which would put an unapproved plan on the ticket, and never on a
         # REVISE, which would post one comment per round. `plan_body` is the
         # raw submission `wait` recorded off the genuine plan-question; a
-        # record from before this round carries no such field.
+        # record from before this round carries no such field. `body` is the
+        # same `## Approval` text just sent in the reply above — reused
+        # instead of recomputed from the same token/notes.
         plan_body = rec.get("plan_body")
         if plan_body is None:
             result["plan_copy"] = "NOT posted (no plan_body recorded)"
         else:
-            approval = _reports.format_approval_reply(token, note_lines)
-            comment = f"{plan_body.rstrip()}\n\n## Approval\n\n{approval}\n"
+            comment = f"{plan_body.rstrip()}\n\n## Approval\n\n{body}\n"
             try:
-                _linear.LinearTracker().post_comment(ticket, comment)
+                (tracker or _linear.LinearTracker()).post_comment(ticket, comment)
                 result["plan_copy"] = "posted"
             except Exception as exc:  # noqa: BLE001 - any tracker failure, reported not raised
                 result["plan_copy"] = f"NOT posted ({exc})"
