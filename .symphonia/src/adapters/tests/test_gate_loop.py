@@ -6,8 +6,9 @@ covers is the shell around them — the lock that serializes `wait` and
 `verdict`, how an event is attributed to a role, and the order in which
 `verdict` records and delivers a decision. Most cases here are defects
 found in review of earlier versions, so each of those is a regression, not
-a hypothetical; the `TestBriefVerb` cases cover the `brief` verb itself,
-new feature rather than a regression.
+a hypothetical; the `TestBriefVerb` and `TestWaitPersistsDelivery` cases
+cover the `brief` verb and the delivery journal/receipt respectively — both
+new feature, not a regression.
 
 No network: `SPAWN.orca` and `SPAWN._linear.LinearTracker` are replaced.
 Run either way:
@@ -211,6 +212,121 @@ class TestWaitCountsRounds(GateLoopCase):
         self.assertEqual(second["question_id"], "q-2", "the verdict must follow the planner")
         self.assertEqual(second["approval_rounds"], 1, "re-asking is not a new round")
         self.assertEqual(self.tracker.gate_calls, [("GRE-1", True)], "label lit once")
+
+
+class TestWaitPersistsDelivery(GateLoopCase):
+    """GRE-187 stage A: the Delivery id no longer has to survive in a
+    terminal's stdout to be ackable. New feature, not a regression — like
+    `TestBriefVerb` above."""
+
+    def test_wait_writes_the_receipt_for_the_delivery_it_saw(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        self.assertEqual(self.spawn._journal.read_receipt(self.spawn.RUNTIME_DIR), "d1")
+
+    def test_second_wait_without_ack_sends_the_persisted_id(self):
+        """The normal-path half of the ack ordering: no crash, so the
+        receipt the first call wrote (after its own `state_write`) is
+        exactly what the second call reads back and sends as `--ack`. The
+        crash half lives in
+        `test_a_missing_receipt_after_a_crash_sends_no_ack_and_the_replay_is_a_no_op`."""
+
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+        self.calls.clear()
+
+        self.batch = {"deliveryId": "d2", "messages": []}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        check_call = self.calls[0]
+        self.assertIn("--ack", check_call)
+        self.assertEqual(check_call[check_call.index("--ack") + 1], "d1")
+
+    def test_explicit_ack_wins_over_the_persisted_receipt(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)  # persists a receipt for d1
+        self.calls.clear()
+
+        self.batch = {"deliveryId": "d2", "messages": []}
+        out = self.spawn.wait(ack="by-hand", timeout_ms=1)
+
+        check_call = self.calls[0]
+        self.assertEqual(check_call[check_call.index("--ack") + 1], "by-hand")
+        self.assertEqual(out["acked"], "by-hand")
+
+    def test_empty_delivery_id_persists_no_receipt_and_no_journal(self):
+        self.batch = {"deliveryId": "", "messages": []}
+
+        out = self.spawn.wait(ack=None, timeout_ms=1)
+
+        self.assertIsNone(out["acked"])
+        self.assertIsNone(self.spawn._journal.read_receipt(self.spawn.RUNTIME_DIR))
+        self.assertFalse((self.spawn.RUNTIME_DIR / "events.jsonl").exists())
+
+    def test_a_missing_receipt_after_a_crash_sends_no_ack_and_the_replay_is_a_no_op(self):
+        """Simulates the crash the ordering in `wait` exists to survive: the
+        registry write for the round already landed, but the receipt for
+        the delivery that caused it never made it to disk (process died
+        between `state_write` and `write_receipt`). The next `wait` must
+        NOT send `--ack` for that delivery — nothing here proves Orca ever
+        saw one — so it redelivers the identical batch, and the gate's own
+        replay-safety (already proven in `TestWaitCountsRounds`) keeps
+        `approval_rounds` from counting the same submission twice."""
+
+        submission = (
+            "## Plan\nGRE-1 — comment abc\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+        )
+        question = self.message(
+            id="q-1", type="question", body=submission,
+            payload={"taskId": "task_1", "dispatchId": "ctx_1"},
+        )
+        self.batch = {"deliveryId": "d1", "messages": [question]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+        first = self.spawn.state_read()["GRE-1/planner"]
+        self.assertEqual(first["approval_rounds"], 1)
+        # The receipt this call just wrote never survived the crash.
+        self.spawn._journal.write_receipt(self.spawn.RUNTIME_DIR, "")
+        self.calls.clear()
+
+        # Orca redelivers the same, still-unacked batch.
+        out = self.spawn.wait(ack=None, timeout_ms=1)
+
+        check_call = self.calls[0]
+        self.assertNotIn("--ack", check_call)
+        self.assertIsNone(out["acked"])
+        second = self.spawn.state_read()["GRE-1/planner"]
+        self.assertEqual(second["approval_rounds"], 1, "replay must not double-count")
+
+    def test_journal_line_carries_the_full_body(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        lines = (self.spawn.RUNTIME_DIR / "events.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["body"], DONE_BODY)
+
+    def test_wait_return_value_carries_acked_and_elapsed_ms(self):
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+
+        out = self.spawn.wait(ack=None, timeout_ms=1)
+
+        self.assertIsNone(out["acked"])
+        self.assertIsInstance(out["elapsed_ms"], int)
+        self.assertGreaterEqual(out["elapsed_ms"], 0)
+
+    def test_status_without_a_ticket_reports_the_pending_delivery(self):
+        """`status(None)` fanned out from a flat list into an object with a
+        `pending_delivery` key read straight from the receipt — the only
+        piece of this round without a test before now."""
+
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        out = self.spawn.status(None)
+
+        self.assertEqual(out["pending_delivery"], "d1")
+        self.assertEqual([rec["key"] for rec in out["spawns"]], ["GRE-1/planner"])
 
 
 class TestVerdictOrdering(GateLoopCase):

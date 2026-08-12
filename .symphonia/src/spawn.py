@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 # Session ids are minted inside `ClaudeHarness.prepare()` now
 # (`adapters/harnesses/claude.py`, GRE-186 S3), not here — but `uuid` is
 # still imported so the name resolves as `spawn.uuid`. `claude.py` imports
@@ -70,6 +71,7 @@ from adapters.orca import events as _events
 from adapters.harnesses import claude as _claude
 import setup_worktree as _setup_worktree
 from workflow import gate_loop as _gate_loop
+from workflow import journal as _journal
 from workflow import roles as _roles
 
 # `.symphonia/`, the package root: two levels up from this file
@@ -536,7 +538,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
 # --- observation ---------------------------------------------------------
 
 
-def status(ticket: str | None) -> list[dict]:
+def status(ticket: str | None) -> list[dict] | dict:
     """Deterministic state per spawn: what the dispatch says, and what tier
     evidence the harness can produce — `harness.observe()` reads it,
     never this function guessing from a transcript itself (GRE-186 S3: the
@@ -547,7 +549,13 @@ def status(ticket: str | None) -> list[dict]:
     `tier_evidence` (the old `model_requested` shape) reads as
     `evidence_kind="unverifiable"`, named as a pre-GRE-186 record — nothing
     more elaborate than that; the record format is not a contract (decision
-    5 of the S3 verdict)."""
+    5 of the S3 verdict).
+
+    With a `ticket`, this stays the flat list every existing caller indexes
+    into. Without one — the whole-registry view — it wraps that same list
+    under `"spawns"` alongside `"pending_delivery"` (GRE-187): the open
+    Delivery id, read from `workflow.journal`'s receipt, so an unacked
+    `wait` is visible without recovering an id from old stdout."""
 
     adapter = _adapter()
     harness = _harness()
@@ -584,6 +592,8 @@ def status(ticket: str | None) -> list[dict]:
                 "terminal": rec["terminal"],
             }
         )
+    if ticket is None:
+        return {"pending_delivery": _journal.read_receipt(RUNTIME_DIR), "spawns": out}
     return out
 
 
@@ -779,6 +789,13 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     action is guarded by the recorded `gate_state` (and, for plan-question,
     by the event's own id), so a repeat is a no-op (see `plan_gate.py`).
 
+    `ack` defaults to the receipt `workflow.journal` persisted from the
+    previous call (GRE-187): the Delivery id no longer has to survive in a
+    terminal's stdout to be ackable, so reopening the Orchestrator's
+    terminal does not force a re-delivery of everything already seen. An
+    explicit `ack` still wins over the receipt — it exists for the one case
+    that isn't "ack whatever came last": re-acking a specific id by hand.
+
     The Linear tracker is built lazily, only when a gate action actually
     needs it — a `wait` that observes no gate action (the common case for
     every role but the planner) must work even without `LINEAR_API_KEY` set.
@@ -786,8 +803,22 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     The blocking `check --wait` runs BEFORE `state_lock()` is taken — it is
     the up-to-15-minute wait itself, and holding the lock across it would
     starve every concurrent `verdict` for as long as this call sits idle.
-    Only the read-modify-write that follows is locked.
+    Only the read-modify-write that follows is locked. Inside it, the
+    journal append happens BEFORE `gate_loop.run` (the raw event survives a
+    crash mid-processing even if the round it started is never recorded),
+    and the receipt write happens AFTER `state_write` — the delivery is
+    only marked acked once the outcome it acks is durable on disk. A crash
+    anywhere before the receipt is written leaves the delivery unacked: the
+    next `wait` sends no `--ack`, Orca redelivers the identical batch, and
+    `gate_loop.run` replays it — a no-op by construction (see above).
+    Writing the receipt any earlier would risk acking a delivery whose
+    processing never made it to `state_write`, which silently skips the
+    round it belonged to; a lost receipt (forcing a harmless replay), not a
+    suppressed one, is the failure this ordering exists to prevent.
     """
+
+    if ack is None:
+        ack = _journal.read_receipt(RUNTIME_DIR)
 
     argv = [
         "orchestration", "check", "--wait",
@@ -796,16 +827,36 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     ]
     if ack:
         argv += ["--ack", ack]
+    started = time.monotonic()
     batch_raw = orca(*argv)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     # `orca()` already unwraps the envelope; `parse_check_output` expects the
     # raw JSON text of `check --peek/--wait --json`, so it is fed back in —
     # the same helper serves both call sites without a second parser.
     batch = _events.parse_check_output(json.dumps(batch_raw))
     events = _events.gate_events(batch.messages)
     raw_by_id = {m.id: m for m in batch.messages}
+    # Every mailbox message, not just the ones typed as gate events — an
+    # escalation or a non-planner question must stay visible to the
+    # Orchestrator even though the gate itself has nothing to do with it.
+    # Built once, reused for both the journal and the return value.
+    message_dicts = [
+        {
+            "id": m.id, "type": m.type, "subject": m.subject,
+            "body": m.body, "payload": m.payload, "sender": m.sender,
+        }
+        for m in batch.messages
+    ]
 
     with state_lock():
         data = state_read()
+        # Journaled before processing: the journal is an append-only record,
+        # not state, so a replay re-appending the same lines for the same
+        # `delivery_id` is acceptable — each line already carries that id,
+        # so a duplicate is identifiable by a reader, and deduping it would
+        # need its own persisted "seen" set, which is exactly the kind of
+        # state this module was built to avoid holding (GRE-187 onda 11).
+        _journal.append_events(RUNTIME_DIR, batch.delivery_id, message_dicts)
         actions_taken, unattributed = _gate_loop.run(
             events, raw_by_id, data,
             tracker=lambda: _linear.LinearTracker(),
@@ -813,18 +864,20 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
             gate_role=GATE_ROLE.value,
         )
         state_write(data)
+        # The receipt is written LAST, only after the registry write above
+        # is durable — see the docstring for why (GRE-187 onda 11 reverted
+        # writing it earlier).
+        _journal.write_receipt(RUNTIME_DIR, batch.delivery_id)
     return {
         "delivery_id": batch.delivery_id,
-        # Every mailbox message, not just the ones typed as gate events —
-        # an escalation or a non-planner question must stay visible to the
-        # Orchestrator even though the gate itself has nothing to do with it.
-        "events": [
-            {
-                "id": m.id, "type": m.type, "subject": m.subject,
-                "body": m.body, "payload": m.payload, "sender": m.sender,
-            }
-            for m in batch.messages
-        ],
+        "acked": ack or None,
+        # An empty batch back in a couple of seconds, instead of blocking
+        # for the requested timeout, is the anomaly measured live in ondas
+        # 9-10: content-identical to a legitimate empty timeout, elapsed
+        # time is the only observable difference. Surfaced here so it stops
+        # passing for a real timeout unnoticed.
+        "elapsed_ms": elapsed_ms,
+        "events": message_dicts,
         "actions": actions_taken,
         "unattributed": unattributed,
     }
@@ -1212,7 +1265,12 @@ def main() -> int:
     p = sub.add_parser("sweep")
     p.add_argument("ticket", nargs="?")
     p = sub.add_parser("wait")
-    p.add_argument("--ack", help="Delivery id to acknowledge before waiting again.")
+    p.add_argument(
+        "--ack",
+        help="Delivery id to acknowledge before waiting again. Normally automatic "
+        "— the previous Delivery's id is read from the persisted receipt. Pass "
+        "this only to re-ack a specific id by hand.",
+    )
     p.add_argument("--timeout-ms", type=int, default=900000)
     p = sub.add_parser("verdict")
     p.add_argument("ticket")
