@@ -71,7 +71,8 @@ wins.
 
 ## How to finish
 
-Before you finish, write your handoff document following {handoff_hint}.
+Commit your work on the ticket's branch — uncommitted work does not survive
+you. Then, before you finish, write your handoff document following {handoff_hint}.
 Save it as {handoff_dir}/{ticket_lower}.md, replacing the previous document
 if one exists — one current handoff per ticket. Carry forward anything from
 it that still matters. Do NOT hand ownership to anyone and do NOT launch

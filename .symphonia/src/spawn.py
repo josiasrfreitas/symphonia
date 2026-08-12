@@ -1052,6 +1052,12 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
     `head_at_dispatch`. Both fire BEFORE anything is sent, same as the
     planner's parse checks above: the one shot a dispatch grants is never
     spent on an empty success.
+
+    A third case never refuses: the same role reporting `succeeded` with a
+    dirty tree but no new commit. That is real work, just not persisted —
+    refusing it would destroy the report to save a five-second `git commit`.
+    It is accepted and flagged `uncommitted_work: true` on the record
+    instead, so the Orchestrator can check without opening the worktree.
     """
 
     ticket = ticket.upper()
@@ -1085,9 +1091,15 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
     if outcome == "succeeded" and rec.get("access") == "write" and rec["role"] != GATE_ROLE.value:
         baseline = rec.get("head_at_dispatch")
         if not baseline:
+            # No baseline means the whole check is skipped, dirty-tree half
+            # included — not just the HEAD comparison. A record from before
+            # this round has no dirty-tree evidence to trust either, and
+            # refusing on a partial check would trap an old record with a
+            # clean tree, which is exactly what this skip exists to avoid.
             print(
                 f"note: {ticket}/{rec['role']} has no head_at_dispatch recorded "
-                f"(pre-GRE-187 dispatch); skipping the empty-success check", file=sys.stderr,
+                f"(pre-GRE-187 dispatch); skipping the empty-success check entirely "
+                f"(HEAD comparison and dirty-tree check both)", file=sys.stderr,
             )
         else:
             measured = _worktree_measurement(rec["worktree"])
@@ -1107,6 +1119,22 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
                         f"`--outcome failed --file <report explaining why>` instead, so the "
                         f"Orchestrator can decide."
                     )
+                if head_now == baseline and dirty:
+                    # The dirty tree is real work — this is not the empty
+                    # success above — but it never made it into a commit, and
+                    # uncommitted work does not survive the worktree. Accept,
+                    # never refuse: flag it on the record so the Orchestrator
+                    # can check without opening the worktree by hand.
+                    print(
+                        f"note: {ticket}/{rec['role']} outcome=succeeded but HEAD is still "
+                        f"{head_now} (same as at dispatch) — the tree is dirty but nothing was "
+                        f"committed; flagging uncommitted_work on the record", file=sys.stderr,
+                    )
+                    with state_lock():
+                        data = state_read()
+                        if key in data:
+                            data[key]["uncommitted_work"] = True
+                            state_write(data)
 
     argv = [
         "orchestration", "send",

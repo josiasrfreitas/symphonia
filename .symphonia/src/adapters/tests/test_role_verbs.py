@@ -315,12 +315,29 @@ class TestDoneEmptySuccess(unittest.TestCase):
         )
         self.assertEqual(len(self.calls), 1)
 
-    def test_an_uncommitted_change_sends(self):
+    def test_an_uncommitted_change_sends_and_flags_the_record(self):
+        """Real work, just never committed — accepted, not refused, but the
+        record is flagged so the Orchestrator can check without opening the
+        worktree by hand (correction round: implementer delivered good work
+        and never ran `git commit`)."""
+
         (self.repo / "c.txt").write_text("z")
         self.spawn.done(
             "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
         )
         self.assertEqual(len(self.calls), 1)
+        rec = self.spawn.state_read()["GRE-1/implementer"]
+        self.assertTrue(rec["uncommitted_work"])
+
+    def test_a_new_commit_does_not_flag_the_record(self):
+        (self.repo / "b.txt").write_text("y")
+        subprocess.run(["git", "add", "b.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "work"], cwd=self.repo, check=True)
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        rec = self.spawn.state_read()["GRE-1/implementer"]
+        self.assertNotIn("uncommitted_work", rec)
 
     def test_failed_outcome_with_clean_worktree_sends(self):
         self.spawn.done(
@@ -361,7 +378,12 @@ class TestDoneEmptySuccess(unittest.TestCase):
         )
         self.assertEqual(len(self.calls), 1)
 
-    def test_empty_body_refuses_regardless_of_role_or_outcome(self):
+    def test_empty_body_refuses(self):
+        """One case (implementer, failed) is enough: the check sits before
+        any role/outcome branch in `done()`, so it never sees either — the
+        guarantee comes from that position in the code, not from exercising
+        every combination here."""
+
         with self.assertRaises(SystemExit) as ctx:
             self.spawn.done("GRE-1", self.body_file("   \n"), outcome="failed", files_modified="")
         self.assertIn("empty report", str(ctx.exception))
