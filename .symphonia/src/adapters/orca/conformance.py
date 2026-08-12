@@ -49,6 +49,19 @@ class ConformanceMixin:
     adapter: object
     rig: Rig
 
+    def batch_cap(self) -> int:
+        """Subclass hook (GRE-188 S2): the mailbox's FIFO batch cap. Default
+        is the fake's own number (``FakeRuntime.batch_cap``) — unoverridden
+        by ``FakeConformance``, so its step-9 assertion stays byte-identical
+        to before this hook existed; nothing loosens in the fake."""
+        return 3
+
+    def quiet_threshold_ms(self) -> int:
+        """Subclass hook (GRE-188 S2): how quiet an attempt must sit before
+        ``sweep()`` must report it IDLE. Default is the fake's own number.
+        Unoverridden by ``FakeConformance`` for the same reason as above."""
+        return TEN_MINUTES
+
     def test_walkthrough(self):
         a, rig = self.adapter, self.rig
 
@@ -113,12 +126,13 @@ class ConformanceMixin:
         # failure is the absence of one — sweep, not drain, finds it.
         with self.subTest(step=6):
             orphan = a.dispatch(impl, "One more thing.")
-            rig.go_quiet(impl, 11 * 60 * 1000)
+            quiet_ms = self.quiet_threshold_ms()
+            rig.go_quiet(impl, quiet_ms)
             self.assertEqual(a.drain(ALL_KINDS).events, ())
             statuses = {s.attempt_id: s for s in a.sweep()}
             status = statuses[orphan.attempt_id]
             self.assertIs(status.liveness, Liveness.IDLE)
-            self.assertGreaterEqual(status.quiet_for_ms, TEN_MINUTES)
+            self.assertGreaterEqual(status.quiet_for_ms, quiet_ms)
 
         # 7. the stolen control binding: reclaimed automatically, reported
         # loudly — a silent reclaim would hide the breach.
@@ -144,15 +158,17 @@ class ConformanceMixin:
         # 9. the mailbox cap: a capped FIFO batch, replayed until acked —
         # the core has to be idempotent per attempt.
         with self.subTest(step=9):
-            for i in range(5):
+            cap = self.batch_cap()
+            total = cap + 2
+            for i in range(total):
                 rig.post_escalation(orphan, f"escalation {i}")
             first = a.drain(["escalation"])
-            self.assertEqual([e.reason for e in first.events], ["escalation 0", "escalation 1", "escalation 2"])
+            self.assertEqual([e.reason for e in first.events], [f"escalation {i}" for i in range(cap)])
             redelivered = a.drain(["escalation"])  # no ack in between
             self.assertEqual([e.reason for e in redelivered.events], [e.reason for e in first.events])
             a.ack(redelivered.receipt)
             rest = a.drain(["escalation"])
-            self.assertEqual([e.reason for e in rest.events], ["escalation 3", "escalation 4"])
+            self.assertEqual([e.reason for e in rest.events], [f"escalation {i}" for i in range(cap, total)])
             a.ack(rest.receipt)
             self.assertEqual(a.drain(["escalation"]).events, ())
 
