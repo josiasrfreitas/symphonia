@@ -140,7 +140,16 @@ role with a fresh dispatch.
 
 **You spawn; roles never do.** A role that finishes writes its handoff
 document and dies. It does not launch its successor and it does not hand
-ownership to anyone. Every transition goes through you.
+ownership to anyone. Every transition goes through you. The handoff is one
+current document per ticket — each role overwrites the same path, so the
+next role never has two files to choose between.
+
+**An empty `succeeded` is refused, not registered.** `spawn done <TICKET>
+--outcome succeeded` from a write-access, non-planner role is refused
+outright if the worktree shows no change — same HEAD as at dispatch and a
+clean `git status`. An empty body is refused for every role, on either
+outcome. Both checks run before anything is sent, so an empty success never
+reaches the registry to begin with.
 
 ## Where the decisions live
 

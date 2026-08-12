@@ -206,6 +206,7 @@ class SpawnPlanHappyPath(CharacterizationCase):
                 "dispatch": {"id": "disp-1"},
                 "preamble": "orca orchestration send --dispatch-capability dcap_ABC123 --type worker_done",
             })),
+            _proc("sha-1\n"),                                            # 12 _head (head_at_dispatch)
         ])
 
         record = self.spawn.spawn(self.RoleName.PLANNER, ticket, fresh_worktree=True)
@@ -227,10 +228,12 @@ class SpawnPlanHappyPath(CharacterizationCase):
             ["orchestration", "task-create", "--spec", brief],
             ["orchestration", "dispatch", "--task", "task-1", "--to", "term-1",
              "--inject", "--return-preamble"],
+            ["git", "-C", path, "rev-parse", "HEAD"],
         ])
         self.assertEqual(record["capability"], "dcap_ABC123")
         self.assertEqual(record["worktree"], path)
         self.assertEqual(record["terminal"], "term-1")
+        self.assertEqual(record["head_at_dispatch"], "sha-1")
 
 
 class SpawnPlanNoCapability(CharacterizationCase):
@@ -291,6 +294,7 @@ class SpawnImplementReusesWorktree(CharacterizationCase):
                 "dispatch": {"id": "disp-2"},
                 "preamble": "orca orchestration send --dispatch-capability dcap_DEF456 --type worker_done",
             })),
+            _proc("sha-2\n"),                                          # _head (head_at_dispatch)
         ])
 
         record = self.spawn.spawn(self.RoleName.IMPLEMENTER, ticket, fresh_worktree=False)
@@ -306,8 +310,10 @@ class SpawnImplementReusesWorktree(CharacterizationCase):
             ["orchestration", "task-create", "--spec", expected_spec],
             ["orchestration", "dispatch", "--task", "task-2", "--to", "term-2",
              "--inject", "--return-preamble"],
+            ["git", "-C", path, "rev-parse", "HEAD"],
         ])
         self.assertEqual(record["capability"], "dcap_DEF456")
+        self.assertEqual(record["head_at_dispatch"], "sha-2")
 
 
 class SpawnStatusAndRetire(CharacterizationCase):
