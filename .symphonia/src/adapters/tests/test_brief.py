@@ -269,9 +269,10 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
         self.assertEqual(rec["gate_state"], SPAWN._gate.SUBMITTED)
         self.assertEqual(rec["question_id"], "q-1")
         self.assertEqual(rec["last_question_id"], "q-1")
-        # what the parser found is kept, not thrown away
-        self.assertEqual(rec["plan_pointer"], "pointer")
-        self.assertEqual(rec["plan_decisions"], ["1. x"])
+        # the pointer/decisions the parser found are validation only now —
+        # the record never carries them, so the digest residue cannot return
+        self.assertNotIn("plan_pointer", rec)
+        self.assertNotIn("plan_decisions", rec)
         self.assertEqual(rec["approval_rounds"], 1)
         # the raw submission is recorded too — `spawn.verdict` republishes
         # it on approval, never on submission
@@ -360,7 +361,7 @@ class TestApplyGateEventWorkerDone(unittest.TestCase):
         actions = GATE_LOOP.apply_gate_event(rec, self._done(), {"d-1": raw})
         self.assertEqual(actions, [(SPAWN._gate.RETIRE_PLANNER, None)])
         self.assertEqual(rec["gate_state"], SPAWN._gate.RETIRED)
-        self.assertEqual(rec["plan_pointer_final"], "pointer")
+        self.assertNotIn("plan_pointer_final", rec)
         self.assertEqual(rec["deviations"], [])
 
     def test_report_that_does_not_parse_is_flagged_not_retired(self):

@@ -56,11 +56,13 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
     starts `## Plan` but does not otherwise parse is flagged rather than
     silently accepted or silently ignored.
 
-    What the parsers return is kept, not discarded: the plan's pointer, the
-    round count, and the raw submission body (`plan_body`, republished by
-    `spawn.verdict` on approval — never here) all come from here, and the
-    Ticket Key on the `## Plan` line is checked against the record so a
-    report filed under the wrong ticket is caught rather than counted.
+    What the parser returns is kept, not discarded: the round count and the
+    raw submission body (`plan_body`, republished by `spawn.verdict` on
+    approval — never here) both come from here, and the Ticket Key on the
+    `## Plan` line is checked against the record so a report filed under the
+    wrong ticket is caught rather than counted. The pointer and decisions the
+    parser also returns are validation only now — `wait` delivers the plan
+    inline, so neither is worth a field in the record.
     """
 
     state = rec.get("gate_state", IDLE)
@@ -96,8 +98,10 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
         if result.question_id:
             rec["question_id"] = result.question_id
             rec["last_question_id"] = result.question_id
-            rec["plan_pointer"] = submission.pointer
-            rec["plan_decisions"] = list(submission.decisions)
+            # Kept in the same transaction as gate_state (one state_write,
+            # under one state_lock) because spawn.verdict republishes this
+            # exact string on approval — a sidecar file would let the two
+            # drift apart between wait and verdict.
             rec["plan_body"] = event.question
             if result.state == _gate.SUBMITTED and state != _gate.SUBMITTED:
                 # A round is a plan put in front of the human, counted here
@@ -113,7 +117,6 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
             malformed_reason = str(exc)
         result = _gate.transition(state, event, report_ok=report_ok)
         if report is not None:
-            rec["plan_pointer_final"] = report.plan_pointer
             rec["deviations"] = list(report.deviations)
         if not report_ok and _gate.FLAG_MALFORMED in result.actions:
             rec["gate_state"] = result.state

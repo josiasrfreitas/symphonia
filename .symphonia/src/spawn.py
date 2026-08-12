@@ -2,9 +2,9 @@
 """The whole spawn interface the Orchestrator is allowed to use.
 
 TLDR: the four role verbs take one argument each — a Ticket Key — plus
-`status`, `retire`, `sweep`, and the plan gate pair `wait`/`verdict`. The
-Orchestrator never picks a model, a permission flag, a worktree or a launch
-path; every one of those is decided here. If a command below does not
+`status`, `retire`, `sweep`, `brief`, and the plan gate pair `wait`/`verdict`.
+The Orchestrator never picks a model, a permission flag, a worktree or a
+launch path; every one of those is decided here. If a command below does not
 express what you need, that is a package change, not an improvisation at
 the terminal.
 
@@ -15,6 +15,7 @@ the terminal.
     .symphonia/bin/spawn status          [GRE-181]
     .symphonia/bin/spawn retire           GRE-181 planner
     .symphonia/bin/spawn sweep           [GRE-181]
+    .symphonia/bin/spawn brief            GRE-181 --file cut.md
     .symphonia/bin/spawn wait             [--ack <delivery_id>] [--timeout-ms <ms>]
     .symphonia/bin/spawn verdict          GRE-181 approved|revise [--notes <text>|--notes-file <path>]
 
@@ -918,6 +919,31 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     return result
 
 
+def brief(ticket: str, body_path: str) -> dict:
+    """Post a wave's coordination note as a ticket comment — the
+    Orchestrator's sanctioned way to hand a role a cut of work, instead of
+    typing into the tracker's own client by hand. `build_brief` already
+    composes every ticket comment into the Execution Brief every role
+    opens with, so posting the comment IS the whole job here — unlike
+    `verdict`, where posting a comment is a side effect of a verdict
+    already delivered (and a tracker failure there is reported, not
+    raised), here nothing else happens if the post fails, so there is no
+    try/except: `LinearError` (`linear_not_connected` included) propagates
+    with its own traceback, never a silent fallback to another client.
+    """
+
+    ticket = ticket.upper()
+    path = Path(body_path)
+    if not path.exists():
+        raise SystemExit(f"{body_path} does not exist; nothing to post")
+    body = path.read_text()
+    if not body.strip():
+        raise SystemExit(f"{body_path} is empty; an empty cut of work coordinates nothing")
+
+    comment = _linear.LinearTracker().post_comment(ticket, body)
+    return {"ticket": ticket, "posted": True, "comment": comment.id}
+
+
 # --- the role's own two verbs ---------------------------------------------
 #
 # Everything above is run by the Orchestrator. The two below are run BY A
@@ -1193,6 +1219,9 @@ def main() -> int:
     p.add_argument("decision", choices=["approved", "revise"])
     p.add_argument("--notes", default="")
     p.add_argument("--notes-file")
+    p = sub.add_parser("brief")
+    p.add_argument("ticket")
+    p.add_argument("--file", required=True, help="Path to the coordination note to post.")
     # The role's own two verbs. Run inside a dispatched terminal, by the role
     # itself — the Orchestrator never calls these.
     p = sub.add_parser("submit")
@@ -1224,6 +1253,8 @@ def main() -> int:
         if args.notes_file:
             notes = (notes + "\n" + Path(args.notes_file).read_text()).strip()
         print(json.dumps(verdict(args.ticket, args.decision, notes), indent=2))
+    elif args.verb == "brief":
+        print(json.dumps(brief(args.ticket, args.file), indent=2))
     elif args.verb == "submit":
         print(json.dumps(
             submit(args.ticket, args.file, max_wait_ms=args.max_wait_ms), indent=2

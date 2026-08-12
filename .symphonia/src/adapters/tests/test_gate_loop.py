@@ -24,6 +24,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 PACKAGE = Path(__file__).resolve().parents[2]  # .symphonia/src, the sys.path root since the move
 sys.path.insert(0, str(PACKAGE))
@@ -53,6 +54,7 @@ class FakeTracker:
         if self.fail_comment:
             raise RuntimeError("linear unreachable")
         self.comments.append((ticket, body))
+        return SimpleNamespace(id=f"comment-{len(self.comments)}")
 
     def set_attention(self, ticket, attention):
         self.attention.append((ticket, attention))
@@ -302,6 +304,39 @@ class TestVerdictPublishesThePlanCopy(GateLoopCase):
         out = self.spawn.verdict("GRE-1", "approved", "")
         self.assertEqual(out["plan_copy"], "NOT posted (no plan_body recorded)")
         self.assertEqual(self.tracker.comments, [])
+
+
+class TestBriefVerb(GateLoopCase):
+    """GRE-187 item 2: `spawn brief` is the Orchestrator's only sanctioned
+    way to post a cut of work to the ticket — no try/except, because here
+    posting the comment IS the work, unlike `verdict`'s cosmetic label/plan
+    copy where a tracker failure is reported, not raised."""
+
+    def _write(self, body):
+        path = Path(self.tmp.name) / "cut.md"
+        path.write_text(body)
+        return str(path)
+
+    def test_posts_the_file_body_verbatim_on_the_right_ticket(self):
+        out = self.spawn.brief("GRE-1", self._write("Recorte da onda 10.\n"))
+        self.assertEqual(out, {"ticket": "GRE-1", "posted": True, "comment": "comment-1"})
+        self.assertEqual(self.tracker.comments, [("GRE-1", "Recorte da onda 10.\n")])
+
+    def test_a_missing_file_is_refused_before_any_post(self):
+        missing = str(Path(self.tmp.name) / "does-not-exist.md")
+        with self.assertRaises(SystemExit):
+            self.spawn.brief("GRE-1", missing)
+        self.assertEqual(self.tracker.comments, [])
+
+    def test_an_empty_file_is_refused_before_any_post(self):
+        with self.assertRaises(SystemExit):
+            self.spawn.brief("GRE-1", self._write("   \n\n"))
+        self.assertEqual(self.tracker.comments, [])
+
+    def test_a_tracker_failure_propagates_never_swallowed(self):
+        self.tracker.fail_comment = True
+        with self.assertRaises(RuntimeError):
+            self.spawn.brief("GRE-1", self._write("Recorte.\n"))
 
 
 class TestRegistryLocation(GateLoopCase):
