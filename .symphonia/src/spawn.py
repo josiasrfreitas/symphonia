@@ -803,13 +803,18 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     The blocking `check --wait` runs BEFORE `state_lock()` is taken — it is
     the up-to-15-minute wait itself, and holding the lock across it would
     starve every concurrent `verdict` for as long as this call sits idle.
-    Only the read-modify-write that follows is locked, and the journal
-    append + receipt write happen inside that same section, BEFORE
-    `gate_loop.run` — persisting the batch is what makes a crash between
-    delivery and processing survivable: the next `wait` auto-acks the same
-    id, `gate_loop.run` replays it, and the replay is a no-op by
-    construction (see above). A lost receipt, not a replayed one, is the
-    failure this ordering exists to prevent.
+    Only the read-modify-write that follows is locked. Inside it, the
+    journal append happens BEFORE `gate_loop.run` (the raw event survives a
+    crash mid-processing even if the round it started is never recorded),
+    and the receipt write happens AFTER `state_write` — the delivery is
+    only marked acked once the outcome it acks is durable on disk. A crash
+    anywhere before the receipt is written leaves the delivery unacked: the
+    next `wait` sends no `--ack`, Orca redelivers the identical batch, and
+    `gate_loop.run` replays it — a no-op by construction (see above).
+    Writing the receipt any earlier would risk acking a delivery whose
+    processing never made it to `state_write`, which silently skips the
+    round it belonged to; a lost receipt (forcing a harmless replay), not a
+    suppressed one, is the failure this ordering exists to prevent.
     """
 
     if ack is None:
@@ -845,8 +850,13 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
 
     with state_lock():
         data = state_read()
+        # Journaled before processing: the journal is an append-only record,
+        # not state, so a replay re-appending the same lines for the same
+        # `delivery_id` is acceptable — each line already carries that id,
+        # so a duplicate is identifiable by a reader, and deduping it would
+        # need its own persisted "seen" set, which is exactly the kind of
+        # state this module was built to avoid holding (GRE-187 onda 11).
         _journal.append_events(RUNTIME_DIR, batch.delivery_id, message_dicts)
-        _journal.write_receipt(RUNTIME_DIR, batch.delivery_id)
         actions_taken, unattributed = _gate_loop.run(
             events, raw_by_id, data,
             tracker=lambda: _linear.LinearTracker(),
@@ -854,6 +864,10 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
             gate_role=GATE_ROLE.value,
         )
         state_write(data)
+        # The receipt is written LAST, only after the registry write above
+        # is durable — see the docstring for why (GRE-187 onda 11 reverted
+        # writing it earlier).
+        _journal.write_receipt(RUNTIME_DIR, batch.delivery_id)
     return {
         "delivery_id": batch.delivery_id,
         "acked": ack or None,

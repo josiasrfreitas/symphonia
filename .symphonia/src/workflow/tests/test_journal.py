@@ -30,7 +30,7 @@ class AppendEvents(unittest.TestCase):
         self.runtime_dir = Path(self._tmp.name)
 
     def _lines(self):
-        path = self.runtime_dir / journal_events_file()
+        path = self.runtime_dir / JOURNAL.EVENTS_FILE
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text().splitlines()]
@@ -53,7 +53,7 @@ class AppendEvents(unittest.TestCase):
     def test_empty_batch_writes_nothing(self):
         JOURNAL.append_events(self.runtime_dir, "", [])
 
-        self.assertFalse((self.runtime_dir / journal_events_file()).exists())
+        self.assertFalse((self.runtime_dir / JOURNAL.EVENTS_FILE).exists())
 
     def test_line_carries_full_body(self):
         JOURNAL.append_events(self.runtime_dir, "d-1", [MESSAGE])
@@ -87,7 +87,7 @@ class Receipt(unittest.TestCase):
         JOURNAL.write_receipt(self.runtime_dir, "")
 
         self.assertIsNone(JOURNAL.read_receipt(self.runtime_dir))
-        self.assertFalse((self.runtime_dir / journal_receipt_file()).exists())
+        self.assertFalse((self.runtime_dir / JOURNAL.RECEIPT_FILE).exists())
 
     def test_removing_receipt_when_none_exists_does_not_raise(self):
         JOURNAL.write_receipt(self.runtime_dir, "")  # no prior write_receipt call
@@ -101,14 +101,6 @@ class Receipt(unittest.TestCase):
         leftovers = list(self.runtime_dir.glob("*.tmp"))
         self.assertEqual(leftovers, [])
         self.assertEqual(JOURNAL.read_receipt(self.runtime_dir), "d-2")
-
-
-def journal_events_file() -> str:
-    return JOURNAL.EVENTS_FILE
-
-
-def journal_receipt_file() -> str:
-    return JOURNAL.RECEIPT_FILE
 
 
 if __name__ == "__main__":

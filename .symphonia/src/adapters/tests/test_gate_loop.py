@@ -226,6 +226,12 @@ class TestWaitPersistsDelivery(GateLoopCase):
         self.assertEqual(self.spawn._journal.read_receipt(self.spawn.RUNTIME_DIR), "d1")
 
     def test_second_wait_without_ack_sends_the_persisted_id(self):
+        """The normal-path half of the ack ordering: no crash, so the
+        receipt the first call wrote (after its own `state_write`) is
+        exactly what the second call reads back and sends as `--ack`. The
+        crash half lives in
+        `test_a_missing_receipt_after_a_crash_sends_no_ack_and_the_replay_is_a_no_op`."""
+
         self.batch = {"deliveryId": "d1", "messages": [self.message()]}
         self.spawn.wait(ack=None, timeout_ms=1)
         self.calls.clear()
@@ -258,13 +264,15 @@ class TestWaitPersistsDelivery(GateLoopCase):
         self.assertIsNone(self.spawn._journal.read_receipt(self.spawn.RUNTIME_DIR))
         self.assertFalse((self.spawn.RUNTIME_DIR / "events.jsonl").exists())
 
-    def test_replay_of_the_same_unacked_delivery_auto_acks_and_does_not_double_count(self):
-        """Simulates the crash the receipt exists to survive: the terminal
-        dies after `wait` persists the receipt but before the ack is
-        visibly consumed, and Orca redelivers the identical batch. The next
-        `wait` must auto-ack it, and the gate's own replay-safety (already
-        proven in `TestWaitCountsRounds`) must keep `approval_rounds` from
-        counting the same submission twice."""
+    def test_a_missing_receipt_after_a_crash_sends_no_ack_and_the_replay_is_a_no_op(self):
+        """Simulates the crash the ordering in `wait` exists to survive: the
+        registry write for the round already landed, but the receipt for
+        the delivery that caused it never made it to disk (process died
+        between `state_write` and `write_receipt`). The next `wait` must
+        NOT send `--ack` for that delivery — nothing here proves Orca ever
+        saw one — so it redelivers the identical batch, and the gate's own
+        replay-safety (already proven in `TestWaitCountsRounds`) keeps
+        `approval_rounds` from counting the same submission twice."""
 
         submission = (
             "## Plan\nGRE-1 — comment abc\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
@@ -277,15 +285,16 @@ class TestWaitPersistsDelivery(GateLoopCase):
         self.spawn.wait(ack=None, timeout_ms=1)
         first = self.spawn.state_read()["GRE-1/planner"]
         self.assertEqual(first["approval_rounds"], 1)
+        # The receipt this call just wrote never survived the crash.
+        self.spawn._journal.write_receipt(self.spawn.RUNTIME_DIR, "")
         self.calls.clear()
 
-        # Same delivery, same message — Orca redelivering because the
-        # previous ack never landed.
+        # Orca redelivers the same, still-unacked batch.
         out = self.spawn.wait(ack=None, timeout_ms=1)
 
         check_call = self.calls[0]
-        self.assertEqual(check_call[check_call.index("--ack") + 1], "d1")
-        self.assertEqual(out["acked"], "d1")
+        self.assertNotIn("--ack", check_call)
+        self.assertIsNone(out["acked"])
         second = self.spawn.state_read()["GRE-1/planner"]
         self.assertEqual(second["approval_rounds"], 1, "replay must not double-count")
 
@@ -305,6 +314,19 @@ class TestWaitPersistsDelivery(GateLoopCase):
         self.assertIsNone(out["acked"])
         self.assertIsInstance(out["elapsed_ms"], int)
         self.assertGreaterEqual(out["elapsed_ms"], 0)
+
+    def test_status_without_a_ticket_reports_the_pending_delivery(self):
+        """`status(None)` fanned out from a flat list into an object with a
+        `pending_delivery` key read straight from the receipt — the only
+        piece of this round without a test before now."""
+
+        self.batch = {"deliveryId": "d1", "messages": [self.message()]}
+        self.spawn.wait(ack=None, timeout_ms=1)
+
+        out = self.spawn.status(None)
+
+        self.assertEqual(out["pending_delivery"], "d1")
+        self.assertEqual([rec["key"] for rec in out["spawns"]], ["GRE-1/planner"])
 
 
 class TestVerdictOrdering(GateLoopCase):

@@ -127,10 +127,16 @@ worker changes nothing on your screen; the message sits there until you
 `check`. Delivery is FIFO and replays the same batch until it is acked, so
 an unacked old batch hides every newer message behind it. Losing the
 terminal's stdout no longer loses the ack: the pending Delivery id is
-persisted to disk (`workflow/journal`'s receipt) before it is processed, so
-reopening the terminal and calling `wait` again picks it up and acks it —
+persisted to disk (`workflow/journal`'s receipt) only AFTER it has been
+processed and the registry write is durable, so reopening the terminal and
+calling `wait` again either sees the receipt and acks it, or — if the
+process died before that write — sees no receipt, sends no `--ack`, and
+lets Orca redeliver the identical batch for a harmless replay. Either way:
 no id to recover from old output, and `spawn status` (no ticket) shows it
-under `pending_delivery` if you want to check without waiting.
+under `pending_delivery` if you want to check without waiting. That same
+no-ticket call is now an object, not the flat list you get with a ticket —
+`{"pending_delivery": ..., "spawns": [...]}` — so `spawn status | jq '.[0]'`
+breaks; index into `.spawns` instead.
 
 **A timeout is not a failure — but an instant empty return might not be one
 either.** `check --wait` returning `count: 0` after the full `--timeout-ms`
