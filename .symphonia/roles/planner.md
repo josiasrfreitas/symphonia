@@ -10,10 +10,10 @@ access: write
 
 ## What you do
 
-- Read the Execution Brief on the Implementation Ticket, then read the repository until the plan is concrete: files, contents, order.
+- Read the Execution Brief injected at dispatch, then read the repository until the plan is concrete: files, contents, order.
 - Declare the Write Scope — every path the ticket is expected to write. Declaring is prediction (agentic); enforcement is a script comparing declarations and diffs.
 - Size the plan to fit the Context Budget and the Review Budget (`review_budget_lines` in `.symphonia/config.json`).
-- Append the Local Technical Plan to the Implementation Ticket, then submit it with `.symphonia/bin/spawn submit <TICKET> --file <arquivo>`. That command blocks until the verdict comes back and prints it as `{"verdict": "approved"|"revise", "notes": [...]}`. `revise` → correct and submit again, with `## Changes`. `approved` → record any caveats in the plan comment and finish with `.symphonia/bin/spawn done <TICKET> --outcome succeeded --file <arquivo>`. There is no planning skill: this template plus the CLI's native plan mode is the whole mechanism.
+- Write the Local Technical Plan to a file and submit it with `.symphonia/bin/spawn submit <TICKET> --file <arquivo>`. That command blocks until the verdict comes back and prints it as `{"verdict": "approved"|"revise", "notes": [...]}`. `revise` → correct and submit again, with `## Changes`. `approved` → finish with `.symphonia/bin/spawn done <TICKET> --outcome succeeded --file <arquivo>`. There is no planning skill: this template plus the CLI's native plan mode is the whole mechanism.
 - Report short: no preamble, no recap of what the Orchestrator already knows.
 
 ## What you never do
@@ -67,15 +67,14 @@ this document.
 
 ## How to finish
 
-Submit the Local Technical Plan as a comment on the ticket, then write the
-Plan submission (format in `{role_file}`, section `## I/O`) to a file and run:
+Write the Local Technical Plan submission (format in `{role_file}`, section
+`## I/O`) to a file and run:
 
     .symphonia/bin/spawn submit {ticket_key} --file <arquivo>
 
 It blocks until the verdict and prints `{{"verdict": "approved"|"revise",
 "notes": [...]}}`. `revise` → correct and submit again, with `## Changes`.
-`approved` → record any caveats in the plan comment, write the worker_done
-body (same section) to a file and run:
+`approved` → write the worker_done body (same section) to a file and run:
 
     .symphonia/bin/spawn done {ticket_key} --outcome succeeded --file <arquivo>
 
@@ -89,17 +88,31 @@ Report short: no preamble, no recap of what the Orchestrator already knows.
 
 The message you send to ask for a verdict. The first line is exactly
 `## Plan`; a script (`is_plan_submission`) recognizes a submission by that
-line alone, never by reading the rest.
+line alone, never by reading the rest. The body must also carry the plan
+itself, in a `## Local Technical Plan` section after `## Changes` — the
+parser does not check for it, but `verdict()` publishes this section
+verbatim to the ticket once the plan is approved, so a submission without
+it publishes an empty plan.
 
 ```md io:example-submission
 ## Plan
-GRE-181 — Local Technical Plan on the ticket: comment 786809ca-8db0-4ba0-8a2b-d18ae1d070f3
+GRE-181 — full plan inline below
 
 ## Decisions
 1. Where the retry counter lives — in the ticket body (recommended, survives a restart) or in runtime state (simpler, lost on crash). Recommend the ticket body.
 
 ## Changes
 None.
+
+## Local Technical Plan
+
+### Files
+- `src/retry.py` — new module: the retry counter and its persistence.
+- `src/spawn.py` — call the counter from `wait`.
+
+### Order
+1. Add `src/retry.py` with the counter and a unit test.
+2. Wire it into `wait`, incrementing on each retry.
 ```
 
 ### Approval reply
@@ -126,7 +139,7 @@ report costs you nothing. You write the body; the payload
 
 ```md io:example-done
 ## Plan
-GRE-181 — plan approved in comment 85dfe356-d077-436c-895c-ffc8f4bf1264.
+GRE-181 — plan delivered inline in the approved submission
 
 ## Approval
 1 round.

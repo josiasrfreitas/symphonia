@@ -270,17 +270,22 @@ class SpawnPlanNoCapability(CharacterizationCase):
 
 
 class SpawnImplementReusesWorktree(CharacterizationCase):
-    """3. `spawn implement`: no worktree create, no orphan-shell close, no
-    Brief — `work_spec()` is the pointer instead."""
+    """3. `spawn implement`: no worktree create, no orphan-shell close —
+    `build_brief()` is the Brief now, same as the planner's, so one extra
+    subprocess boundary (`_current_branch`) joins the sequence."""
 
     def test_argv_sequence(self):
-        ticket, wt_id, path = "GRE-201", "wt-1", "/workspaces/gre-201"
-        expected_spec = self.spawn.work_spec(self.RoleName.IMPLEMENTER, ticket, path)
+        ticket, wt_id, path, branch = "GRE-201", "wt-1", "/workspaces/gre-201", "gre-201-implement"
+        expected_spec = self.expected_brief(
+            self.RoleName.IMPLEMENTER, ticket, path, branch=branch,
+        )
+        self.stub_linear_tracker(ticket)
         runner = self.install_runner([
             _proc(_ok({"worktrees": [{"id": wt_id, "path": path}]})),  # find_worktree
             _proc(_ok({})),                                            # worktree set (badge)
             _proc(_ok({"terminal": {"handle": "term-2"}})),            # terminal create
             _proc(_ok({})),                                            # terminal wait tui-idle
+            _proc(f"{branch}\n"),                                      # _current_branch (in build_brief)
             _proc(_ok({"task": {"id": "task-2"}})),                    # task-create
             _proc(_ok({                                                # dispatch
                 "dispatch": {"id": "disp-2"},
@@ -297,6 +302,7 @@ class SpawnImplementReusesWorktree(CharacterizationCase):
             ["terminal", "create", "--worktree", f"id:{wt_id}",
              "--title", f"🔨 implementing · {ticket}", "--command", PLAN_COMMAND_IMPLEMENTER],
             ["terminal", "wait", "--terminal", "term-2", "--for", "tui-idle", "--timeout-ms", "120000"],
+            ["git", "-C", path, "branch", "--show-current"],
             ["orchestration", "task-create", "--spec", expected_spec],
             ["orchestration", "dispatch", "--task", "task-2", "--to", "term-2",
              "--inject", "--return-preamble"],
@@ -433,29 +439,16 @@ class SpawnSubmitSingleRound(CharacterizationCase):
         self.assertEqual(out["verdict"], "approved")
 
 
-class WorkSpecBatonText(CharacterizationCase):
-    """C4 of the GRE-186 S3 verdict: the characterization scenarios above
-    recompute `work_spec()` by calling the function itself, so its text has
-    no oracle anywhere else — and this round rewrote exactly that text (the
-    baton rule's `handoff_dir` now comes from `config.json`, and the skill
-    path from `_harness().handoff_hint()`, not a core constant). Fixed here
-    so a future edit to either source is caught."""
-
-    def test_write_role_gets_the_baton_rule_with_handoff_dir_and_harness_hint(self):
-        spec = self.spawn.work_spec(self.RoleName.IMPLEMENTER, "GRE-1", "/workspaces/gre-1")
-        self.assertIn("~/orca/.context/gre-1-implementer-<YYYY-MM-DD>.md", spec)
-        self.assertIn(
-            "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)", spec
-        )
-        self.assertIn("Do NOT hand ownership to anyone and do NOT launch another agent", spec)
-
-    def test_read_role_gets_the_read_only_line_and_no_skill_path(self):
-        spec = self.spawn.work_spec(self.RoleName.SPEC_REVIEWER, "GRE-1", "/workspaces/gre-1")
-        self.assertIn(
-            "You are read-only by construction: Edit/Write are disabled at launch.", spec
-        )
-        self.assertNotIn("SKILL.md", spec)
-        self.assertNotIn("handoff document", spec)
+# `BriefBatonText` (the GRE-186 S3 baton-text scenarios) lived here until
+# the GRE-187 correction round (C8/S6): it called `build_brief()` directly
+# through `expected_brief`, exactly like `test_brief.py`'s
+# `test_implementer_brief_carries_the_baton_rule` and
+# `test_reviewer_briefs_carry_the_read_only_line_and_no_handoff` — same
+# function, same fake tracker, no argv or dispatch path in between. Its own
+# docstring's justification ("the text has no oracle anywhere else") stopped
+# being true once `test_brief.py` grew those two tests, so it was a second
+# oracle for the same claim rather than added coverage. Removed; the two
+# tests in `test_brief.py` are the single house for this text now.
 
 
 if __name__ == "__main__":

@@ -55,10 +55,25 @@ class TestPlanSubmissionGolden(unittest.TestCase):
     def test_parses_ticket_pointer_decisions_and_changes(self):
         report = parse_plan_submission(self.body)
         self.assertEqual(report.ticket, "GRE-181")
-        self.assertIn("786809ca-8db0-4ba0-8a2b-d18ae1d070f3", report.pointer)
+        self.assertEqual(report.pointer, "full plan inline below")
         self.assertEqual(len(report.decisions), 1)
         self.assertTrue(report.decisions[0].startswith("1. Where the retry counter lives"))
         self.assertEqual(report.changes, "None.")
+
+
+class TestPlanSubmissionProseRequiresTheLocalTechnicalPlanSection(unittest.TestCase):
+    """GRE-187 correction C4: the example alone showed `## Local Technical
+    Plan` — a planner who read the prose and skipped the example could
+    submit a body without it, and `verdict()` now publishes that section
+    verbatim on approval. The prose must require it too, not just the
+    example."""
+
+    def test_prose_names_the_required_section(self):
+        text = PLANNER_MD.read_text()
+        start = text.index("### Plan submission")
+        end = text.index("```md io:example-submission", start)
+        prose = text[start:end]
+        self.assertIn("## Local Technical Plan", prose)
 
 
 class TestApprovalReplyGolden(unittest.TestCase):
@@ -74,7 +89,7 @@ class TestApprovalReplyGolden(unittest.TestCase):
 class TestPlannerDoneGolden(unittest.TestCase):
     def test_parses_plan_pointer_and_deviations_from_the_body(self):
         report = parse_planner_done(_example("md io:example-done"))
-        self.assertIn("85dfe356-d077-436c-895c-ffc8f4bf1264", report.plan_pointer)
+        self.assertEqual(report.plan_pointer, "GRE-181 — plan delivered inline in the approved submission")
         self.assertEqual(report.deviations, ())
 
     def test_the_body_carries_no_approval_facts(self):
@@ -89,7 +104,7 @@ class TestPlannerDoneGolden(unittest.TestCase):
         written = set_approval_rounds(_example("md io:example-done"), 2)
         self.assertIn("2 rodadas.", written)
         report = parse_planner_done(written)
-        self.assertIn("85dfe356-d077-436c-895c-ffc8f4bf1264", report.plan_pointer)
+        self.assertEqual(report.plan_pointer, "GRE-181 — plan delivered inline in the approved submission")
 
     def test_one_round_is_singular(self):
         self.assertIn("1 rodada.", set_approval_rounds(_example("md io:example-done"), 1))

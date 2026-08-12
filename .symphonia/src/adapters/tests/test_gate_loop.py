@@ -36,9 +36,10 @@ DONE_BODY = "## Plan\nGRE-1 — comment abc\n\n## Approval\n1 rodada.\n\n## Devi
 class FakeTracker:
     """Records what the gate asked of Linear; raises on demand."""
 
-    def __init__(self, fail: bool = False):
-        self.gate_calls, self.attention = [], []
+    def __init__(self, fail: bool = False, fail_comment: bool = False):
+        self.gate_calls, self.attention, self.comments = [], [], []
         self.fail = fail
+        self.fail_comment = fail_comment
         self.on_set_gate = None  # optional hook, fired after a real call is recorded
 
     def set_gate(self, ticket, on):
@@ -47,6 +48,11 @@ class FakeTracker:
         self.gate_calls.append((ticket, on))
         if self.on_set_gate is not None:
             self.on_set_gate(ticket, on)
+
+    def post_comment(self, ticket, body):
+        if self.fail_comment:
+            raise RuntimeError("linear unreachable")
+        self.comments.append((ticket, body))
 
     def set_attention(self, ticket, attention):
         self.attention.append((ticket, attention))
@@ -247,6 +253,55 @@ class TestVerdictOrdering(GateLoopCase):
             self.spawn.verdict("GRE-1", "approved", "")
         rec = self.spawn.state_read()["GRE-1/planner"]
         self.assertEqual(rec["question_id"], "q-1", "a failed reply must stay retryable")
+
+
+class TestVerdictPublishesThePlanCopy(GateLoopCase):
+    """GRE-187 item 4: the approved plan's one and only copy on the ticket
+    is posted here — never on submission, never on REVISE — from the
+    `plan_body` `wait` recorded off the genuine submission."""
+
+    PLAN_BODY = "## Plan\nGRE-1 — full plan inline below\n\n## Decisions\n1. x\n\n## Changes\nNone.\n"
+
+    def test_approval_publishes_the_plan_and_the_notes_exactly_once(self):
+        self.set_state(
+            gate_state=self.spawn._gate.SUBMITTED, question_id="q-1", plan_body=self.PLAN_BODY,
+        )
+        out = self.spawn.verdict("GRE-1", "approved", "Ship it, but note the caveat.")
+        self.assertEqual(out["plan_copy"], "posted")
+        self.assertEqual(len(self.tracker.comments), 1)
+        ticket, body = self.tracker.comments[0]
+        self.assertEqual(ticket, "GRE-1")
+        self.assertIn(self.PLAN_BODY.rstrip(), body)
+        self.assertIn("## Approval", body)
+        self.assertIn("APPROVED", body)
+        self.assertIn("- Ship it, but note the caveat.", body)
+
+    def test_revise_publishes_nothing(self):
+        self.set_state(
+            gate_state=self.spawn._gate.SUBMITTED, question_id="q-1", plan_body=self.PLAN_BODY,
+        )
+        out = self.spawn.verdict("GRE-1", "revise", "Fix the retry counter.")
+        self.assertNotIn("plan_copy", out)
+        self.assertEqual(self.tracker.comments, [])
+
+    def test_a_post_comment_failure_is_visible_never_fatal(self):
+        self.set_state(
+            gate_state=self.spawn._gate.SUBMITTED, question_id="q-1", plan_body=self.PLAN_BODY,
+        )
+        self.tracker.fail_comment = True
+        out = self.spawn.verdict("GRE-1", "approved", "")
+        self.assertIn("NOT posted", out["plan_copy"])
+        rec = self.spawn.state_read()["GRE-1/planner"]
+        self.assertEqual(rec["gate_state"], self.spawn._gate.VERDICT_APPROVED)
+
+    def test_a_record_with_no_plan_body_is_reported_not_raised(self):
+        """A record from before this round (or a submission the gate never
+        saw, e.g. a hand-answered question) carries no `plan_body`."""
+
+        self.set_state(gate_state=self.spawn._gate.SUBMITTED, question_id="q-1")
+        out = self.spawn.verdict("GRE-1", "approved", "")
+        self.assertEqual(out["plan_copy"], "NOT posted (no plan_body recorded)")
+        self.assertEqual(self.tracker.comments, [])
 
 
 class TestRegistryLocation(GateLoopCase):

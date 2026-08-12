@@ -151,7 +151,7 @@ ownership to anyone. Every transition goes through you.
 | `src/spawn.py` (behind the `bin/spawn` entrypoint) | The verbs, worktree policy, phase labels, what a role is told at dispatch, the Execution Brief (`build_brief`), the plan gate wiring (`wait`/`verdict`) |
 | `src/adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
 | `src/adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
-| `roles/*.md` | What each role does and never does, and (for the planner) the I/O shapes it reads and writes |
+| `roles/*.md` | What each role does and never does, and the I/O shapes it reads and writes |
 | `src/setup_worktree.py` (behind the `bin/setup-worktree` entrypoint) | What a fresh checkout needs and git does not bring: the env files |
 | `config.json` | The calibration numbers, plus the `handoff_dir` a role's baton document is written to |
 

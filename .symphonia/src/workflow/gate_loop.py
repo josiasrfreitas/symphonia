@@ -56,11 +56,11 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
     starts `## Plan` but does not otherwise parse is flagged rather than
     silently accepted or silently ignored.
 
-    What the parsers return is kept, not discarded: the plan's pointer (the
-    comment the next role has to read) and the round count both come from
-    here, and the Ticket Key on the `## Plan` line is checked against the
-    record so a report filed under the wrong ticket is caught rather than
-    counted.
+    What the parsers return is kept, not discarded: the plan's pointer, the
+    round count, and the raw submission body (`plan_body`, republished by
+    `spawn.verdict` on approval — never here) all come from here, and the
+    Ticket Key on the `## Plan` line is checked against the record so a
+    report filed under the wrong ticket is caught rather than counted.
     """
 
     state = rec.get("gate_state", IDLE)
@@ -98,6 +98,7 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
             rec["last_question_id"] = result.question_id
             rec["plan_pointer"] = submission.pointer
             rec["plan_decisions"] = list(submission.decisions)
+            rec["plan_body"] = event.question
             if result.state == _gate.SUBMITTED and state != _gate.SUBMITTED:
                 # A round is a plan put in front of the human, counted here
                 # so `spawn done` never asks the planner how many there were.
