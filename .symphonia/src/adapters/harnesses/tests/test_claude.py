@@ -29,11 +29,11 @@ from adapters.harness_adapter import HarnessCapabilities, HarnessRefusal
 from adapters.harnesses.claude import (
     PROVIDERS,
     ClaudeHarness,
-    _shell_join,
     build_launch,
     observed_models,
     tier_matches,
 )
+from adapters.orca.adapter import _shell_join
 from adapters.runtime_adapter import Access, CapabilityTier, RoleName, WorkspaceRef
 from adapters.tests.test_spawn_characterization import (
     FIXED_UUID,
@@ -60,7 +60,7 @@ class TestNothingLaunchesIntoAPrompt(unittest.TestCase):
                 tier=policy.tier, access=policy.access,
             )
             with self.subTest(role=role.value):
-                self.assertIn("bypassPermissions", plan.command)
+                self.assertIn("bypassPermissions", plan.argv)
 
     def test_every_provider_declares_an_unattended_mode(self):
         for name, grammar in PROVIDERS.items():
@@ -77,11 +77,10 @@ class TestReadOnlyIsStructural(unittest.TestCase):
             )
             with self.subTest(role=role.value):
                 if policy.access is Access.READ:
-                    self.assertIn("--disallowedTools", plan.command)
-                    for tool in ("Edit", "Write", "NotebookEdit"):
-                        self.assertIn(tool, plan.command)
+                    self.assertIn("--disallowedTools", plan.argv)
+                    self.assertIn("Edit Write NotebookEdit", plan.argv)
                 else:
-                    self.assertNotIn("--disallowedTools", plan.command)
+                    self.assertNotIn("--disallowedTools", plan.argv)
 
     def test_a_provider_that_cannot_deny_refuses_read_roles(self):
         """Better to fail the launch than to start a reviewer that can edit
@@ -138,14 +137,17 @@ class TestTierIsObservable(unittest.TestCase):
 class TestArgvIsShellSafe(unittest.TestCase):
     def test_multiword_values_survive_the_command_string(self):
         """`orca terminal create --command` takes one string, so a value with
-        spaces must not split into two arguments."""
+        spaces must not split into two arguments. Joining is the caller's
+        job now, not `build_launch`'s (GRE-186 S3) — `_shell_join` lives in
+        `adapters/orca/adapter.py`, the one place that actually calls that
+        CLI; this test plays that caller's role."""
 
         policy = POLICIES[RoleName.SPEC_REVIEWER]
         plan = build_launch(
             RoleName.SPEC_REVIEWER, session_id="s", workspace="/tmp/w",
             tier=policy.tier, access=policy.access,
         )
-        self.assertIn("'Edit Write NotebookEdit'", plan.command)
+        self.assertIn("'Edit Write NotebookEdit'", _shell_join(plan.argv))
 
 
 class TestClaudeHarnessCapabilities(unittest.TestCase):

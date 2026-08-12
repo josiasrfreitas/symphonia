@@ -128,8 +128,10 @@ checkpoint. Planning and implementation routinely run 15–60 minutes. Keep
 waiting unless the terminal is gone or the human tells you to stop.
 
 **A silent worker is not necessarily working.** Use `spawn status <TICKET>`:
-it reports the dispatch state and which model actually answered, both read
-from files. If you need to see the session itself, `orca terminal read`.
+it reports the dispatch state and the declared tier's evidence — what kind
+of evidence exists (`requested` vs `observed`) and the detail behind it, not
+a comparison against a model alias — both read from files. If you need to
+see the session itself, `orca terminal read`.
 
 **Never message a dead dispatch.** After `worker_done` the worker is asleep; a
 send lands in its mailbox and never wakes it. Go through the Runtime Adapter's
@@ -151,7 +153,7 @@ ownership to anyone. Every transition goes through you.
 | `src/adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
 | `roles/*.md` | What each role does and never does, and (for the planner) the I/O shapes it reads and writes |
 | `src/setup_worktree.py` (behind the `bin/setup-worktree` entrypoint) | What a fresh checkout needs and git does not bring: the env files |
-| `config.json` | The calibration numbers |
+| `config.json` | The calibration numbers, plus the `handoff_dir` a role's baton document is written to |
 
 Adding a provider is a `PROVIDERS` entry in `claude.py`. Changing a model is
 one line in the same file. Neither touches a caller, and neither is ever done

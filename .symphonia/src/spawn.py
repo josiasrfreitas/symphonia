@@ -47,16 +47,18 @@ import json
 import os
 import subprocess
 import sys
-# Session ids are minted inside adapters.orca.adapter now (GRE-184 M4), not
-# here — but `uuid` is still imported so the name resolves as `spawn.uuid`.
-# `adapter.py` imports the identical shared module object, so a test that
-# patches `uuid4` through this attribute (`self.spawn.uuid`) still reaches
-# the code that actually calls it.
+# Session ids are minted inside `ClaudeHarness.prepare()` now
+# (`adapters/harnesses/claude.py`, GRE-186 S3), not here — but `uuid` is
+# still imported so the name resolves as `spawn.uuid`. `claude.py` imports
+# the identical shared module object, so a test that patches `uuid4`
+# through this attribute (`self.spawn.uuid`) still reaches the code that
+# actually calls it.
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from adapters import harness_adapter as _harness_adapter
 from adapters import plan_gate as _gate
 from adapters import reports as _reports
 from adapters import runtime_adapter as _contract
@@ -109,16 +111,24 @@ STATE = RUNTIME_DIR / "spawns.json"
 # `os.replace`, so an flock held on the file being replaced protects
 # nothing once the swap happens.
 STATE_LOCK = STATE.with_name(STATE.name + ".lock")
-# The baton between roles is the installed handoff skill's document, in the
-# location that skill owns — not a format this package invents.
+# The baton between roles is a document dropped at a configured directory —
+# not a format this package invents, and (GRE-186 S3) not a path this
+# package hardcodes either: `"handoff_dir"` in `config.json` names it, this
+# function is the one place that reads that key (C5 of the S3 verdict), and
+# every caller below goes through it rather than reading the key itself.
 #
 # It lives outside the repository on purpose: it is never committed, never
 # travels with the branch, and outlives nothing. Its only job is carrying
 # context from the role that just died to the one about to start. Moving it
 # into the worktree would turn a disposable note into a versioned artifact
 # that reviewers have to maintain — do not.
-HANDOFF_SKILL = "~/.claude/skills/handoff/SKILL.md"
-HANDOFF_DIR = "~/orca/.context"
+_HANDOFF_DIR_DEFAULT = "~/orca/.context"
+
+
+def _handoff_dir() -> str:
+    config = json.loads((PACKAGE / "config.json").read_text())
+    return config.get("handoff_dir", _HANDOFF_DIR_DEFAULT)
+
 
 # The role matrix (tier, access, role file) lives only in each role file's
 # own frontmatter now — `workflow.roles.load_policies` reads it, and fails
@@ -131,6 +141,15 @@ ROLES_DIR = PACKAGE / "roles"
 
 def _policies() -> dict[RoleName, _roles.RolePolicy]:
     return _roles.load_policies(ROLES_DIR)
+
+
+def _harness() -> _harness_adapter.HarnessAdapter:
+    """The one harness this package composes over — hardcoded, not looked
+    up from `config.json` (decision 6 / item 5 of GRE-186): a registry keyed
+    by provider and a `config.harness` setting are deferred until a second
+    harness exists to prove the seam is real, not speculative."""
+
+    return _claude.ClaudeHarness()
 
 # --- orca CLI ------------------------------------------------------------
 
@@ -233,7 +252,7 @@ def state_lock() -> Iterator[None]:
 def _adapter() -> _cli.OrcaRuntimeAdapter:
     """The production adapter `spawn()` composes its verbs over (GRE-184
     M4): `find_workspace`/`create_workspace`/`default_base`/`set_phase`/
-    `launch_role`/`dispatch`/`snapshot`. `coordinator`/`run_id` are inert
+    `open_context`/`dispatch`/`snapshot`. `coordinator`/`run_id` are inert
     placeholders — `bind_control=False` (approval condition #3 of the PR-A
     plan) means `_ensure_control` never reads them, and none of the methods
     above reference `self.coordinator` either; only `message_worker`/
@@ -252,10 +271,16 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
     """What the role is told at dispatch. Deliberately a pointer, not a
     briefing: the role contract lives in a versioned file, so it can be
     reviewed and changed without touching this launcher (closes GRE-175 M3 —
-    the briefing used to be discarded at spawn)."""
+    the briefing used to be discarded at spawn).
+
+    The baton rule (produce the handoff document, never launch the next
+    role) is text this function owns; which skill produces that document is
+    not — that fragment comes from `_harness().handoff_hint()` (GRE-186 S3),
+    so this core module never has to know a harness-specific skill path."""
 
     policy = _policies()[role]
     role_file = f".symphonia/roles/{policy.role_file}"
+    handoff_dir = _handoff_dir()
     lines = [
         f"Ticket: {ticket.upper()}. Your role: {role.value}.",
         f"1. Read {role_file} — it is your role contract; follow it exactly.",
@@ -266,7 +291,7 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
         "`orca linear issue --current --full --json`, and write back to it "
         "(plan, findings, status) with the `orca linear` commands — never "
         "invent another channel.",
-        f"2. Read {HANDOFF_DIR}/{ticket.lower()}-*.md — if such a file exists it is the "
+        f"2. Read {handoff_dir}/{ticket.lower()}-*.md — if such a file exists it is the "
         f"handoff from the role before you, and it is all the context you get.",
         f"3. Do the work of your role for {ticket.upper()} in this worktree ({workspace}).",
     ]
@@ -281,8 +306,8 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
         # the handoff skill applies here.
         lines.append(
             f"4. Before you finish, write your handoff document following "
-            f"{HANDOFF_SKILL} — the document half only (as with --doc-only). "
-            f"Save it as {HANDOFF_DIR}/{ticket.lower()}-{role.value}-<YYYY-MM-DD>.md. "
+            f"{_harness().handoff_hint()}. "
+            f"Save it as {handoff_dir}/{ticket.lower()}-{role.value}-<YYYY-MM-DD>.md. "
             f"Do NOT hand ownership to anyone and do NOT launch another agent: "
             f"the Orchestrator starts the next role. That document is the only "
             f"thing that survives you."
@@ -305,7 +330,7 @@ def _current_branch(workspace: str) -> str:
 
 
 def _handoff_files(ticket: str) -> list[Path]:
-    return sorted(Path(os.path.expanduser(HANDOFF_DIR)).glob(f"{ticket.lower()}-*.md"))
+    return sorted(Path(os.path.expanduser(_handoff_dir())).glob(f"{ticket.lower()}-*.md"))
 
 
 def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) -> str:
@@ -399,14 +424,16 @@ def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
 
 
 def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None = None) -> dict:
-    """Composed over `OrcaRuntimeAdapter` (GRE-184 M4) — every orca call
-    below lives in `_adapter()`'s methods, not here. Item 10 of GRE-181
-    ("failure mid-sequence leaves no orphan"): a fresh workspace is torn
-    down if `set_phase`/`launch_role` fails; `dispatch`'s one characterized
-    failure (a dispatch that minted no capability) already rolls its own
-    task/terminal back inside the adapter (GRE-184 M3) — unchanged from
-    what M0 froze, so this wrapper only translates the error, it does not
-    clean up a second time. A workspace is never destroyed once reused.
+    """Composed over `OrcaRuntimeAdapter` and one `HarnessAdapter` (GRE-186
+    S3) — every orca call below lives in `_adapter()`'s methods, the launch
+    itself in `_harness().prepare()`, not here. Item 10 of GRE-181 ("failure
+    mid-sequence leaves no orphan"): a fresh workspace is torn down if
+    `set_phase`/`prepare`/`open_context` fails; `dispatch`'s one
+    characterized failure (a dispatch that minted no capability) already
+    rolls its own task/terminal back inside the adapter (GRE-184 M3) —
+    unchanged from what M0 froze, so this wrapper only translates the
+    error, it does not clean up a second time. A workspace is never
+    destroyed once reused.
     """
 
     ticket = ticket.upper()
@@ -449,15 +476,12 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
                 f"{', '.join(t.value for t in _contract.CapabilityTier)}"
             )
 
+    harness = _harness()
     try:
         adapter.set_phase(workspace, role)
-        launch = adapter.launch_role(
-            workspace,
-            _contract.RoleSpec(
-                role=role, tier=policy.tier, access=policy.access, briefing="",
-            ),
-        )
-    except (RuntimeError, _cli.OrcaCliError) as exc:
+        prepared = harness.prepare(workspace=workspace, policy=policy)
+        context = adapter.open_context(workspace, role=role, access=policy.access, launch=prepared)
+    except (RuntimeError, _cli.OrcaCliError, _harness_adapter.HarnessRefusal) as exc:
         if fresh:
             try:
                 adapter.destroy_workspace(workspace)
@@ -475,7 +499,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         else work_spec(role, ticket, workspace.path)
     )
     try:
-        attempt = adapter.dispatch(launch.context, spec)
+        attempt = adapter.dispatch(context, spec)
     except _cli.OrcaCliError as exc:
         raise SystemExit(str(exc)) from exc
     snap = adapter.snapshot(attempt)
@@ -483,8 +507,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     record = {
         "ticket": ticket,
         "role": role.value,
-        "tier": snap["tier"],
-        "model_requested": _claude.TIER_MODELS[policy.tier],
+        "tier": policy.tier.value,
         "access": snap["access"],
         "worktree": workspace.path,
         "worktree_id": workspace.id,
@@ -494,8 +517,22 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "capability": snap["capability"],
         "gate_state": IDLE,
         "approval_rounds": 0,
-        "session_id": snap["session_id"],
-        "transcript": snap["transcript"],
+        # Honest by construction (decision 3 of the GRE-186 S3 verdict):
+        # `requested` is what launch itself can ever prove; nothing reads
+        # this before `status()` calls `harness.observe()` for the strong
+        # check. Deliberately never re-read afterwards either: this records
+        # what was known at launch, and `observe()` is the live source of
+        # what's known now — reading the record back in its place would
+        # trade a live value for a stale one, the dishonesty this ticket
+        # exists to kill.
+        "tier_evidence": {
+            "kind": "requested",
+            "tier": policy.tier.value,
+            "detail": "recorded at launch; no observation yet",
+        },
+        # The ContextRef <-> HarnessSession association (decision 5): the
+        # loose `session_id`/`transcript` fields this replaces are gone.
+        "session": {"id": snap["session_id"], "observation_ref": snap["observation_ref"]},
         "command": snap["command"],
     }
     data = state_read()
@@ -508,10 +545,20 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
 
 
 def status(ticket: str | None) -> list[dict]:
-    """Deterministic state per spawn: what the dispatch says, and which model
-    actually answered — read from the transcript, never asked of the agent."""
+    """Deterministic state per spawn: what the dispatch says, and what tier
+    evidence the harness can produce — `harness.observe()` reads it,
+    never this function guessing from a transcript itself (GRE-186 S3: the
+    model-alias-vs-transcript comparison left the core along with
+    `verify_tier`).
+
+    Tolerant of a record from before this round: one with no `session`/
+    `tier_evidence` (the old `model_requested` shape) reads as
+    `evidence_kind="unverifiable"`, named as a pre-GRE-186 record — nothing
+    more elaborate than that; the record format is not a contract (decision
+    5 of the S3 verdict)."""
 
     adapter = _adapter()
+    harness = _harness()
     out = []
     for key, rec in sorted(state_read().items()):
         if ticket and not key.startswith(ticket.upper() + "/"):
@@ -520,15 +567,21 @@ def status(ticket: str | None) -> list[dict]:
             dispatch_status = adapter.dispatch_status(rec["task"])
         except _cli.OrcaCliError:
             dispatch_status = "unknown"
-        transcript = Path(rec["transcript"]) if rec.get("transcript") else None
-        models = _claude.observed_models(transcript) if transcript else []
+        if "session" in rec and "tier_evidence" in rec:
+            session = _harness_adapter.HarnessSession(**rec["session"])
+            requested = _contract.CapabilityTier(rec["tier"])
+            evidence = harness.observe(session, requested)
+            evidence_kind, evidence_detail = evidence.kind, evidence.detail
+        else:
+            evidence_kind = "unverifiable"
+            evidence_detail = "pre-GRE-186 record; no session/tier_evidence to observe"
         out.append(
             {
                 "key": key,
                 "dispatch_status": dispatch_status,
-                "model_requested": rec["model_requested"],
-                "model_observed": ",".join(models) or "(sem resposta ainda)",
-                "tier_ok": bool(models) and all(rec["model_requested"] in m for m in models),
+                "tier": rec.get("tier"),
+                "evidence_kind": evidence_kind,
+                "evidence_detail": evidence_detail,
                 # A role stuck at `verdict-approved` with an old
                 # `last_event_at` is one whose worker_done never landed —
                 # visible here rather than needing a verb of its own.

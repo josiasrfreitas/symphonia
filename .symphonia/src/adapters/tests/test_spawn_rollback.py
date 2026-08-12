@@ -1,6 +1,6 @@
 """GRE-184 P6: item 10 of GRE-181 ("failure mid-sequence leaves no orphan
 worktree/terminal/task"), for the one stage `test_spawn_characterization.py`
-does not already characterize — a `launch_role` failure (as opposed to the
+does not already characterize — an `open_context` failure (as opposed to the
 dispatch-stage "no capability" rollback, which M0 already froze and which
 `spawn()` does not duplicate, see spawn.py's `spawn()` docstring).
 
@@ -26,7 +26,7 @@ from adapters.tests.test_spawn_characterization import CharacterizationCase, _ok
 
 class FreshWorktreeTornDownOnLaunchFailure(CharacterizationCase):
     """`spawn plan`: `worktree create` succeeds, `terminal create` (inside
-    `launch_role`) fails — the freshly created worktree must not survive."""
+    `open_context`) fails — the freshly created worktree must not survive."""
 
     def test_worktree_rm_follows_a_launch_failure(self):
         ticket, wt_id, path = "GRE-301", "wt-9", "/workspaces/gre-301"

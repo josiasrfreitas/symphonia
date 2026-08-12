@@ -18,7 +18,7 @@ READMEs are the one exception: documentation of the folder they sit in, not cont
 
 | Path | What lives here |
 |---|---|
-| `config.json` | The calibration numbers guardrail scripts read, plus (under the `"linear"` key) the Linear Tracker Adapter's provider identifiers. Nothing else configures the workflow. |
+| `config.json` | The calibration numbers guardrail scripts read, the `"linear"` key for the Linear Tracker Adapter's provider identifiers, and `handoff_dir` for where a role's baton document is written. |
 | `DEPENDENCIES.md` | Third-party skills the workflow depends on (grilling, code-review, tdd). Declared, not bundled. |
 | `roles/` | Role templates (Orchestrator, Planner, Implementer, Spec Reviewer, Standards Reviewer) as markdown; the four spawnable roles each declare `capability_tier` and `access` in their frontmatter — the source, not a mirror, read by `src/workflow/roles.py`. |
 | `bin/` | Thin entrypoints (`spawn`, `setup-worktree`) — the CLI surface. Their bodies live in `src/`. |

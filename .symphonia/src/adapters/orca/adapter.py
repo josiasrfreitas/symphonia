@@ -6,9 +6,9 @@ runner is injectable so the conformance suite can drive the exact same
 adapter against a scripted CLI. The Capability Tier translation table lives
 here — roles declare a tier, only this file knows model names.
 
-``RoleSpec.briefing`` (GRE-175 M3, closed by GRE-184 M3): the brief IS the
-body of the first ``dispatch`` — the caller passes it as ``work``, same as
-every later correction. There is no second channel to wire.
+The brief IS the body of the first ``dispatch`` (GRE-175 M3, closed by
+GRE-184 M3) — the caller passes it as ``work``, same as every later
+correction. There is no second channel to wire.
 """
 from __future__ import annotations
 
@@ -16,37 +16,32 @@ import json
 import re
 import subprocess
 import sys
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
 from ..attention import Attention, AttentionCode
+from ..harness_adapter import PreparedLaunch
 from ..runtime_adapter import (
     Access,
     AttemptRef,
     AttemptStatus,
-    CapabilityTier,
     ContextRef,
     ControlLostEvent,
     EscalationEvent,
     EventBatch,
     EventKind,
     KillReceipt,
-    LaunchResult,
     Liveness,
     QuestionEvent,
     ResultEvent,
     RoleName,
-    RoleSpec,
     RuntimeCapabilities,
     RuntimeEvent,
     TicketKey,
-    TierEvidence,
     WorkspaceRef,
 )
 from .events import parse_check_output
-from ..harnesses.claude import LaunchPlan, TIER_MODELS, build_launch, observed_models, tier_matches
 
 
 @dataclass(frozen=True)
@@ -149,9 +144,18 @@ def unwrap_envelope(
     return data if isinstance(data, dict) else {"items": data}
 
 
-# The (tier -> launch command) table GRE-161 put behind this boundary now
-# lives in adapters/harnesses/claude.py, so the adapter and the `spawn` CLI
-# cannot drift into two different command lines for the same tier (GRE-179).
+def _shell_join(argv: tuple[str, ...]) -> str:
+    """`orca terminal create --command` takes one string, so a
+    ``PreparedLaunch.command`` argv tuple is joined here — quoting anything
+    the shell would otherwise split. Lives here, not in a harness (GRE-186
+    S3): joining argv into one shell string is knowledge of the caller of
+    `orca terminal create --command`, not of whatever built the argv."""
+
+    out = []
+    for part in argv:
+        out.append(f"'{part}'" if re.search(r"[\s()*?\"$]", part) else part)
+    return " ".join(out)
+
 
 # What the phase looks like in the Orca sidebar (GRE-184 M3, retroported
 # from `spawn.ROLE_BADGE` unedited). Orca exposes no per-worktree colour, so
@@ -207,8 +211,7 @@ class _ContextRecord:
     ref: ContextRef
     terminal: str
     access: Access
-    requested_tier: CapabilityTier
-    plan: LaunchPlan | None = None
+    launch: PreparedLaunch
 
 
 @dataclass
@@ -224,8 +227,10 @@ class _AttemptRecord:
 class OrcaRuntimeAdapter:
     """``RuntimeAdapter`` over the real Orca CLI.
 
-    Orca records only the launch command, never which model answered, so
-    ``tier_verification`` is False and evidence is at best ``requested``.
+    Carries no tier evidence of its own (GRE-186 S3): Orca records only the
+    launch command, never which model answered, so tier evidence is a
+    ``HarnessAdapter.observe()`` concern now, read from whatever a harness's
+    own session exposes — never from this adapter.
     """
 
     coordinator: str
@@ -253,7 +258,7 @@ class OrcaRuntimeAdapter:
 
     @property
     def capabilities(self) -> RuntimeCapabilities:
-        return RuntimeCapabilities(tier_verification=False, cooperative_completion=True)
+        return RuntimeCapabilities(cooperative_completion=True)
 
     def _orca(self, *argv: str, expect_lifecycle_ok: bool = False) -> dict:
         result = self.runner(["orca", *argv, "--json"])
@@ -394,7 +399,7 @@ class OrcaRuntimeAdapter:
     def set_phase(self, workspace: WorkspaceRef, role: RoleName) -> None:
         """The phase badge in the Orca sidebar (GRE-184 M3, retroported from
         ``spawn.spawn`` unedited). Orca-specific, like ``message_worker`` —
-        not part of the neutral Protocol, and not called by ``launch_role``
+        not part of the neutral Protocol, and not called by ``open_context``
         itself: the caller sets the badge, then launches, same order the
         measured argv freezes."""
 
@@ -407,9 +412,17 @@ class OrcaRuntimeAdapter:
             "--workspace-status", board,
         )
 
-    def launch_role(self, workspace: WorkspaceRef, spec: RoleSpec) -> LaunchResult:
+    def open_context(
+        self, workspace: WorkspaceRef, *, role: RoleName, access: Access, launch: PreparedLaunch
+    ) -> ContextRef:
+        """Place an already-decided launch: the writer guard, the badge's
+        title, ``terminal create``, the ``tui-idle`` wait. What model, effort
+        or permission flags the process actually started with was decided
+        before this was ever called, by a ``HarnessAdapter.prepare()`` — this
+        method never sees a Capability Tier (GRE-186 S3)."""
+
         self._ensure_control()
-        if spec.access is Access.WRITE:
+        if access is Access.WRITE:
             writer = next(
                 (
                     c
@@ -420,30 +433,23 @@ class OrcaRuntimeAdapter:
             )
             if writer is not None:
                 raise RuntimeError(
-                    f"refusing to launch {spec.role.value} into {workspace.ticket_key}: "
+                    f"refusing to launch {role.value} into {workspace.ticket_key}: "
                     f"{writer.ref.role.value} already holds write access. "
                     "The runtime cannot detect the collision."
                 )
 
         self._seq += 1
         context_id = f"ctx-{self._seq}"
-        emoji, phase, _board = ROLE_BADGE[spec.role]
+        emoji, phase, _board = ROLE_BADGE[role]
         # The argv measured from `spawn.spawn` (GRE-184 M3): title carries
         # phase and ticket, not context identity — Rig._proc_for falls back
         # to a role+liveness match for exactly this reason.
         title = f"{emoji} {phase} · {workspace.ticket_key}"
-        plan = build_launch(
-            spec.role,
-            session_id=str(uuid.uuid4()),
-            workspace=workspace.path,
-            tier=spec.tier,
-            access=spec.access,
-        )
         created = self._orca(
             "terminal", "create",
             "--worktree", f"id:{workspace.id}",
             "--title", title,
-            "--command", plan.command,
+            "--command", _shell_join(launch.command),
         )
         # Real shape, matching `spawn.spawn`'s `orca(...)["terminal"]["handle"]`
         # (GRE-184 M3) — the old flat `created["terminal"]` this replaced was
@@ -453,51 +459,9 @@ class OrcaRuntimeAdapter:
         # Losing the first prompt costs a whole spawn, so readiness is
         # waited on, never assumed.
         self._orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle", "--timeout-ms", "120000")
-        ref = ContextRef(id=context_id, role=spec.role, workspace=workspace)
-        self._contexts[context_id] = _ContextRecord(
-            ref=ref, terminal=terminal, access=spec.access, requested_tier=spec.tier, plan=plan
-        )
-        return LaunchResult(context=ref, tier_evidence=self.verify_tier(ref))
-
-    def verify_tier(self, context: ContextRef) -> TierEvidence:
-        """Orca records the launch command only, but the CLI writes a session
-        transcript that names the model on every answer. Pinning the session
-        id at launch makes that file addressable, so a tier is `observed`
-        once the context has answered at least once (GRE-179)."""
-
-        record = self._contexts.get(context.id)
-        if record is None:
-            return TierEvidence(kind="unverifiable", detail="no such context")
-        transcript = record.plan.transcript if record.plan else None
-        if transcript is None:
-            return TierEvidence(
-                kind="requested",
-                tier=record.requested_tier,
-                detail=f"provider {record.plan.provider if record.plan else '?'} exposes no transcript",
-            )
-        models = observed_models(transcript)
-        if not models:
-            # No answer yet is not a wrong tier: the session may still be
-            # starting. Downgrade to what was asked for, never guess.
-            return TierEvidence(
-                kind="requested",
-                tier=record.requested_tier,
-                detail="session has not answered yet; transcript is empty",
-            )
-        if tier_matches(record.requested_tier, models):
-            return TierEvidence(
-                kind="observed",
-                tier=record.requested_tier,
-                detail=f"transcript reports {', '.join(models)}",
-            )
-        return TierEvidence(
-            kind="observed",
-            tier=None,
-            detail=(
-                f"tier mismatch: requested {record.requested_tier.value} "
-                f"({TIER_MODELS[record.requested_tier]}), transcript reports {', '.join(models)}"
-            ),
-        )
+        ref = ContextRef(id=context_id, role=role, workspace=workspace)
+        self._contexts[context_id] = _ContextRecord(ref=ref, terminal=terminal, access=access, launch=launch)
+        return ref
 
     def close_role(self, context: ContextRef) -> None:
         self._ensure_control()
@@ -555,8 +519,10 @@ class OrcaRuntimeAdapter:
     def snapshot(self, attempt: AttemptRef) -> dict:
         """Everything a caller needs to persist about one dispatch, read
         back from the adapter's own records (GRE-184 M3) rather than
-        reconstructed by hand: terminal, task, dispatch, capability, tier,
-        access, session id, transcript, launch command."""
+        reconstructed by hand: terminal, task, dispatch, capability, access,
+        session id, observation ref, launch command. No tier — the runtime
+        never held one to begin with (GRE-186 S3); a caller that needs it
+        already has its own ``RolePolicy``."""
 
         attempt_record = self._attempts.get(attempt.attempt_id)
         if attempt_record is None:
@@ -564,17 +530,16 @@ class OrcaRuntimeAdapter:
         context_record = self._contexts.get(attempt.context.id)
         if context_record is None:
             raise RuntimeError(f"context {attempt.context.id} is gone; snapshot has nothing to read")
-        plan = context_record.plan
+        launch = context_record.launch
         return {
             "terminal": context_record.terminal,
             "task": attempt_record.task_id,
             "dispatch": attempt.attempt_id,
             "capability": attempt_record.capability,
-            "tier": context_record.requested_tier.value,
             "access": context_record.access.value,
-            "session_id": plan.session_id if plan else None,
-            "transcript": str(plan.transcript) if plan and plan.transcript else None,
-            "command": plan.command if plan else None,
+            "session_id": launch.session.id,
+            "observation_ref": launch.session.observation_ref,
+            "command": _shell_join(launch.command),
         }
 
     def kill(self, attempt: AttemptRef) -> KillReceipt:

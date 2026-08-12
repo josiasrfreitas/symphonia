@@ -2,15 +2,28 @@
 
 TLDR: the provider-neutral boundary through which the workflow creates,
 observes, and controls isolated execution contexts. No provider concept
-(Orca, terminal, model name, effort value) appears here — roles declare a
-Capability Tier and the adapter translates it. Specification:
-``docs/contracts/runtime-adapter.contract.prototype.ts``.
+(Orca, terminal, model name, effort value) appears here — a role's
+Capability Tier is spent entirely inside the ``PreparedLaunch`` a
+``HarnessAdapter`` (``harness_adapter.py``) builds before ``open_context``
+is ever called (GRE-186 S3); this module knows only role and access.
+Specification: ``docs/contracts/runtime-adapter.contract.prototype.ts``.
 """
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Literal, Protocol, Union
+from typing import TYPE_CHECKING, Literal, Protocol, Union
+
+if TYPE_CHECKING:
+    # Harness vocabulary the Protocol's signature needs (GRE-186 S3): the
+    # runtime now takes a harness's ``PreparedLaunch`` instead of building
+    # its own launch command. This is the one exception to "nothing in
+    # runtime_adapter imports from harness_adapter" (`harness_adapter.py`'s
+    # own docstring) — a `TYPE_CHECKING`-only import, invisible at runtime
+    # (this module's own `from __future__ import annotations` makes every
+    # annotation a lazy string), so the real import edge still runs one way:
+    # `harness_adapter` -> `runtime_adapter`, never back.
+    from .harness_adapter import PreparedLaunch
 
 TicketKey = str
 
@@ -94,30 +107,6 @@ class AttemptRef:
     context: ContextRef
 
 
-TierEvidenceKind = Literal["requested", "observed", "unverifiable"]
-
-
-@dataclass(frozen=True)
-class TierEvidence:
-    """What is actually known about the tier a Role Context ran at."""
-
-    kind: TierEvidenceKind
-    tier: CapabilityTier | None = None
-    detail: str = ""
-
-
-@dataclass(frozen=True)
-class RoleSpec:
-    role: RoleName
-    tier: CapabilityTier
-    access: Access
-    # Kept on purpose (GRE-184 M3 review): no caller reads this back. The
-    # brief a role actually receives arrives as the body of its first
-    # `dispatch` — there is no second channel. GRE-186 (S5) rewrites this
-    # whole boundary; removing the field belongs there, not here.
-    briefing: str
-
-
 @dataclass(frozen=True)
 class ResultEvent:
     kind: Literal["result"]
@@ -170,12 +159,6 @@ class AttemptStatus:
 
 
 @dataclass(frozen=True)
-class LaunchResult:
-    context: ContextRef
-    tier_evidence: TierEvidence
-
-
-@dataclass(frozen=True)
 class KillReceipt:
     attempt: AttemptRef
     confirmed_gone: bool
@@ -183,7 +166,12 @@ class KillReceipt:
 
 @dataclass(frozen=True)
 class RuntimeCapabilities:
-    tier_verification: bool
+    """What the runtime itself promises. Tier evidence is a harness
+    contract now, not a runtime one (GRE-186 S3) — the runtime stopped
+    promising verification of a dial it never chose; a role's Capability
+    Tier is spent entirely inside the launch a harness prepares, before
+    ``open_context`` ever sees it."""
+
     cooperative_completion: bool
 
 
@@ -199,8 +187,17 @@ class RuntimeAdapter(Protocol):
     def destroy_workspace(self, workspace: WorkspaceRef) -> None: ...
 
     # Role Contexts
-    def launch_role(self, workspace: WorkspaceRef, spec: RoleSpec) -> LaunchResult: ...
-    def verify_tier(self, context: ContextRef) -> TierEvidence: ...
+    def open_context(
+        self, workspace: WorkspaceRef, *, role: RoleName, access: Access, launch: "PreparedLaunch"
+    ) -> ContextRef:
+        """Open a fresh Role Context, already launched. The runtime places
+        it (workspace, badge/title) and enforces the single-writer guard;
+        the launch itself — model, effort, permissions, session — was
+        already decided by a ``HarnessAdapter.prepare()`` before this is
+        called. The runtime never sees a Capability Tier: only ``role``
+        (badge/title) and ``access`` (the writer guard) are its business."""
+        ...
+
     def close_role(self, context: ContextRef) -> None: ...
 
     # Attempts
