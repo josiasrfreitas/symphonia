@@ -12,6 +12,7 @@
 .symphonia/bin/spawn status          [<TICKET>]
 .symphonia/bin/spawn retire           <TICKET> <role>  # manual: same teardown a worker_done already ran for you
 .symphonia/bin/spawn sweep           [<TICKET>]         # audits for a role whose world is already gone, tears it down
+.symphonia/bin/spawn brief            <TICKET> --file <cut.md>  # posts a wave's coordination note to the ticket
 .symphonia/bin/spawn wait            [--ack <delivery_id>] [--timeout-ms <ms>]
 .symphonia/bin/spawn verdict          <TICKET> approved|revise [--notes <text>|--notes-file <path>]
 ```
@@ -142,7 +143,14 @@ role with a fresh dispatch.
 document and dies. It does not launch its successor and it does not hand
 ownership to anyone. Every transition goes through you. The handoff is one
 current document per ticket — each role overwrites the same path, so the
-next role never has two files to choose between.
+next role never has two files to choose between. A wave's cut of work goes
+to the ticket through `spawn brief`, never through a tracker client typed
+by hand — `build_brief` already composes every ticket comment into the
+next role's Execution Brief, so posting through the package is the whole
+job. `build_brief` runs at dispatch, not on a schedule: a comment posted
+after a role is already standing does not reach it — there is no channel
+to a live role. Posting and re-dispatching are a pair, in that order; the
+cut lands in the brief of the *next* dispatch, never the current one.
 
 **An empty `succeeded` is refused, not registered.** `spawn done <TICKET>
 --outcome succeeded` from a write-access, non-planner role is refused
