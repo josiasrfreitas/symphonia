@@ -21,14 +21,16 @@ from workflow.roles import load_policies
 ROLES_DIR = PACKAGE.parent / "roles"
 
 # The matrix decided on GRE-179, now declared in each role file's own
-# frontmatter instead of a second table here. Both reviewers moved from
-# `high` to `frontier` on 2026-08-12: review is the judgement seat of the
-# loop, and it reads the same diff the planner designed — the tier ladder
-# itself is unchanged, only which rung these two sit on.
+# frontmatter instead of a second table here. The two reviewers deliberately
+# sit on different rungs (2026-08-12): they read the same diff with different
+# eyes, so a second model is a second perspective, not a redundant one. Spec
+# checks the delivery against the approved plan; standards reads the repo's
+# own idiom, which is where line-by-line prose reading pays. The tier ladder
+# itself never moves — only which rung a role stands on.
 DECLARED = {
     RoleName.PLANNER: ("frontier", "write"),
     RoleName.IMPLEMENTER: ("standard", "write"),
-    RoleName.SPEC_REVIEWER: ("frontier", "read"),
+    RoleName.SPEC_REVIEWER: ("high", "read"),
     RoleName.STANDARDS_REVIEWER: ("frontier", "read"),
 }
 
