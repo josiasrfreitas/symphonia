@@ -267,57 +267,6 @@ def _adapter() -> _cli.OrcaRuntimeAdapter:
 # --- the spawn itself ----------------------------------------------------
 
 
-def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
-    """What the role is told at dispatch. Deliberately a pointer, not a
-    briefing: the role contract lives in a versioned file, so it can be
-    reviewed and changed without touching this launcher (closes GRE-175 M3 —
-    the briefing used to be discarded at spawn).
-
-    The baton rule (produce the handoff document, never launch the next
-    role) is text this function owns; which skill produces that document is
-    not — that fragment comes from `_harness().handoff_hint()` (GRE-186 S3),
-    so this core module never has to know a harness-specific skill path."""
-
-    policy = _policies()[role]
-    role_file = f".symphonia/roles/{policy.role_file}"
-    handoff_dir = _handoff_dir()
-    lines = [
-        f"Ticket: {ticket.upper()}. Your role: {role.value}.",
-        f"1. Read {role_file} — it is your role contract; follow it exactly.",
-        # The worktree is linked to the ticket at creation, so the brief is
-        # one command away. Saying "read the Execution Brief" without saying
-        # how is what makes a role improvise.
-        "1b. The Execution Brief is the linked ticket. Read it with "
-        "`orca linear issue --current --full --json`, and write back to it "
-        "(plan, findings, status) with the `orca linear` commands — never "
-        "invent another channel.",
-        f"2. Read {handoff_dir}/{ticket.lower()}-*.md — if such a file exists it is the "
-        f"handoff from the role before you, and it is all the context you get.",
-        f"3. Do the work of your role for {ticket.upper()} in this worktree ({workspace}).",
-    ]
-    if policy.access is Access.READ:
-        lines.append(
-            "4. You are read-only by construction: Edit/Write are disabled at launch. "
-            "Report findings; never fix them yourself."
-        )
-    else:
-        # The dying agent writes the baton; it never launches the next role.
-        # Spawning belongs to the Orchestrator, so only the document half of
-        # the handoff skill applies here.
-        lines.append(
-            f"4. Before you finish, write your handoff document following "
-            f"{_harness().handoff_hint()}. "
-            f"Save it as {handoff_dir}/{ticket.lower()}-{role.value}-<YYYY-MM-DD>.md. "
-            f"Do NOT hand ownership to anyone and do NOT launch another agent: "
-            f"the Orchestrator starts the next role. That document is the only "
-            f"thing that survives you."
-        )
-    lines.append(
-        "5. Then send worker_done exactly once with --outcome succeeded or failed, and stop."
-    )
-    return "\n".join(lines)
-
-
 # --- the Execution Brief (planner input) ----------------------------------
 
 
@@ -361,6 +310,7 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
 
     values = {
         "ticket_key": ticket,
+        "ticket_lower": ticket.lower(),
         "role": role.value,
         "role_file": f".symphonia/roles/{policy.role_file}",
         "workspace": workspace,
@@ -370,6 +320,8 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
         "description": item.body or "(no description)",
         "comments": comment_text,
         "handoff_files": handoff_text,
+        "handoff_dir": _handoff_dir(),
+        "handoff_hint": _harness().handoff_hint(),
     }
     try:
         return template.format(**values)
@@ -489,15 +441,9 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
                 pass  # best-effort; the launch failure is what gets reported
         raise SystemExit(str(exc)) from exc
 
-    # The planner's input is the Execution Brief, injected: the issue is
-    # read and formatted here, never left for the role to go fetch. Every
-    # other role still gets the `work_spec()` pointer until its own cycle
-    # brings it a Brief (legacy, migrated one role at a time).
-    spec = (
-        build_brief(role, ticket, workspace.path)
-        if role is RoleName.PLANNER
-        else work_spec(role, ticket, workspace.path)
-    )
+    # Every role's input is the Execution Brief, injected: the ticket is
+    # read and formatted here, never left for the role to go fetch.
+    spec = build_brief(role, ticket, workspace.path)
     try:
         attempt = adapter.dispatch(context, spec)
     except _cli.OrcaCliError as exc:
@@ -841,11 +787,15 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
 def verdict(ticket: str, decision: str, notes: str) -> dict:
     """The human's decision, as argv — never typed by an agent. Formats the
     response in the contract's format (b), replies to the recorded
-    `question_id`, and lifts the `human-gate` label. `retire` does not
-    happen here: it happens in `wait`, when the planner's `worker_done`
-    arrives with the approved gate_state already recorded — one path for
-    both APPROVED and APPROVED-with-caveats, and it never kills a planner
-    still blocked inside its `ask`.
+    `question_id`, and lifts the `human-gate` label. On `approved`, also
+    posts the one and only copy of the plan the ticket ever gets — the
+    recorded `plan_body` plus the `## Approval` verdict — never on
+    submission (that would post an unapproved plan) and never on `revise`
+    (that would post once per round). `retire` does not happen here: it
+    happens in `wait`, when the planner's `worker_done` arrives with the
+    approved gate_state already recorded — one path for both APPROVED and
+    APPROVED-with-caveats, and it never kills a planner still blocked
+    inside its `ask`.
 
     The read, both writes and the reply all happen inside one
     `state_lock()`: the reply is deliberately inside the lock, not just the
@@ -898,7 +848,26 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
         _linear.LinearTracker().set_gate(ticket, False)
     except Exception as exc:  # noqa: BLE001 - any tracker failure, reported not raised
         label = f"NOT cleared ({exc}); clear the human-gate label by hand"
-    return {"ticket": ticket, "decision": token, "label": label}
+
+    result = {"ticket": ticket, "decision": token, "label": label}
+    if decision == "approved":
+        # Published here, on the approved path only — never on submission,
+        # which would put an unapproved plan on the ticket, and never on a
+        # REVISE, which would post one comment per round. `plan_body` is the
+        # raw submission `wait` recorded off the genuine plan-question; a
+        # record from before this round carries no such field.
+        plan_body = rec.get("plan_body")
+        if plan_body is None:
+            result["plan_copy"] = "NOT posted (no plan_body recorded)"
+        else:
+            approval = _reports.format_approval_reply(token, note_lines)
+            comment = f"{plan_body.rstrip()}\n\n## Approval\n\n{approval}\n"
+            try:
+                _linear.LinearTracker().post_comment(ticket, comment)
+                result["plan_copy"] = "posted"
+            except Exception as exc:  # noqa: BLE001 - any tracker failure, reported not raised
+                result["plan_copy"] = f"NOT posted ({exc})"
+    return result
 
 
 # --- the role's own two verbs ---------------------------------------------

@@ -104,6 +104,55 @@ class TestBuildBrief(unittest.TestCase):
         )
         self.assertIn("first role on this ticket", brief)
 
+    def test_implementer_brief_carries_the_baton_rule(self):
+        """GRE-187: `work_spec()` is gone — the baton rule (write the
+        handoff, never launch the next role) now lives in the implementer's
+        own `io:brief-template`, filled by `build_brief()` from
+        `handoff_dir`/`handoff_hint`."""
+
+        brief = SPAWN.build_brief(
+            RoleName.IMPLEMENTER, "GRE-181", "/tmp/gre-181", tracker=self.tracker,
+        )
+        self.assertIn("~/orca/.context/gre-181-implementer-<YYYY-MM-DD>.md", brief)
+        self.assertIn(
+            "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)",
+            brief,
+        )
+        self.assertIn(".symphonia/bin/spawn done GRE-181", brief)
+
+    def test_reviewer_briefs_carry_the_read_only_line_and_no_handoff(self):
+        for role in (RoleName.SPEC_REVIEWER, RoleName.STANDARDS_REVIEWER):
+            brief = SPAWN.build_brief(role, "GRE-181", "/tmp/gre-181", tracker=self.tracker)
+            self.assertIn(
+                "You are read-only by construction: Edit/Write are disabled at launch.",
+                brief,
+            )
+            self.assertNotIn("SKILL.md", brief)
+            self.assertNotIn("handoff document", brief)
+
+    def test_no_brief_mentions_orca_linear(self):
+        """GRE-187's whole point: no role fetches its own context — every
+        role opens with the Brief already in hand."""
+
+        for role in RoleName:
+            brief = SPAWN.build_brief(role, "GRE-181", "/tmp/gre-181", tracker=self.tracker)
+            self.assertNotIn("orca linear", brief)
+
+
+class TestEveryRoleHasABriefTemplate(unittest.TestCase):
+    """GRE-187 item 1: the four spawnable roles each declare their own
+    `io:brief-template` block — none of them fall back to a role with no
+    template of its own."""
+
+    def test_every_policy_role_file_has_a_brief_template(self):
+        for role, policy in SPAWN._policies().items():
+            with self.subTest(role=role.value):
+                role_path = SPAWN.ROLES_DIR / policy.role_file
+                try:
+                    SPAWN._reports.extract_block(role_path.read_text(), "md io:brief-template")
+                except LookupError:
+                    self.fail(f"{role_path} has no 'md io:brief-template' block")
+
 
 class TestExtractBlockFailureIsLoud(unittest.TestCase):
     def test_role_file_with_no_brief_template_raises(self):
@@ -137,6 +186,9 @@ class TestApplyGateEventQuestionFiltering(unittest.TestCase):
         self.assertEqual(rec["plan_pointer"], "pointer")
         self.assertEqual(rec["plan_decisions"], ["1. x"])
         self.assertEqual(rec["approval_rounds"], 1)
+        # the raw submission is recorded too — `spawn.verdict` republishes
+        # it on approval, never on submission
+        self.assertEqual(rec["plan_body"], body)
 
     def test_a_submission_filed_under_another_ticket_is_flagged(self):
         rec = {"ticket": "GRE-1", "gate_state": SPAWN.IDLE}
@@ -188,6 +240,19 @@ class TestApplyGateEventReplayVsResubmission(unittest.TestCase):
         self.assertEqual(rec["last_question_id"], "q-2")
         # a second round is counted, so `spawn done` never asks the planner
         self.assertEqual(rec["approval_rounds"], 1)
+        # the record keeps only the version the human is looking at now
+        self.assertEqual(rec["plan_body"], self.SUBMISSION)
+
+    def test_resubmission_overwrites_the_previous_plan_body(self):
+        old_body = "## Plan\nGRE-1 — pointer\n\n## Decisions\n1. old\n\n## Changes\nNone.\n"
+        new_body = "## Plan\nGRE-1 — pointer\n\n## Decisions\n1. new\n\n## Changes\nFixed per REVISE.\n"
+        rec = {
+            "ticket": "GRE-1", "gate_state": SPAWN._gate.VERDICT_REVISE,
+            "last_question_id": "q-1", "plan_body": old_body,
+        }
+        question = SimpleNamespace(kind="plan-question", message_id="q-2", question=new_body)
+        GATE_LOOP.apply_gate_event(rec, question, {})
+        self.assertEqual(rec["plan_body"], new_body)
 
 
 class TestApplyGateEventWorkerDone(unittest.TestCase):

@@ -270,17 +270,22 @@ class SpawnPlanNoCapability(CharacterizationCase):
 
 
 class SpawnImplementReusesWorktree(CharacterizationCase):
-    """3. `spawn implement`: no worktree create, no orphan-shell close, no
-    Brief — `work_spec()` is the pointer instead."""
+    """3. `spawn implement`: no worktree create, no orphan-shell close —
+    `build_brief()` is the Brief now, same as the planner's, so one extra
+    subprocess boundary (`_current_branch`) joins the sequence."""
 
     def test_argv_sequence(self):
-        ticket, wt_id, path = "GRE-201", "wt-1", "/workspaces/gre-201"
-        expected_spec = self.spawn.work_spec(self.RoleName.IMPLEMENTER, ticket, path)
+        ticket, wt_id, path, branch = "GRE-201", "wt-1", "/workspaces/gre-201", "gre-201-implement"
+        expected_spec = self.expected_brief(
+            self.RoleName.IMPLEMENTER, ticket, path, branch=branch,
+        )
+        self.stub_linear_tracker(ticket)
         runner = self.install_runner([
             _proc(_ok({"worktrees": [{"id": wt_id, "path": path}]})),  # find_worktree
             _proc(_ok({})),                                            # worktree set (badge)
             _proc(_ok({"terminal": {"handle": "term-2"}})),            # terminal create
             _proc(_ok({})),                                            # terminal wait tui-idle
+            _proc(f"{branch}\n"),                                      # _current_branch (in build_brief)
             _proc(_ok({"task": {"id": "task-2"}})),                    # task-create
             _proc(_ok({                                                # dispatch
                 "dispatch": {"id": "disp-2"},
@@ -297,6 +302,7 @@ class SpawnImplementReusesWorktree(CharacterizationCase):
             ["terminal", "create", "--worktree", f"id:{wt_id}",
              "--title", f"🔨 implementing · {ticket}", "--command", PLAN_COMMAND_IMPLEMENTER],
             ["terminal", "wait", "--terminal", "term-2", "--for", "tui-idle", "--timeout-ms", "120000"],
+            ["git", "-C", path, "branch", "--show-current"],
             ["orchestration", "task-create", "--spec", expected_spec],
             ["orchestration", "dispatch", "--task", "task-2", "--to", "term-2",
              "--inject", "--return-preamble"],
@@ -433,29 +439,35 @@ class SpawnSubmitSingleRound(CharacterizationCase):
         self.assertEqual(out["verdict"], "approved")
 
 
-class WorkSpecBatonText(CharacterizationCase):
-    """C4 of the GRE-186 S3 verdict: the characterization scenarios above
-    recompute `work_spec()` by calling the function itself, so its text has
-    no oracle anywhere else — and this round rewrote exactly that text (the
-    baton rule's `handoff_dir` now comes from `config.json`, and the skill
-    path from `_harness().handoff_hint()`, not a core constant). Fixed here
-    so a future edit to either source is caught."""
+class BriefBatonText(CharacterizationCase):
+    """C4 of the GRE-186 S3 verdict, carried over onto the Brief: the
+    characterization scenarios above recompute `build_brief()` by calling
+    the function itself, so its text has no oracle anywhere else. GRE-187
+    moved the baton rule (produce the handoff, never launch the next role)
+    off `work_spec()` — deleted — and into each write role's own
+    `io:brief-template`, filled from `handoff_dir`/`handoff_hint`, now
+    values `build_brief()` supplies. Fixed here so a future edit to either
+    source is caught."""
 
     def test_write_role_gets_the_baton_rule_with_handoff_dir_and_harness_hint(self):
-        spec = self.spawn.work_spec(self.RoleName.IMPLEMENTER, "GRE-1", "/workspaces/gre-1")
-        self.assertIn("~/orca/.context/gre-1-implementer-<YYYY-MM-DD>.md", spec)
-        self.assertIn(
-            "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)", spec
+        brief = self.expected_brief(
+            self.RoleName.IMPLEMENTER, "GRE-1", "/workspaces/gre-1", branch="gre-1-implement",
         )
-        self.assertIn("Do NOT hand ownership to anyone and do NOT launch another agent", spec)
+        self.assertIn("~/orca/.context/gre-1-implementer-<YYYY-MM-DD>.md", brief)
+        self.assertIn(
+            "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)", brief
+        )
+        self.assertIn("Do NOT\nhand ownership to anyone and do NOT launch another agent", brief)
 
     def test_read_role_gets_the_read_only_line_and_no_skill_path(self):
-        spec = self.spawn.work_spec(self.RoleName.SPEC_REVIEWER, "GRE-1", "/workspaces/gre-1")
-        self.assertIn(
-            "You are read-only by construction: Edit/Write are disabled at launch.", spec
+        brief = self.expected_brief(
+            self.RoleName.SPEC_REVIEWER, "GRE-1", "/workspaces/gre-1", branch="gre-1-review",
         )
-        self.assertNotIn("SKILL.md", spec)
-        self.assertNotIn("handoff document", spec)
+        self.assertIn(
+            "You are read-only by construction: Edit/Write are disabled at launch.", brief
+        )
+        self.assertNotIn("SKILL.md", brief)
+        self.assertNotIn("handoff document", brief)
 
 
 if __name__ == "__main__":

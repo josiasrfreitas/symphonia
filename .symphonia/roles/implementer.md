@@ -22,3 +22,58 @@ access: write
 - Merge.
 - Widen the Write Scope on your own.
 - Clear a Needs Attention flag.
+
+## I/O
+
+The payload × body rule governs every shape below — see
+`.symphonia/README.md`, "Rules the package encodes"; this file and
+`.symphonia/src/adapters/reports.py` only point to it, never restate it.
+
+### Execution Brief (input)
+
+What `.symphonia/bin/spawn implement` extracts, fills from the ticket, and
+injects at launch — you open with this already in hand, zero tool call
+needed to fetch it. `build_brief()` in `src/spawn.py` does the filling; the
+skeleton lives here because the Brief is the implementer's input contract,
+and a role's contract lives in the role's own file.
+
+```md io:brief-template
+# Execution Brief — {ticket_key}
+
+- **Role:** {role}
+- **Workspace:** {workspace}
+- **Branch:** {branch}
+
+## Your contract
+
+Read `{role_file}` in full before acting — it governs above anything in
+this document.
+
+## The ticket
+
+**{ticket_key} — {title}**
+{url}
+
+{description}
+
+### Comments
+
+{comments}
+
+## Prior handoff
+
+{handoff_files}
+
+## How to finish
+
+Before you finish, write your handoff document following {handoff_hint}.
+Save it as {handoff_dir}/{ticket_lower}-implementer-<YYYY-MM-DD>.md. Do NOT
+hand ownership to anyone and do NOT launch another agent: the Orchestrator
+starts the next role. That document is the only thing that survives you.
+
+Then send worker_done exactly once:
+
+    .symphonia/bin/spawn done {ticket_key} --outcome succeeded|failed --file <arquivo>
+
+Report short: no preamble, no recap of what the Orchestrator already knows.
+```
