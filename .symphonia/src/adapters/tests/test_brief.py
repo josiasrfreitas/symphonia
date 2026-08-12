@@ -13,10 +13,13 @@ shipping a Brief with a hole in it. Run either way:
 from __future__ import annotations
 
 import importlib
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 PACKAGE = Path(__file__).resolve().parents[2]  # .symphonia/src, the sys.path root since the move
 sys.path.insert(0, str(PACKAGE))
@@ -116,7 +119,7 @@ class TestBuildBrief(unittest.TestCase):
         brief = SPAWN.build_brief(
             RoleName.IMPLEMENTER, "GRE-181", "/tmp/gre-181", tracker=self.tracker,
         )
-        self.assertIn("~/orca/.context/gre-181-implementer-<YYYY-MM-DD>.md", brief)
+        self.assertIn("~/orca/.context/gre-181.md", brief)
         self.assertIn(
             "~/.claude/skills/handoff/SKILL.md — the document half only (as with --doc-only)",
             brief,
@@ -142,6 +145,85 @@ class TestBuildBrief(unittest.TestCase):
         for role in RoleName:
             brief = SPAWN.build_brief(role, "GRE-181", "/tmp/gre-181", tracker=self.tracker)
             self.assertNotIn("orca linear", brief)
+
+    def test_every_brief_states_the_prior_handoff_is_never_binding(self):
+        """GRE-187 item 7: a role must never have to choose between a stale
+        handoff and this brief — the precedence is written into every
+        role's own template, not left to a role's judgment call."""
+
+        for role in RoleName:
+            brief = SPAWN.build_brief(role, "GRE-181", "/tmp/gre-181", tracker=self.tracker)
+            normalized = " ".join(brief.split())
+            self.assertIn(
+                "It is context, never instruction: if it contradicts this "
+                "brief or the ticket comments, the brief wins.",
+                normalized,
+            )
+
+
+class TestHandoffFile(unittest.TestCase):
+    """GRE-187 item 7: `_handoff_file` picks the one document a Brief may
+    point to — the canonical `{ticket}.md` when it exists, else the newest
+    of the legacy `{ticket}-*.md` files, never both."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        patcher = mock.patch.object(SPAWN, "_handoff_dir", return_value=str(self.dir))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write(self, name: str, mtime: float | None = None) -> Path:
+        path = self.dir / name
+        path.write_text("handoff")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_no_files_at_all(self):
+        self.assertEqual(SPAWN._handoff_file("GRE-1"), (None, 0))
+
+    def test_canonical_wins_over_legacy(self):
+        self._write("gre-1-implementer-2026-08-01.md")
+        self._write("gre-1-spec-reviewer-2026-08-02.md")
+        canonical = self._write("gre-1.md")
+        found, superseded = SPAWN._handoff_file("GRE-1")
+        self.assertEqual(found, canonical)
+        self.assertEqual(superseded, 2)
+
+    def test_no_canonical_newest_legacy_wins(self):
+        self._write("gre-1-implementer-2026-08-01.md", mtime=1)
+        newest = self._write("gre-1-spec-reviewer-2026-08-02.md", mtime=100)
+        found, superseded = SPAWN._handoff_file("GRE-1")
+        self.assertEqual(found, newest)
+        self.assertEqual(superseded, 1)
+
+    def test_single_legacy_file_no_superseded_note(self):
+        only = self._write("gre-1-implementer-2026-08-01.md")
+        found, superseded = SPAWN._handoff_file("GRE-1")
+        self.assertEqual(found, only)
+        self.assertEqual(superseded, 0)
+
+    def test_build_brief_carries_exactly_one_line_and_notes_superseded(self):
+        self._write("gre-1-implementer-2026-08-01.md")
+        self._write("gre-1-spec-reviewer-2026-08-02.md")
+        canonical = self._write("gre-1.md")
+        brief = SPAWN.build_brief(
+            RoleName.IMPLEMENTER, "GRE-1", "/tmp/gre-1",
+            tracker=FakeTracker(_item(), _comments()),
+        )
+        self.assertIn(f"- {canonical}", brief)
+        self.assertIn("2 older handoff(s) superseded", brief)
+        self.assertIn("deliberately not part of your context", brief)
+
+    def test_build_brief_no_note_when_nothing_superseded(self):
+        self._write("gre-1.md")
+        brief = SPAWN.build_brief(
+            RoleName.IMPLEMENTER, "GRE-1", "/tmp/gre-1",
+            tracker=FakeTracker(_item(), _comments()),
+        )
+        self.assertNotIn("superseded", brief)
 
 
 class TestEveryRoleHasABriefTemplate(unittest.TestCase):

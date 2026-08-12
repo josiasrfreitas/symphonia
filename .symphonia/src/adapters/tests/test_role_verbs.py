@@ -235,6 +235,161 @@ class TestDoneBeforeApproval(RoleVerbCase):
         self.assertEqual(self.payload_of()["outcome"], "failed")
 
 
+class TestDoneEmptySuccess(unittest.TestCase):
+    """GRE-187 item 6: `done --outcome succeeded` from a write-access,
+    non-planner role is refused before anything is sent if the worktree
+    shows no change against `head_at_dispatch` — and, for every role and
+    either outcome, an empty body is refused outright.
+
+    A real temp git repo, not a fake: the comparison is `git -C <worktree>
+    rev-parse HEAD` / `git status --porcelain`, and stubbing those out would
+    test the stub, not the two commands that actually run.
+    """
+
+    REPORT_BODY = "Report body text.\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.environ["SYMPHONIA_RUNTIME"] = self.tmp.name
+        self.addCleanup(os.environ.pop, "SYMPHONIA_RUNTIME", None)
+        os.environ["ORCA_TERMINAL_HANDLE"] = "term_impl"
+        self.addCleanup(os.environ.pop, "ORCA_TERMINAL_HANDLE", None)
+
+        self.spawn = _load_spawn()
+
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.repo, check=True)
+        (self.repo / "a.txt").write_text("x")
+        subprocess.run(["git", "add", "a.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.repo, check=True)
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        self.record = {
+            "ticket": "GRE-1", "role": "implementer", "access": "write",
+            "worktree": str(self.repo), "terminal": "term_impl",
+            "task": "task_1", "dispatch": "ctx_1", "capability": "dcap_abc",
+            "head_at_dispatch": head,
+        }
+        self.spawn.state_write({"GRE-1/implementer": self.record})
+
+        self.calls: list[tuple] = []
+
+        def fake_orca(*argv, expect_lifecycle_ok=False):
+            self.calls.append((argv, expect_lifecycle_ok))
+            return {}
+
+        self.spawn.orca = fake_orca
+
+    def body_file(self, text: str) -> str:
+        path = Path(self.tmp.name) / "body.md"
+        path.write_text(text)
+        return str(path)
+
+    def _set(self, **updates) -> None:
+        data = self.spawn.state_read()
+        data["GRE-1/implementer"].update(updates)
+        self.spawn.state_write(data)
+
+    def test_clean_worktree_same_head_refuses(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.spawn.done(
+                "GRE-1", self.body_file(self.REPORT_BODY),
+                outcome="succeeded", files_modified="",
+            )
+        self.assertIn("no change", str(ctx.exception))
+        self.assertEqual(self.calls, [])
+
+    def test_a_new_commit_sends(self):
+        (self.repo / "b.txt").write_text("y")
+        subprocess.run(["git", "add", "b.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "work"], cwd=self.repo, check=True)
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        self.assertEqual(len(self.calls), 1)
+
+    def test_an_uncommitted_change_sends_and_flags_the_record(self):
+        """Real work, just never committed — accepted, not refused, but the
+        record is flagged so the Orchestrator can check without opening the
+        worktree by hand (correction round: implementer delivered good work
+        and never ran `git commit`)."""
+
+        (self.repo / "c.txt").write_text("z")
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        self.assertEqual(len(self.calls), 1)
+        rec = self.spawn.state_read()["GRE-1/implementer"]
+        self.assertTrue(rec["uncommitted_work"])
+
+    def test_a_new_commit_does_not_flag_the_record(self):
+        (self.repo / "b.txt").write_text("y")
+        subprocess.run(["git", "add", "b.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "work"], cwd=self.repo, check=True)
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        rec = self.spawn.state_read()["GRE-1/implementer"]
+        self.assertNotIn("uncommitted_work", rec)
+
+    def test_failed_outcome_with_clean_worktree_sends(self):
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="failed", files_modified="",
+        )
+        self.assertEqual(len(self.calls), 1)
+
+    def test_read_access_role_sends_even_if_clean(self):
+        """A reviewer legitimately writes no code; its report IS the work."""
+
+        self._set(access="read")
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        self.assertEqual(len(self.calls), 1)
+
+    def test_no_baseline_sends(self):
+        """A record from before this round has no `head_at_dispatch`; the
+        check is skipped rather than trapping a role that predates it."""
+
+        data = self.spawn.state_read()
+        data["GRE-1/implementer"].pop("head_at_dispatch")
+        self.spawn.state_write(data)
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_measurement_failure_does_not_refuse(self):
+        """The verdict's ressalva: if git itself cannot answer (worktree
+        gone, broken repo), that is not proof of an empty success — a false
+        positive here costs a whole round's work, a false negative costs a
+        check the Orchestrator already does."""
+
+        self._set(worktree=str(self.repo) + "-missing")
+        self.spawn.done(
+            "GRE-1", self.body_file(self.REPORT_BODY), outcome="succeeded", files_modified="",
+        )
+        self.assertEqual(len(self.calls), 1)
+
+    def test_empty_body_refuses(self):
+        """One case (implementer, failed) is enough: the check sits before
+        any role/outcome branch in `done()`, so it never sees either — the
+        guarantee comes from that position in the code, not from exercising
+        every combination here."""
+
+        with self.assertRaises(SystemExit) as ctx:
+            self.spawn.done("GRE-1", self.body_file("   \n"), outcome="failed", files_modified="")
+        self.assertIn("empty report", str(ctx.exception))
+        self.assertEqual(self.calls, [])
+
+
 class TestSubmit(RoleVerbCase):
     gate_state = "idle"
     approval_rounds = 0

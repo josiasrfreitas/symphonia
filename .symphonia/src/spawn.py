@@ -278,8 +278,41 @@ def _current_branch(workspace: str) -> str:
     return proc.stdout.strip() or "(unknown)"
 
 
-def _handoff_files(ticket: str) -> list[Path]:
-    return sorted(Path(os.path.expanduser(_handoff_dir())).glob(f"{ticket.lower()}-*.md"))
+def _head(workspace: str) -> str:
+    """The commit a worktree is on, or `""` if git could not answer — the
+    same "empty/erro -> empty string" shape as `_current_branch`. Recorded
+    at dispatch as `head_at_dispatch`, the baseline `done()` compares
+    against to catch an empty `succeeded`."""
+
+    proc = subprocess.run(
+        ["git", "-C", workspace, "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    return proc.stdout.strip()
+
+
+def _handoff_file(ticket: str) -> tuple[Path | None, int]:
+    """The one handoff a role's Brief may point to, plus how many other
+    files were passed over — item 7 of GRE-187: a role must never have to
+    choose which of two documents to believe.
+
+    The canonical path, `{handoff_dir}/{ticket_lower}.md`, always wins when
+    it exists: it is the only file a role's own "How to finish" instructs
+    it to write, so its presence alone proves it is current. Legacy files
+    from before this round (`{ticket_lower}-*.md`) are a fallback, picked by
+    newest mtime — the lexicographic name mixes role and date and would lie
+    about which one is current.
+    """
+
+    directory = Path(os.path.expanduser(_handoff_dir()))
+    canonical = directory / f"{ticket.lower()}.md"
+    legacy = sorted(directory.glob(f"{ticket.lower()}-*.md"))
+    if canonical.exists():
+        return canonical, len(legacy)
+    if not legacy:
+        return None, 0
+    newest = max(legacy, key=lambda p: p.stat().st_mtime)
+    return newest, len(legacy) - 1
 
 
 def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) -> str:
@@ -303,10 +336,16 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
         for c in comments
     ) or "None."
 
-    handoff_files = _handoff_files(ticket)
-    handoff_text = "\n".join(f"- {p}" for p in handoff_files) or (
-        "None — this is the first role on this ticket."
-    )
+    handoff_file, superseded = _handoff_file(ticket)
+    if handoff_file is None:
+        handoff_text = "None — this is the first role on this ticket."
+    else:
+        handoff_text = f"- {handoff_file}"
+        if superseded:
+            handoff_text += (
+                f"\n\n({superseded} older handoff(s) superseded — "
+                f"deliberately not part of your context.)"
+            )
 
     values = {
         "ticket_key": ticket,
@@ -449,6 +488,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     except _cli.OrcaCliError as exc:
         raise SystemExit(str(exc)) from exc
     snap = adapter.snapshot(attempt)
+    head_at_dispatch = _head(workspace.path)
 
     record = {
         "ticket": ticket,
@@ -457,6 +497,11 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "access": snap["access"],
         "worktree": workspace.path,
         "worktree_id": workspace.id,
+        # The baseline `done()` compares HEAD against to catch a `succeeded`
+        # that changed nothing (GRE-187 item 6). `""` on a git error — never
+        # raised here, since a `spawn` that fails on a measurement it does
+        # not need would be its own bug.
+        "head_at_dispatch": head_at_dispatch,
         "terminal": snap["terminal"],
         "task": snap["task"],
         "dispatch": snap["dispatch"],
@@ -976,12 +1021,43 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
     }
 
 
+def _worktree_measurement(workspace: str) -> tuple[str, bool] | None:
+    """`(HEAD, tree is dirty)`, or `None` if git itself could not answer —
+    a worktree gone missing, a full disk, a repository in a broken state.
+    `None` is not "clean": the caller must never read a failed measurement
+    as proof that nothing changed (GRE-187 item 6 verdict ressalva)."""
+
+    head_proc = subprocess.run(
+        ["git", "-C", workspace, "rev-parse", "HEAD"], capture_output=True, text=True,
+    )
+    status_proc = subprocess.run(
+        ["git", "-C", workspace, "status", "--porcelain"], capture_output=True, text=True,
+    )
+    if head_proc.returncode != 0 or status_proc.returncode != 0:
+        return None
+    return head_proc.stdout.strip(), bool(status_proc.stdout.strip())
+
+
 def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> dict:
     """The single `worker_done` a dispatch allows, built and checked here.
 
     For the planner it also refuses to fire before the gate recorded an
     approval — that check is what protects the one shot, since a `worker_done`
     that arrives without a recorded approval is flagged and cannot be resent.
+
+    Two more refusals, both role-side and local (GRE-187 item 6): an empty
+    body, for any role and either outcome — a `failed` with no explanation
+    serves nobody either — and, for a write-access non-planner role
+    reporting `succeeded`, a worktree that shows no change at all against
+    `head_at_dispatch`. Both fire BEFORE anything is sent, same as the
+    planner's parse checks above: the one shot a dispatch grants is never
+    spent on an empty success.
+
+    A third case never refuses: the same role reporting `succeeded` with a
+    dirty tree but no new commit. That is real work, just not persisted —
+    refusing it would destroy the report to save a five-second `git commit`.
+    It is accepted and flagged `uncommitted_work: true` on the record
+    instead, so the Orchestrator can check without opening the worktree.
     """
 
     ticket = ticket.upper()
@@ -989,6 +1065,11 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
         raise SystemExit(f"unknown outcome {outcome!r}; use 'succeeded' or 'failed'")
     key, rec = own_record(ticket)
     body = Path(body_path).read_text()
+    if not body.strip():
+        raise SystemExit(
+            f"{ticket}/{rec['role']}: an empty report says nothing; `done` needs a body "
+            f"even for --outcome failed"
+        )
     extra: dict = {}
 
     if rec["role"] == GATE_ROLE.value and outcome == "succeeded":
@@ -1006,6 +1087,54 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
         # not know about, and there is no second worker_done to resend them.
         body = _reports.set_approval_rounds(body, rounds)
         extra = {"planApproved": True, "approvalRounds": rounds}
+
+    if outcome == "succeeded" and rec.get("access") == "write" and rec["role"] != GATE_ROLE.value:
+        baseline = rec.get("head_at_dispatch")
+        if not baseline:
+            # No baseline means the whole check is skipped, dirty-tree half
+            # included — not just the HEAD comparison. A record from before
+            # this round has no dirty-tree evidence to trust either, and
+            # refusing on a partial check would trap an old record with a
+            # clean tree, which is exactly what this skip exists to avoid.
+            print(
+                f"note: {ticket}/{rec['role']} has no head_at_dispatch recorded "
+                f"(pre-GRE-187 dispatch); skipping the empty-success check entirely "
+                f"(HEAD comparison and dirty-tree check both)", file=sys.stderr,
+            )
+        else:
+            measured = _worktree_measurement(rec["worktree"])
+            if measured is None:
+                print(
+                    f"note: could not measure {rec['worktree']} (git error); "
+                    f"skipping the empty-success check", file=sys.stderr,
+                )
+            else:
+                head_now, dirty = measured
+                if head_now == baseline and not dirty:
+                    raise SystemExit(
+                        f"{ticket}/{rec['role']}: outcome=succeeded but the worktree shows no "
+                        f"change — HEAD is still {head_now} (same as at dispatch) and `git "
+                        f"status --porcelain` is empty. An empty success is exactly what this "
+                        f"gate exists to catch. If there genuinely was nothing to do, report "
+                        f"`--outcome failed --file <report explaining why>` instead, so the "
+                        f"Orchestrator can decide."
+                    )
+                if head_now == baseline and dirty:
+                    # The dirty tree is real work — this is not the empty
+                    # success above — but it never made it into a commit, and
+                    # uncommitted work does not survive the worktree. Accept,
+                    # never refuse: flag it on the record so the Orchestrator
+                    # can check without opening the worktree by hand.
+                    print(
+                        f"note: {ticket}/{rec['role']} outcome=succeeded but HEAD is still "
+                        f"{head_now} (same as at dispatch) — the tree is dirty but nothing was "
+                        f"committed; flagging uncommitted_work on the record", file=sys.stderr,
+                    )
+                    with state_lock():
+                        data = state_read()
+                        if key in data:
+                            data[key]["uncommitted_work"] = True
+                            state_write(data)
 
     argv = [
         "orchestration", "send",
