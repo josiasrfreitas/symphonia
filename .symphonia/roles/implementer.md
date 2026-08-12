@@ -1,6 +1,7 @@
 ---
 role: implementer
 capability_tier: standard
+access: write
 ---
 
 # Implementer

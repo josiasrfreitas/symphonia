@@ -1,6 +1,7 @@
 ---
 role: planner
 capability_tier: frontier
+access: write
 ---
 
 # Planner

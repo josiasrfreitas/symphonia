@@ -46,7 +46,11 @@ from ..runtime_adapter import (
     WorkspaceRef,
 )
 from .adapter import ROLE_BADGE, RunResult
-from .launcher import TIER_MODELS
+# `harnesses.claude` is the one documented exception to "nothing outside
+# `adapters/harnesses/` reads its internals" (GRE-186 S2): this fake needs
+# the same tier->model table the real harness launches with, so a scripted
+# `orca terminal create --command` can tell which tier a command asked for.
+from ..harnesses.claude import TIER_MODELS
 
 
 @dataclass

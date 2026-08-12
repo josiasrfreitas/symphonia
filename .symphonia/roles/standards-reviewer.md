@@ -1,6 +1,7 @@
 ---
 role: standards-reviewer
 capability_tier: high
+access: read
 ---
 
 # Standards Reviewer

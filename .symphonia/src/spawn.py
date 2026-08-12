@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import fcntl
 import json
 import os
@@ -63,9 +64,10 @@ from adapters.linear import adapter as _linear
 from adapters.linear import client as _linear_client
 from adapters.orca import adapter as _cli
 from adapters.orca import events as _events
-from adapters.orca import launcher as _launcher
+from adapters.harnesses import claude as _claude
 import setup_worktree as _setup_worktree
 from workflow import gate_loop as _gate_loop
+from workflow import roles as _roles
 
 # `.symphonia/`, the package root: two levels up from this file
 # (`src/spawn.py`), one for `src/` and one for the package. Everything below
@@ -117,12 +119,18 @@ STATE_LOCK = STATE.with_name(STATE.name + ".lock")
 # that reviewers have to maintain — do not.
 HANDOFF_SKILL = "~/.claude/skills/handoff/SKILL.md"
 HANDOFF_DIR = "~/orca/.context"
-ROLE_FILES = {
-    RoleName.PLANNER: "planner.md",
-    RoleName.IMPLEMENTER: "implementer.md",
-    RoleName.SPEC_REVIEWER: "spec-reviewer.md",
-    RoleName.STANDARDS_REVIEWER: "standards-reviewer.md",
-}
+
+# The role matrix (tier, access, role file) lives only in each role file's
+# own frontmatter now — `workflow.roles.load_policies` reads it, and fails
+# at bootstrap rather than letting a missing/malformed declaration launch
+# something undeclared (GRE-186 S1). No cache: every verb call re-reads the
+# four small files, so an edit to a role file takes effect on the next spawn
+# without restarting anything.
+ROLES_DIR = PACKAGE / "roles"
+
+
+def _policies() -> dict[RoleName, _roles.RolePolicy]:
+    return _roles.load_policies(ROLES_DIR)
 
 # --- orca CLI ------------------------------------------------------------
 
@@ -246,7 +254,8 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
     reviewed and changed without touching this launcher (closes GRE-175 M3 —
     the briefing used to be discarded at spawn)."""
 
-    role_file = f".symphonia/roles/{ROLE_FILES[role]}"
+    policy = _policies()[role]
+    role_file = f".symphonia/roles/{policy.role_file}"
     lines = [
         f"Ticket: {ticket.upper()}. Your role: {role.value}.",
         f"1. Read {role_file} — it is your role contract; follow it exactly.",
@@ -261,7 +270,7 @@ def work_spec(role: RoleName, ticket: str, workspace: str) -> str:
         f"handoff from the role before you, and it is all the context you get.",
         f"3. Do the work of your role for {ticket.upper()} in this worktree ({workspace}).",
     ]
-    if _launcher.ROLE_ACCESS[role] is Access.READ:
+    if policy.access is Access.READ:
         lines.append(
             "4. You are read-only by construction: Edit/Write are disabled at launch. "
             "Report findings; never fix them yourself."
@@ -307,7 +316,8 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
     the tracker adapter directly, same as GRE-174)."""
 
     ticket = ticket.upper()
-    role_path = PACKAGE / "roles" / ROLE_FILES[role]
+    policy = _policies()[role]
+    role_path = ROLES_DIR / policy.role_file
     template = _reports.extract_block(role_path.read_text(), "md io:brief-template")
 
     tracker = tracker or _linear.LinearTracker()
@@ -327,7 +337,7 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
     values = {
         "ticket_key": ticket,
         "role": role.value,
-        "role_file": f".symphonia/roles/{ROLE_FILES[role]}",
+        "role_file": f".symphonia/roles/{policy.role_file}",
         "workspace": workspace,
         "branch": _current_branch(workspace),
         "title": item.title,
@@ -428,20 +438,11 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
             )
 
     # `--tier` is a human override, not a knob for the Orchestrator: the
-    # matrix is the default precisely so no agent has to choose a model.
-    #
-    # Both tables are read here, adjacent, because composition requires it:
-    # `launch_role` takes a `RoleSpec` with tier and access already decided,
-    # so the caller has to hold them (`launcher.py:151-153`). That does make
-    # this a second reading site alongside `build_launch` — a property this
-    # code had before the composition and lost. Collapsing tier/access to a
-    # single source is GRE-186's first scope item (RolePolicy); until then,
-    # keeping the two reads adjacent is containment, not a fix.
-    resolved_tier = _launcher.ROLE_TIERS[role]
-    resolved_access = _launcher.ROLE_ACCESS[role]
+    # policy is the default precisely so no agent has to choose a model.
+    policy = _policies()[role]
     if tier:
         try:
-            resolved_tier = _contract.CapabilityTier(tier)
+            policy = dataclasses.replace(policy, tier=_contract.CapabilityTier(tier))
         except ValueError:
             raise SystemExit(
                 f"unknown tier {tier!r}; known: "
@@ -453,7 +454,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         launch = adapter.launch_role(
             workspace,
             _contract.RoleSpec(
-                role=role, tier=resolved_tier, access=resolved_access, briefing="",
+                role=role, tier=policy.tier, access=policy.access, briefing="",
             ),
         )
     except (RuntimeError, _cli.OrcaCliError) as exc:
@@ -483,7 +484,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "ticket": ticket,
         "role": role.value,
         "tier": snap["tier"],
-        "model_requested": _launcher.TIER_MODELS[resolved_tier],
+        "model_requested": _claude.TIER_MODELS[policy.tier],
         "access": snap["access"],
         "worktree": workspace.path,
         "worktree_id": workspace.id,
@@ -520,7 +521,7 @@ def status(ticket: str | None) -> list[dict]:
         except _cli.OrcaCliError:
             dispatch_status = "unknown"
         transcript = Path(rec["transcript"]) if rec.get("transcript") else None
-        models = _launcher.observed_models(transcript) if transcript else []
+        models = _claude.observed_models(transcript) if transcript else []
         out.append(
             {
                 "key": key,

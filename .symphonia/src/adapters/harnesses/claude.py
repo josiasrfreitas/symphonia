@@ -22,10 +22,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..runtime_adapter import Access, CapabilityTier, RoleName
+from ..harness_adapter import (
+    HarnessCapabilities,
+    HarnessRefusal,
+    HarnessSession,
+    PreparedLaunch,
+    TierEvidence,
+)
+from ..runtime_adapter import Access, CapabilityTier, RoleName, RolePolicy, WorkspaceRef
 
 # --- Capability Tier -> model -------------------------------------------
 #
@@ -55,26 +63,13 @@ TIER_EFFORT: dict[CapabilityTier, str] = {
     CapabilityTier.FAST: "low",
 }
 
-# --- Role -> (tier, access) ---------------------------------------------
+# --- tier/access -----------------------------------------------------------
 #
-# The matrix decided on GRE-179: planner Fable, implementer Sonnet, reviewer
-# Opus. Roles carry the same declaration in their `.symphonia/roles/*.md`
-# frontmatter; this table is what actually launches, and the conformance
-# test asserts the two agree.
-
-ROLE_TIERS: dict[RoleName, CapabilityTier] = {
-    RoleName.PLANNER: CapabilityTier.FRONTIER,
-    RoleName.IMPLEMENTER: CapabilityTier.STANDARD,
-    RoleName.SPEC_REVIEWER: CapabilityTier.HIGH,
-    RoleName.STANDARDS_REVIEWER: CapabilityTier.HIGH,
-}
-
-ROLE_ACCESS: dict[RoleName, Access] = {
-    RoleName.PLANNER: Access.WRITE,
-    RoleName.IMPLEMENTER: Access.WRITE,
-    RoleName.SPEC_REVIEWER: Access.READ,
-    RoleName.STANDARDS_REVIEWER: Access.READ,
-}
+# The matrix decided on GRE-179 (planner Fable, implementer Sonnet, reviewer
+# Opus) now lives only in each role's `.symphonia/roles/*.md` frontmatter,
+# read by `workflow.roles.load_policies` — no second table here to drift out
+# of sync with it (GRE-186 S1). `build_launch` takes `tier`/`access` from the
+# caller's `RolePolicy`; it no longer has a default of its own.
 
 # Tools a read-access role may never call. Read access is enforced by the
 # launch command, not by asking the model to behave: a reviewer that cannot
@@ -142,15 +137,16 @@ def build_launch(
     *,
     session_id: str,
     workspace: str,
+    tier: CapabilityTier,
+    access: Access,
     provider: str = DEFAULT_PROVIDER,
-    tier: CapabilityTier | None = None,
-    access: Access | None = None,
 ) -> LaunchPlan:
     """The one function that writes an agent command line.
 
-    ``tier``/``access`` default to the role matrix. The Runtime Adapter
-    passes the ``RoleSpec`` values explicitly, so a caller holding a spec
-    stays authoritative over its own declaration."""
+    ``tier``/``access`` are always the caller's ``RolePolicy`` — no default
+    here to drift from the role file frontmatter (GRE-186 S1). The Runtime
+    Adapter passes the ``RoleSpec`` values it was given, so a caller holding
+    a spec stays authoritative over its own declaration."""
 
     grammar = PROVIDERS.get(provider)
     if grammar is None:
@@ -158,8 +154,6 @@ def build_launch(
             f"no launch grammar for provider {provider!r}; "
             f"known: {', '.join(sorted(PROVIDERS))}"
         )
-    tier = tier or ROLE_TIERS[role]
-    access = access or ROLE_ACCESS[role]
 
     argv: list[str] = [grammar.executable, grammar.model_flag, TIER_MODELS[tier]]
     if grammar.effort_flag:
@@ -238,3 +232,88 @@ def tier_matches(tier: CapabilityTier, models: list[str]) -> bool:
 
     alias = TIER_MODELS[tier]
     return bool(models) and all(alias in m for m in models)
+
+
+# --- HarnessAdapter -------------------------------------------------------
+#
+# `ClaudeHarness` wraps everything above behind `adapters.harness_adapter`'s
+# neutral Protocol (GRE-186 S2): `build_launch` is still the one function
+# that writes an agent command line, `observed_models`/`tier_matches` are
+# still what turns a transcript into evidence. `OrcaRuntimeAdapter.launch_role`
+# still calls `build_launch` directly, not through this class — inverting
+# that call is GRE-186 S3, a separate round.
+
+# The path `handoff_hint()` names — the skill that produces a role's handoff
+# document. Duplicated from `spawn.HANDOFF_SKILL` rather than imported: the
+# core (`spawn.py`) still owns the full baton instructions in this round
+# (GRE-186 S2), and only splices in a harness's hint starting GRE-186 S3.
+# The two must read identically until then.
+HANDOFF_SKILL = "~/.claude/skills/handoff/SKILL.md"
+
+
+@dataclass(frozen=True)
+class ClaudeHarness:
+    """`HarnessAdapter` for the ``claude`` CLI.
+
+    ``capabilities`` is a stored field, not a computed property: it never
+    varies for the real harness, and a plain field lets a test stub it on
+    one instance with a single constructor kwarg — no second harness
+    implementation, no monkeypatching a class-level descriptor."""
+
+    capabilities: HarnessCapabilities = field(
+        default_factory=lambda: HarnessCapabilities(read_only=True, tier_evidence="observed")
+    )
+
+    def prepare(self, *, workspace: WorkspaceRef, policy: RolePolicy) -> PreparedLaunch:
+        if policy.access is Access.READ and not self.capabilities.read_only:
+            raise HarnessRefusal(
+                f"this harness cannot enforce read-only access at launch; "
+                f"refusing to start {policy.role.value} where it could write"
+            )
+        session_id = str(uuid.uuid4())
+        plan = build_launch(
+            policy.role,
+            session_id=session_id,
+            workspace=workspace.path,
+            tier=policy.tier,
+            access=policy.access,
+        )
+        session = HarnessSession(
+            id=session_id,
+            observation_ref=str(plan.transcript) if plan.transcript else None,
+        )
+        return PreparedLaunch(command=plan.argv, session=session)
+
+    def observe(self, session: HarnessSession, requested: CapabilityTier) -> TierEvidence:
+        """The `verify_tier` semantics `OrcaRuntimeAdapter` has always had,
+        moved behind the Protocol: no transcript reference, or a transcript
+        that has not answered yet, is `requested`, never a guess. Once it
+        has answered, a match is `observed`; a divergence is `observed` too
+        — the evidence is honest either way, only the tier differs."""
+
+        if not session.observation_ref:
+            return TierEvidence(
+                kind="requested", tier=requested,
+                detail="this harness exposes no transcript for this session",
+            )
+        models = observed_models(Path(session.observation_ref))
+        if not models:
+            return TierEvidence(
+                kind="requested", tier=requested,
+                detail="session has not answered yet; transcript is empty",
+            )
+        if tier_matches(requested, models):
+            return TierEvidence(
+                kind="observed", tier=requested,
+                detail=f"transcript reports {', '.join(models)}",
+            )
+        return TierEvidence(
+            kind="observed", tier=None,
+            detail=(
+                f"tier mismatch: requested {requested.value} "
+                f"({TIER_MODELS[requested]}), transcript reports {', '.join(models)}"
+            ),
+        )
+
+    def handoff_hint(self) -> str:
+        return f"{HANDOFF_SKILL} — the document half only (as with --doc-only)"
