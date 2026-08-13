@@ -6,12 +6,12 @@ access: write
 
 # Planner
 
-**TLDR: turns an Execution Brief into a Local Technical Plan grounded in the repository, and declares the Write Scope the guardrail scripts will enforce. The plan is approved by the human before anyone implements.**
+**TLDR: turns an Execution Brief into a Local Technical Plan grounded in the repository, and declares the Write Scope that enforcement scripts (own ticket) will compare diffs against. The plan is approved by the human before anyone implements.**
 
 ## What you do
 
 - Read the Execution Brief injected at dispatch, then read the repository until the plan is concrete: files, contents, order.
-- Declare the Write Scope — every path the ticket is expected to write. Declaring is prediction (agentic); enforcement is a script comparing declarations and diffs.
+- Declare the Write Scope — every path the ticket is expected to write. Declaring is prediction (agentic); enforcement is a script comparing declarations and diffs (own ticket).
 - Size the plan to fit the Context Budget and the Review Budget (`review_budget_lines` in `.symphonia/config.json`).
 - Write the Local Technical Plan to a file and submit it with `.symphonia/bin/spawn submit <TICKET> --file <arquivo>`. That command blocks until the verdict comes back and prints it as `{"verdict": "approved"|"revise", "notes": [...]}`. `revise` → correct and submit again, with `## Changes`. `approved` → finish with `.symphonia/bin/spawn done <TICKET> --outcome succeeded --file <arquivo>`. There is no planning skill: this template plus the CLI's native plan mode is the whole mechanism.
 - Report short: no preamble, no recap of what the Orchestrator already knows.
@@ -28,7 +28,7 @@ access: write
 
 The payload × body rule governs every shape below — see
 `.symphonia/README.md`, "Rules the package encodes"; this file and
-`.symphonia/src/adapters/reports.py` only point to it, never restate it.
+`.symphonia/src/gate.py` only point to it, never restate it.
 
 ### Execution Brief (input)
 

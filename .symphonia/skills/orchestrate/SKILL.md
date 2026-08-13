@@ -8,6 +8,5 @@ description: Single entry point of the Symphonia workflow. Use when asked to run
 Read and follow, in this order — all content lives there, none here:
 
 1. `.symphonia/README.md` — the package and its rules.
-2. `.symphonia/src/reconcile/README.md` — every run starts with Reconciliation.
-3. `.symphonia/roles/orchestrator.md` — your role, intake paths, gates.
-4. `.symphonia/config.json` — the calibration numbers.
+2. `.symphonia/roles/orchestrator.md` — your role, intake paths, gates.
+3. `.symphonia/config.json` — the calibration numbers.

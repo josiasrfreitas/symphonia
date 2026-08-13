@@ -1,6 +1,6 @@
 # The spawn interface
 
-**TLDR: `spawn` is the only way a role starts, `spawn wait` is the only way you hear back, and `spawn submit`/`spawn done` are the only way a role answers. Between those two, the Orchestrator makes no choice about models, permissions, worktrees or launch paths — the model/effort/permission grammar is decided in `src/adapters/harnesses/claude.py`, over a tier/access each role declares in its own frontmatter and `src/workflow/roles.py` reads. If you are about to type a raw `orca terminal create` or `orca orchestration worker-start`, stop: that is the failure this interface exists to prevent.**
+**TLDR: `spawn` is the only way a role starts, `spawn wait` is the only way you hear back, and `spawn submit`/`spawn done` are the only way a role answers. Between those two, the Orchestrator makes no choice about models, permissions, worktrees or launch paths — the model/effort/permission grammar is decided in `src/claude.py`, over a tier/access each role declares in its own frontmatter and `src/roles.py` reads. If you are about to type a raw `orca terminal create` or `orca orchestration worker-start`, stop: that is the failure this interface exists to prevent.**
 
 ## The Orchestrator's commands
 
@@ -127,7 +127,7 @@ worker changes nothing on your screen; the message sits there until you
 `check`. Delivery is FIFO and replays the same batch until it is acked, so
 an unacked old batch hides every newer message behind it. Losing the
 terminal's stdout no longer loses the ack: the pending Delivery id is
-persisted to disk (`workflow/journal`'s receipt) only AFTER it has been
+persisted to disk (`src/journal.py`'s receipt) only AFTER it has been
 processed and the registry write is durable, so reopening the terminal and
 calling `wait` again either sees the receipt and acks it, or — if the
 process died before that write — sees no receipt, sends no `--ack`, and
@@ -155,9 +155,9 @@ a comparison against a model alias — both read from files. If you need to
 see the session itself, `orca terminal read`.
 
 **Never message a dead dispatch.** After `worker_done` the worker is asleep; a
-send lands in its mailbox and never wakes it. Go through the Runtime Adapter's
-`message_worker`, which checks the dispatch state first, or start the next
-role with a fresh dispatch.
+send lands in its mailbox and never wakes it. Anything you have to say after
+that point goes into the ticket (`spawn brief`) and reaches the next role's
+Brief at its dispatch.
 
 **You spawn; roles never do.** A role that finishes writes its handoff
 document and dies. It does not launch its successor and it does not hand
@@ -183,15 +183,16 @@ reaches the registry to begin with.
 
 | File | Decides |
 |---|---|
-| `src/workflow/roles.py` | Which role runs at which tier and access — read from each role file's own frontmatter, one declaration, not a table to keep in sync |
-| `src/adapters/harnesses/claude.py` | Tier → model, effort, permission flags, read-only enforcement, provider grammar |
-| `src/spawn.py` (behind the `bin/spawn` entrypoint) | The verbs, worktree policy, phase labels, what a role is told at dispatch, the Execution Brief (`build_brief`), the plan gate wiring (`wait`/`verdict`) |
-| `src/adapters/plan_gate.py` | The plan gate's state machine — submission, verdict, retire — as a pure function |
-| `src/adapters/reports.py` | Parses a role's message body into typed fields; raises when the body does not follow its contract |
+| `src/roles.py` | Which role runs at which tier and access — read from each role file's own frontmatter, one declaration, not a table to keep in sync |
+| `src/claude.py` | Tier → model, effort, permission flags, read-only enforcement |
+| `src/spawn.py` (behind the `bin/spawn` entrypoint) | The verbs, worktree policy, what a role is told at dispatch, the Execution Brief (`build_brief`), the registry |
+| `src/gate.py` | The whole plan gate: the report formats and their parsers, the state machine (submission, verdict, retire), and the loop that executes gate actions |
+| `src/orca.py` | Every `orca` CLI call and the parsing of what the mailbox answers |
+| `src/linear.py` | Every Linear call: ticket read, comments, Needs Attention, the `human-gate` label |
 | `roles/*.md` | What each role does and never does, and the I/O shapes it reads and writes |
 | `src/setup_worktree.py` (behind the `bin/setup-worktree` entrypoint) | What a fresh checkout needs and git does not bring: the env files |
 | `config.json` | The calibration numbers, plus the `handoff_dir` a role's baton document is written to |
 
-Adding a provider is a `PROVIDERS` entry in `claude.py`. Changing a model is
-one line in the same file. Neither touches a caller, and neither is ever done
-at the terminal.
+Changing a model is one line in `claude.py`. Adding an operation to a
+handoff is an edit to the verb in `spawn.py` (the payload) or to `gate.py`
+(the judgment and the actions) — one file either way, never a refactor.
