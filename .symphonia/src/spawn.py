@@ -32,13 +32,15 @@ mailbox messages into typed events and hands them to `gate.run`, which
 executes what comes back (label the ticket, retire a role, flag a
 divergence). `verdict` is how the human's decision reaches the planner: it
 never comes from an agent typing `APPROVED`/`REVISE` into a reply by hand.
+
+Every verb refuses with `Refusal`, never `SystemExit`: `main()` is the one
+place a refusal becomes an exit code, so an importer of these verbs can
+catch failures with a plain `except Exception`.
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
-import fcntl
 import json
 import os
 import subprocess
@@ -46,13 +48,13 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
 import claude as _claude
 import gate as _gate
 import journal as _journal
 import linear as _linear
 import orca as _orca
+import registry as _registry
 import roles as _roles
 import setup_worktree as _setup_worktree
 
@@ -68,29 +70,18 @@ GATE_ROLE = RoleName.PLANNER
 """Only the planner's completion is a Human Gate today; `wait` only reacts
 to gate events keyed to this role's dispatch."""
 
-ASK_MAX_MS = 1_800_000
-"""What `orca orchestration ask` will actually wait, measured on 1.4.168: a
-larger `--timeout-ms` is clamped to this silently. A human verdict
-routinely takes longer than 30 minutes, so `submit` resumes the same
-question by id instead of asking a second time."""
-
-# The registry of live spawns, deliberately OUTSIDE every checkout: the
-# Orchestrator and the role read it from two different copies of this
-# repository. Writers are all Orchestrator-side (`spawn`, `wait`,
-# `verdict`, `retire`, `sweep`); the role-side verbs (`submit`, `done`)
-# only ever read. The record shape is internal to this package, not a
-# contract.
-RUNTIME_DIR = Path(os.environ.get("SYMPHONIA_RUNTIME", "~/.symphonia/runtime")).expanduser()
-STATE = RUNTIME_DIR / "spawns.json"
-# A sibling, not `STATE` itself: `state_write` swaps the inode via
-# `os.replace`, so an flock on the file being replaced protects nothing.
-STATE_LOCK = STATE.with_name(STATE.name + ".lock")
-
 # The baton between roles is a document dropped at `handoff_dir` — outside
 # the repository on purpose: never committed, never travels with the
 # branch. Its only job is carrying context from the role that just died to
 # the one about to start.
 _HANDOFF_DIR_DEFAULT = "~/orca/.context"
+
+
+class Refusal(Exception):
+    """A verb refused to act; the message names why and what to do
+    instead. `main()` is where a refusal becomes a nonzero exit — as an
+    exception it stays catchable by `except Exception`, which a
+    `SystemExit` raised mid-library is not."""
 
 
 def _handoff_dir() -> str:
@@ -106,62 +97,6 @@ def _policies() -> dict[RoleName, _roles.RolePolicy]:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
-    """One orca call, failures as `SystemExit` — the CLI-facing wrapper
-    around `orca.orca()`."""
-
-    try:
-        return _orca.orca(*argv, expect_lifecycle_ok=expect_lifecycle_ok)
-    except _orca.OrcaCliError as exc:
-        raise SystemExit(str(exc)) from exc
-
-
-# --- the registry ----------------------------------------------------------
-
-
-def state_read() -> dict:
-    if STATE.exists():
-        return json.loads(STATE.read_text())
-    return {}
-
-
-def state_write(data: dict) -> None:
-    """Atomic, and 0600 from the moment the bytes exist — the registry
-    holds Dispatch capability tokens, and a token is what authorizes a
-    `worker_done` on someone else's dispatch."""
-
-    STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(STATE.parent, 0o700)  # a directory that already existed
-    tmp = STATE.with_suffix(".json.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, STATE)
-
-
-@contextlib.contextmanager
-def state_lock() -> Iterator[None]:
-    """Serializes a read-modify-write of the registry across processes:
-    `wait` can sit on a snapshot for 15 minutes while a concurrent
-    `verdict` writes `gate_state` elsewhere.
-
-    Hold this ONLY around a `state_read()`/`state_write()` pair, never
-    around the blocking `check --wait` itself. flock does not nest —
-    `teardown()` must never take it (it runs inside `wait`'s critical
-    section via `gate.run`); `wait`, `verdict`, `done` and `sweep` acquire
-    it."""
-
-    STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(STATE.parent, 0o700)
-    fd = os.open(STATE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
 
 
 # --- the Execution Brief (every role's input) ------------------------------
@@ -241,7 +176,7 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
     try:
         return template.format(**values)
     except KeyError as exc:
-        raise SystemExit(
+        raise Refusal(
             f"Brief template in {role_path} references unknown placeholder {exc}"
         )
 
@@ -260,20 +195,20 @@ def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     behalf."""
 
     ticket = ticket.upper()
-    data = state_read() if data is None else data
+    data = _registry.read() if data is None else data
     live = {
         key: rec for key, rec in data.items()
         if rec.get("ticket") == ticket and not rec.get("retired")
     }
     if not live:
-        raise SystemExit(f"no live spawn recorded for {ticket}; is this the right Ticket Key?")
+        raise Refusal(f"no live spawn recorded for {ticket}; is this the right Ticket Key?")
 
     handle = os.environ.get("ORCA_TERMINAL_HANDLE", "")
     if handle:
         for key, rec in live.items():
             if rec.get("terminal") == handle:
                 return key, rec
-        raise SystemExit(
+        raise Refusal(
             f"terminal {handle} is not a recorded role of {ticket}; "
             f"this command is run by a role, from inside its own dispatched terminal"
         )
@@ -284,7 +219,7 @@ def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     matches = [(key, rec) for key, rec in live.items() if rec.get("worktree") == toplevel]
     if len(matches) == 1:
         return matches[0]
-    raise SystemExit(
+    raise Refusal(
         f"cannot tell which role is calling: ORCA_TERMINAL_HANDLE is unset and "
         f"{len(matches)} live roles of {ticket} share the worktree {toplevel or '(unknown)'}"
     )
@@ -298,27 +233,21 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     declared tier, inject the Execution Brief as the dispatch, and record
     everything. A failure mid-sequence leaves no orphan: after a fresh
     worktree is created, ANY later failure — badge, launch, brief
-    (Linear included), dispatch — closes the terminal it may have opened
-    and removes that worktree, so a retry of `spawn plan` starts clean
-    instead of refusing on a leftover checkout. A reused worktree is never
-    destroyed."""
+    (Linear included), dispatch, a Ctrl-C during the wait for the terminal
+    — closes the terminal it may have opened and removes that worktree, so
+    a retry of `spawn plan` starts clean instead of refusing on a leftover
+    checkout. A reused worktree is never destroyed."""
 
     ticket = ticket.upper()
-    try:
-        worktree = _orca.find_worktree(ticket)
-    except _orca.OrcaCliError as exc:
-        raise SystemExit(str(exc)) from exc
+    worktree = _orca.find_worktree(ticket)
     fresh = False
     if fresh_worktree:
         if worktree is not None:
-            raise SystemExit(
+            raise Refusal(
                 f"{ticket} already has a worktree at {worktree.path}. "
                 f"Planning runs once per ticket; use `implement` to continue in it."
             )
-        try:
-            worktree = _orca.create_worktree(ticket, base_branch=_orca.default_base())
-        except _orca.OrcaCliError as exc:
-            raise SystemExit(str(exc)) from exc
+        worktree = _orca.create_worktree(ticket, base_branch=_orca.default_base())
         fresh = True
         # The env files are gitignored, so the new checkout does not have
         # them — it looks complete and fails the first time something reads
@@ -326,7 +255,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         print(json.dumps(_setup_worktree.setup(Path(worktree.path))), file=sys.stderr)
     else:
         if worktree is None:
-            raise SystemExit(
+            raise Refusal(
                 f"{ticket} has no worktree yet. Run `spawn plan {ticket}` first — "
                 f"every role after the planner reuses the checkout planning created."
             )
@@ -338,7 +267,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         try:
             policy = dataclasses.replace(policy, tier=_roles.CapabilityTier(tier))
         except ValueError:
-            raise SystemExit(
+            raise Refusal(
                 f"unknown tier {tier!r}; known: "
                 f"{', '.join(t.value for t in _roles.CapabilityTier)}"
             )
@@ -352,7 +281,10 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         # is read and formatted here, never left for the role to go fetch.
         spec = build_brief(role, ticket, worktree.path)
         dispatched = _orca.dispatch(terminal, spec, ticket=ticket, role=role.value)
-    except (_orca.OrcaCliError, _linear.LinearError, SystemExit) as exc:
+    except BaseException:
+        # `BaseException`, not a tuple to keep in sync: a KeyboardInterrupt
+        # during the 120s terminal wait must roll back like any other
+        # failure, or the leftover checkout blocks the retry.
         if fresh:
             # Best-effort, terminal first: `worktree rm` on a checkout
             # whose pane is still open would otherwise be the one failure
@@ -367,9 +299,7 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
                 _orca.remove_worktree(worktree.path)
             except _orca.OrcaCliError:
                 pass
-        if isinstance(exc, SystemExit):
-            raise
-        raise SystemExit(str(exc)) from exc
+        raise
 
     record = {
         "ticket": ticket,
@@ -389,9 +319,8 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
         "transcript": launch.transcript,
         "command": _orca.shell_join(launch.command),
     }
-    data = state_read()
-    data[f"{ticket}/{role.value}"] = record
-    state_write(data)
+    with _registry.transaction() as data:
+        data[_registry.key(ticket, role.value)] = record
     return record
 
 
@@ -409,7 +338,7 @@ def status(ticket: str | None) -> list[dict] | dict:
     is visible without recovering an id from old stdout."""
 
     out = []
-    for key, rec in sorted(state_read().items()):
+    for key, rec in sorted(_registry.read().items()):
         if ticket and not key.startswith(ticket.upper() + "/"):
             continue
         try:
@@ -439,7 +368,7 @@ def status(ticket: str | None) -> list[dict] | dict:
             }
         )
     if ticket is None:
-        return {"pending_delivery": _journal.read_receipt(RUNTIME_DIR), "spawns": out}
+        return {"pending_delivery": _journal.read_receipt(_registry.runtime_dir()), "spawns": out}
     return out
 
 
@@ -447,57 +376,69 @@ def retire(ticket: str, role_value: str) -> dict:
     """Stop one role and close its pane. The worktree survives — the next
     role needs it. The Orchestrator's own verb — not idempotent, unlike
     `teardown`: a human retiring an already-dead role a second time still
-    gets the same effects run again, not a silent no-op."""
+    gets the same effects run again, not a silent no-op. Runs inside its
+    own registry transaction, so a concurrent `wait` cannot put a stale
+    un-retired copy of this record back."""
 
-    key = f"{ticket.upper()}/{role_value}"
-    rec = state_read().get(key)
-    if rec is None:
-        raise SystemExit(f"no spawn recorded for {key}")
+    key = _registry.key(ticket, role_value)
+    with _registry.transaction() as data:
+        rec = data.get(key)
+        if rec is None:
+            raise Refusal(f"no spawn recorded for {key}")
 
-    # A role can name its own terminal here — `retire GRE-188 planner` run
-    # from inside the planner's own pane. `stop_worker`/`close_terminal`
-    # would kill the process running this very function, so the caller
-    # loses its terminal mid-command and never sees the task get settled.
-    # Refuse instead: retiring is the Orchestrator's verb.
-    own_terminal = os.environ.get("ORCA_TERMINAL_HANDLE", "")
-    if own_terminal and own_terminal == rec.get("terminal"):
-        raise SystemExit(
-            f"{key} is the role running this command; retiring it would close "
-            f"this terminal mid-command and lose whatever it has not reported "
-            f"yet. Report first and let the Orchestrator retire you."
-        )
+        # A role can name its own terminal here — `retire GRE-188 planner`
+        # run from inside the planner's own pane. `stop_worker`/
+        # `close_terminal` would kill the process running this very
+        # function, so the caller loses its terminal mid-command and never
+        # sees the task get settled. Refuse instead: retiring is the
+        # Orchestrator's verb.
+        own_terminal = os.environ.get("ORCA_TERMINAL_HANDLE", "")
+        if own_terminal and own_terminal == rec.get("terminal"):
+            raise Refusal(
+                f"{key} is the role running this command; retiring it would close "
+                f"this terminal mid-command and lose whatever it has not reported "
+                f"yet. Report first and let the Orchestrator retire you."
+            )
 
-    return _run_teardown(ticket, role_value)
+        return _run_teardown(data, ticket, role_value)
 
 
-def teardown(ticket: str, role_value: str) -> dict:
+def teardown(ticket: str, role_value: str, *, data: dict | None = None) -> dict:
     """Same effects as `retire`, minus the self-guard, plus idempotence: a
     record already marked `retired` returns immediately. Called by
     `gate.run` when a `worker_done` arrives, and by `sweep` for a record
     whose world is already gone — both a replayed Delivery and a repeated
-    `sweep` must be a no-op."""
+    `sweep` must be a no-op.
 
-    key = f"{ticket.upper()}/{role_value}"
-    rec = state_read().get(key)
+    `data` is the registry dict of an already-open transaction (`wait` and
+    `sweep` pass theirs — flock does not nest); without it, this opens its
+    own."""
+
+    if data is None:
+        with _registry.transaction() as opened:
+            return teardown(ticket, role_value, data=opened)
+
+    key = _registry.key(ticket, role_value)
+    rec = data.get(key)
     if rec is None:
-        raise SystemExit(f"no spawn recorded for {key}")
+        raise Refusal(f"no spawn recorded for {key}")
     if rec.get("retired"):
         return {"retired": key, "effects": ["already retired"], "worktree_kept": rec["worktree"]}
-    return _run_teardown(ticket, role_value)
+    return _run_teardown(data, ticket, role_value)
 
 
-def _run_teardown(ticket: str, role_value: str) -> dict:
+def _run_teardown(data: dict, ticket: str, role_value: str) -> dict:
     """Every effect of ending one role's dispatch, best-effort, in a fixed
     order: `stop_worker` -> close the terminal -> settle the Task -> mark
     `retired`. Nothing here raises on a failed effect: a dead terminal or
     an unreachable dispatch is exactly what this cleans up after, so each
     failure becomes an `effects` entry instead of aborting before `retired`
-    is written."""
+    is written. Mutates `data` — the caller's open transaction writes it."""
 
-    key = f"{ticket.upper()}/{role_value}"
-    rec = state_read().get(key)
+    key = _registry.key(ticket, role_value)
+    rec = data.get(key)
     if rec is None:
-        raise SystemExit(f"no spawn recorded for {key}")
+        raise Refusal(f"no spawn recorded for {key}")
 
     effects = []
     try:
@@ -528,12 +469,7 @@ def _run_teardown(ticket: str, role_value: str) -> dict:
             except _orca.OrcaCliError as exc:
                 effects.append(f"task NOT settled ({exc})")
 
-    data = state_read()
-    if key in data:
-        data[key]["retired"] = True
-        state_write(data)
-    else:
-        effects.append("registry record vanished before the retired write")
+    rec["retired"] = True
     return {
         "retired": key,
         "dispatch_was": dispatch_status,
@@ -551,26 +487,24 @@ def sweep(ticket: str | None) -> list[dict]:
     deleted by hand.
 
     A live record is reported, not touched. The whole read-decide-teardown
-    loop runs under `state_lock()` so a concurrent `wait`/`verdict` cannot
-    silently revert a teardown whose effects were already irreversible.
+    loop runs inside one registry transaction so a concurrent
+    `wait`/`verdict` cannot silently revert a teardown whose effects were
+    already irreversible.
 
     A `list_terminals()` that comes back empty is refused rather than acted
     on: every unretired record would read as "terminal not live" and this
     loop would tear down every live role on the strength of one degraded
     CLI response."""
 
-    try:
-        live_terminals = _orca.list_terminals()
-    except _orca.OrcaCliError as exc:
-        raise SystemExit(str(exc)) from exc
+    live_terminals = _orca.list_terminals()
     if not live_terminals:
-        raise SystemExit(
+        raise Refusal(
             "list_terminals() returned no terminals at all; refusing to treat "
             "every unretired record as an orphan. Retry once the CLI is responding."
         )
     out = []
-    with state_lock():
-        for key, rec in sorted(state_read().items()):
+    with _registry.transaction() as data:
+        for key, rec in sorted(data.items()):
             if ticket and not key.startswith(ticket.upper() + "/"):
                 continue
             if rec.get("retired"):
@@ -585,7 +519,7 @@ def sweep(ticket: str | None) -> list[dict]:
                 continue
             out.append({
                 "key": key, "live": False, "reason": reasons,
-                "teardown": teardown(rec["ticket"], rec["role"]),
+                "teardown": teardown(rec["ticket"], rec["role"], data=data),
             })
     return out
 
@@ -597,9 +531,8 @@ IDLE = _gate.IDLE
 
 def wait(*, ack: str | None, timeout_ms: int) -> dict:
     """The one loop the Orchestrator uses to hear back from every role.
-    Wraps `orca orchestration check --wait`, then hands the batch to
-    `gate.run` — never the Orchestrator reading a message and deciding by
-    itself.
+    Wraps the blocking mailbox check, then hands the batch to `gate.run` —
+    never the Orchestrator reading a message and deciding by itself.
 
     Replay-safe: an unacked Delivery replays the same batch, but every
     action is guarded by the recorded `gate_state` (and, for a
@@ -610,30 +543,20 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     ackable. An explicit `--ack` still wins — it exists for re-acking a
     specific id by hand.
 
-    Ordering inside the lock: the journal append happens BEFORE `gate.run`
-    (the raw event survives a crash mid-processing), and the receipt write
-    happens AFTER `state_write` — the delivery is only marked acked once
-    the outcome it acks is durable. A crash before the receipt leaves the
-    delivery unacked, Orca redelivers, and the replay is a no-op. The
-    failure this ordering prevents is a suppressed delivery; a lost receipt
-    only costs a harmless replay."""
+    Ordering: the journal append happens inside the transaction BEFORE
+    `gate.run` (the raw event survives a crash mid-processing), and the
+    receipt is written AFTER the transaction commits — the delivery is only
+    marked acked once the outcome it acks is durable. A crash before the
+    receipt leaves the delivery unacked, Orca redelivers, and the replay is
+    a no-op. The failure this ordering prevents is a suppressed delivery; a
+    lost receipt only costs a harmless replay."""
 
     if ack is None:
-        ack = _journal.read_receipt(RUNTIME_DIR)
+        ack = _journal.read_receipt(_registry.runtime_dir())
 
-    argv = [
-        "orchestration", "check", "--wait",
-        "--types", "worker_done,escalation,question",
-        "--timeout-ms", str(timeout_ms),
-    ]
-    if ack:
-        argv += ["--ack", ack]
     started = time.monotonic()
-    batch_raw = orca(*argv)
+    batch = _orca.check_wait(ack=ack, timeout_ms=timeout_ms)
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    # `orca()` already unwraps the envelope; `parse_check_output` expects
-    # raw JSON text, so it is fed back in — one parser for both call sites.
-    batch = _orca.parse_check_output(json.dumps(batch_raw))
     events = _orca.gate_events(batch.messages)
     raw_by_id = {m.id: m for m in batch.messages}
     # Every mailbox message, not just the typed gate events — an escalation
@@ -649,17 +572,15 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     # The Linear tracker is built lazily, only when a gate action actually
     # needs it — a `wait` that observes no gate action (the common case)
     # must work without `LINEAR_API_KEY` set.
-    with state_lock():
-        data = state_read()
-        _journal.append_events(RUNTIME_DIR, batch.delivery_id, message_dicts)
+    with _registry.transaction() as data:
+        _journal.append_events(_registry.runtime_dir(), batch.delivery_id, message_dicts)
         actions_taken, unattributed = _gate.run(
             events, raw_by_id, data,
             tracker=lambda: _linear.LinearTracker(),
-            teardown=teardown,
+            teardown=lambda t, r: teardown(t, r, data=data),
             gate_role=GATE_ROLE.value,
         )
-        state_write(data)
-        _journal.write_receipt(RUNTIME_DIR, batch.delivery_id)
+    _journal.write_receipt(_registry.runtime_dir(), batch.delivery_id)
     return {
         "delivery_id": batch.delivery_id,
         "acked": ack or None,
@@ -685,43 +606,38 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     for both APPROVED and APPROVED-with-caveats, and it never kills a
     planner still blocked inside its `ask`.
 
-    The read, both writes and the reply all happen inside one
-    `state_lock()`: the state is recorded BEFORE the reply goes out (the
-    reply unblocks the planner, which may run `spawn done` immediately; a
-    registry still saying `submitted` would refuse the very report the
-    human just authorized), and `question_id` is kept until the reply
-    lands, so a failed reply can be retried instead of stranding the
-    planner in its `ask`."""
+    Everything runs inside one registry transaction, with a `commit`
+    checkpoint BEFORE the reply goes out: the reply unblocks the planner,
+    which may run `spawn done` immediately, and a registry still saying
+    `submitted` would refuse the very report the human just authorized.
+    `question_id` is only dropped after the reply lands, so a failed reply
+    can be retried instead of stranding the planner in its `ask`."""
 
     ticket = ticket.upper()
     if decision not in ("approved", "revise"):
-        raise SystemExit(f"unknown decision {decision!r}; use 'approved' or 'revise'")
+        raise Refusal(f"unknown decision {decision!r}; use 'approved' or 'revise'")
 
-    key = f"{ticket}/{GATE_ROLE.value}"
+    key = _registry.key(ticket, GATE_ROLE.value)
     token = "APPROVED" if decision == "approved" else "REVISE"
     note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
     body = _gate.format_approval_reply(token, note_lines)
 
-    with state_lock():
-        data = state_read()
+    with _registry.transaction() as data:
         rec = data.get(key)
         if rec is None or not rec.get("question_id"):
-            raise SystemExit(
+            raise Refusal(
                 f"no pending plan submission recorded for {ticket}; "
                 f"`spawn wait` must observe the submission before a verdict can be given"
             )
         if decision == "revise" and not notes.strip():
-            raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
+            raise Refusal("REVISE with no --notes/--notes-file says nothing; name the correction")
 
         rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
         rec["last_event_at"] = _now()
-        data[key] = rec
-        state_write(data)
+        _registry.commit(data)
 
-        orca("orchestration", "reply", "--id", rec["question_id"], "--body", body)
+        _orca.reply(rec["question_id"], body)
         rec.pop("question_id", None)
-        data[key] = rec
-        state_write(data)
 
     # The label is cosmetic next to the verdict; losing Linear must not
     # make a delivered verdict look like a failure.
@@ -761,10 +677,10 @@ def brief(ticket: str, body_path: str) -> dict:
     ticket = ticket.upper()
     path = Path(body_path)
     if not path.is_file():
-        raise SystemExit(f"{body_path} does not exist; nothing to post")
+        raise Refusal(f"{body_path} does not exist; nothing to post")
     body = path.read_text()
     if not body.strip():
-        raise SystemExit(f"{body_path} is empty; an empty cut of work coordinates nothing")
+        raise Refusal(f"{body_path} is empty; an empty cut of work coordinates nothing")
 
     comment = _linear.LinearTracker().post_comment(ticket, body)
     return {"ticket": ticket, "posted": True, "comment": comment.id}
@@ -773,30 +689,15 @@ def brief(ticket: str, body_path: str) -> dict:
 # --- the role's own two verbs ----------------------------------------------
 #
 # Everything above is run by the Orchestrator. The two below are run BY A
-# ROLE, inside its own dispatched terminal. Three things measured on Orca
+# ROLE, inside its own dispatched terminal. Two things measured on Orca
 # 1.4.168 are why this cannot be left to a role typing `orca orchestration`
-# by hand:
+# by hand (a third — payload × structured-flag exclusivity — lives on
+# `orca.send_worker_done`, where the argv is composed):
 #
-#   1. `--payload` and the structured flags (`--task-id`, `--dispatch-id`,
-#      `--outcome`) are MUTUALLY EXCLUSIVE — using both is
-#      `invalid_argument` and no message is sent at all.
-#   2. An injected dispatch mints a capability, and a lifecycle message
+#   1. An injected dispatch mints a capability, and a lifecycle message
 #      without it is refused with `dispatch_capability_invalid`.
-#   3. A dispatch grants exactly one `worker_done`. A second is refused, so
+#   2. A dispatch grants exactly one `worker_done`. A second is refused, so
 #      the body has to be checked BEFORE the single shot is spent.
-
-
-def _payload_for(rec: dict, outcome: str, extra: dict | None = None) -> str:
-    """The one `--payload` a lifecycle message is allowed to carry: the
-    three fields Orca reconciles on, plus whatever the gate needs."""
-
-    payload = {
-        "taskId": rec["task"],
-        "dispatchId": rec["dispatch"],
-        "outcome": outcome,
-        **(extra or {}),
-    }
-    return json.dumps(payload)
 
 
 def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
@@ -814,37 +715,35 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
     ticket = ticket.upper()
     key, rec = own_record(ticket)
     if rec["role"] != GATE_ROLE.value:
-        raise SystemExit(f"{key} is not the planner; only the planner submits a plan for a verdict")
+        raise Refusal(f"{key} is not the planner; only the planner submits a plan for a verdict")
 
     body = Path(body_path).read_text()
     submission = _gate.parse_plan_submission(body)  # loud, before anything is sent
     if submission.ticket.upper() != ticket:
-        raise SystemExit(
+        raise Refusal(
             f"the '## Plan' line says {submission.ticket!r} but you are dispatched on {ticket!r}"
         )
-
-    ask = ["orchestration", "ask", "--from", rec["terminal"]]
-    if rec.get("capability"):
-        ask += ["--dispatch-capability", rec["capability"]]
 
     waited, message_id, answer = 0, None, None
     while answer is None:
         if waited >= max_wait_ms:
-            raise SystemExit(
+            raise Refusal(
                 f"no verdict after {max_wait_ms}ms; the question is still pending as "
                 f"{message_id} — resume it with a longer --max-wait-ms, never ask again"
             )
-        argv = list(ask)
-        argv += ["--resume", message_id] if message_id else ["--question", body]
-        slice_ms = min(ASK_MAX_MS, max_wait_ms - waited)
-        result = orca(*argv, "--timeout-ms", str(slice_ms))
-        # `ask` answers with its own object and no {id, ok, result}
-        # envelope: {answer, messageId, timedOut, timeoutMs, ...}.
+        slice_ms = min(_orca.ASK_MAX_MS, max_wait_ms - waited)
+        result = _orca.ask(
+            rec["terminal"],
+            question=None if message_id else body,
+            resume=message_id,
+            capability=rec.get("capability"),
+            timeout_ms=slice_ms,
+        )
         waited += int(result.get("timeoutMs") or slice_ms)
         message_id = str(result.get("messageId") or message_id or "")
         answer = result.get("answer")
         if answer is None and not result.get("timedOut"):
-            raise SystemExit(
+            raise Refusal(
                 f"ask ended without an answer and without a timeout "
                 f"(cancelled={result.get('cancelled')}, "
                 f"connectionLost={result.get('connectionLost')}); question {message_id} is pending"
@@ -853,7 +752,7 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
     try:
         parsed = _gate.parse_approval_reply(str(answer))
     except _gate.MalformedReport as exc:
-        raise SystemExit(
+        raise Refusal(
             f"the verdict on question {message_id} does not follow the approval format "
             f"({exc}). It was answered by hand instead of by `spawn verdict`. Do NOT "
             f"submit again — that files a second question and costs another verdict; "
@@ -900,11 +799,11 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
 
     ticket = ticket.upper()
     if outcome not in ("succeeded", "failed"):
-        raise SystemExit(f"unknown outcome {outcome!r}; use 'succeeded' or 'failed'")
+        raise Refusal(f"unknown outcome {outcome!r}; use 'succeeded' or 'failed'")
     key, rec = own_record(ticket)
     body = Path(body_path).read_text()
     if not body.strip():
-        raise SystemExit(
+        raise Refusal(
             f"{ticket}/{rec['role']}: an empty report says nothing; `done` needs a body "
             f"even for --outcome failed"
         )
@@ -913,7 +812,7 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
     if rec["role"] == GATE_ROLE.value and outcome == "succeeded":
         state = rec.get("gate_state", IDLE)
         if state != _gate.VERDICT_APPROVED:
-            raise SystemExit(
+            raise Refusal(
                 f"the plan for {ticket} is not approved (gate state {state!r}); a planner's "
                 f"worker_done is only valid after APPROVED, and you get exactly one"
             )
@@ -935,7 +834,7 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
             head_now, dirty = measured
             baseline = rec.get("head_at_dispatch")
             if head_now == baseline and not dirty:
-                raise SystemExit(
+                raise Refusal(
                     f"{ticket}/{rec['role']}: outcome=succeeded but the worktree shows no "
                     f"change — HEAD is still {head_now} (same as at dispatch) and `git "
                     f"status --porcelain` is empty. If there genuinely was nothing to do, "
@@ -948,30 +847,29 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
                     f"{head_now} — the tree is dirty but nothing was committed; "
                     f"flagging uncommitted_work on the record", file=sys.stderr,
                 )
-                with state_lock():
-                    data = state_read()
+                with _registry.transaction() as data:
                     if key in data:
                         data[key]["uncommitted_work"] = True
-                        state_write(data)
 
-    argv = [
-        "orchestration", "send",
-        "--from", rec["terminal"],
-        "--type", "worker_done",
-        "--subject", f"{ticket} {rec['role']}: {outcome}",
-        "--body", body,
-        "--payload", _payload_for(rec, outcome, extra),
-    ]
-    if rec.get("capability"):
-        argv += ["--dispatch-capability", rec["capability"]]
+    # The three fields Orca reconciles on, plus whatever the gate needs —
+    # all inside the one `--payload` (`orca.send_worker_done` documents the
+    # exclusivity rule that forbids the structured flags).
+    payload = {
+        "taskId": rec["task"],
+        "dispatchId": rec["dispatch"],
+        "outcome": outcome,
+        **extra,
+    }
     if files_modified.strip():
-        # Never as `--files-modified`: that is a structured flag, and one
-        # of those alongside `--payload` is refused outright.
-        payload = json.loads(argv[argv.index("--payload") + 1])
         payload["filesModified"] = [f.strip() for f in files_modified.split(",") if f.strip()]
-        argv[argv.index("--payload") + 1] = json.dumps(payload)
 
-    orca(*argv, expect_lifecycle_ok=True)
+    _orca.send_worker_done(
+        rec["terminal"],
+        subject=f"{ticket} {rec['role']}: {outcome}",
+        body=body,
+        payload=payload,
+        capability=rec.get("capability"),
+    )
     return {"ticket": ticket, "role": rec["role"], "outcome": outcome, "reported": key}
 
 
@@ -1024,7 +922,7 @@ def main() -> int:
     p = sub.add_parser("submit")
     p.add_argument("ticket")
     p.add_argument("--file", required=True, help="Path to the plan submission body.")
-    p.add_argument("--max-wait-ms", type=int, default=6 * ASK_MAX_MS)
+    p.add_argument("--max-wait-ms", type=int, default=6 * _orca.ASK_MAX_MS)
     p = sub.add_parser("done")
     p.add_argument("ticket")
     p.add_argument("--file", required=True, help="Path to the report body.")
@@ -1032,35 +930,40 @@ def main() -> int:
     p.add_argument("--files-modified", default="")
 
     args = parser.parse_args()
-    if args.verb in VERBS:
-        role, fresh = VERBS[args.verb]
-        print(json.dumps(
-            spawn(role, args.ticket, fresh_worktree=fresh, tier=args.tier), indent=2
-        ))
-    elif args.verb == "status":
-        print(json.dumps(status(args.ticket), indent=2))
-    elif args.verb == "retire":
-        print(json.dumps(retire(args.ticket, args.role), indent=2))
-    elif args.verb == "sweep":
-        print(json.dumps(sweep(args.ticket), indent=2))
-    elif args.verb == "wait":
-        print(json.dumps(wait(ack=args.ack, timeout_ms=args.timeout_ms), indent=2))
-    elif args.verb == "verdict":
-        notes = args.notes
-        if args.notes_file:
-            notes = (notes + "\n" + Path(args.notes_file).read_text()).strip()
-        print(json.dumps(verdict(args.ticket, args.decision, notes), indent=2))
-    elif args.verb == "brief":
-        print(json.dumps(brief(args.ticket, args.file), indent=2))
-    elif args.verb == "submit":
-        print(json.dumps(
-            submit(args.ticket, args.file, max_wait_ms=args.max_wait_ms), indent=2
-        ))
-    elif args.verb == "done":
-        print(json.dumps(done(
-            args.ticket, args.file,
-            outcome=args.outcome, files_modified=args.files_modified,
-        ), indent=2))
+    # The one edge where a refusal or a provider failure becomes an exit
+    # code. Inside the library they stay ordinary exceptions.
+    try:
+        if args.verb in VERBS:
+            role, fresh = VERBS[args.verb]
+            print(json.dumps(
+                spawn(role, args.ticket, fresh_worktree=fresh, tier=args.tier), indent=2
+            ))
+        elif args.verb == "status":
+            print(json.dumps(status(args.ticket), indent=2))
+        elif args.verb == "retire":
+            print(json.dumps(retire(args.ticket, args.role), indent=2))
+        elif args.verb == "sweep":
+            print(json.dumps(sweep(args.ticket), indent=2))
+        elif args.verb == "wait":
+            print(json.dumps(wait(ack=args.ack, timeout_ms=args.timeout_ms), indent=2))
+        elif args.verb == "verdict":
+            notes = args.notes
+            if args.notes_file:
+                notes = (notes + "\n" + Path(args.notes_file).read_text()).strip()
+            print(json.dumps(verdict(args.ticket, args.decision, notes), indent=2))
+        elif args.verb == "brief":
+            print(json.dumps(brief(args.ticket, args.file), indent=2))
+        elif args.verb == "submit":
+            print(json.dumps(
+                submit(args.ticket, args.file, max_wait_ms=args.max_wait_ms), indent=2
+            ))
+        elif args.verb == "done":
+            print(json.dumps(done(
+                args.ticket, args.file,
+                outcome=args.outcome, files_modified=args.files_modified,
+            ), indent=2))
+    except (Refusal, _orca.OrcaCliError, _linear.LinearError) as exc:
+        raise SystemExit(str(exc)) from exc
     return 0
 
 

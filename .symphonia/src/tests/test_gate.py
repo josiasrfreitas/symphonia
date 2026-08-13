@@ -391,5 +391,20 @@ class TestFlagMalformed(GateLoopRunCase):
         self.assertEqual(self.teardown_calls, [], "a malformed report must not retire the role")
 
 
+class TestCorruptGateStateFailsLoudly(unittest.TestCase):
+    """A `gate_state` outside the vocabulary — a hand-edited registry, a
+    record written by an older version — must stop the wait, not
+    transition as if it were IDLE: guessing could fire an action twice."""
+
+    def test_unknown_state_raises_naming_the_record_and_the_value(self):
+        rec = {"ticket": "GRE-1", "role": "planner", "gate_state": "submited"}
+        event = SimpleNamespace(
+            kind=GATE.PLAN_QUESTION, message_id="q-1", question=SUBMISSION,
+        )
+        with self.assertRaisesRegex(ValueError, "GRE-1.*'submited'"):
+            GATE.apply_gate_event(rec, event, {})
+        self.assertEqual(rec["gate_state"], "submited", "left for the human to fix")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
