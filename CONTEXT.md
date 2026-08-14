@@ -53,16 +53,12 @@ A point in delivery where progress requires the user's judgement; gates are pres
 _Avoid_: Approval step, blocker
 
 **Capability Tier**:
-The abstract level of model capability a role declares — high, standard, or fast — which an adapter translates into a concrete model and reasoning effort.
+The abstract level of model capability a role declares — frontier, high, standard, or fast — which the launch script translates into a concrete model and reasoning effort.
 _Avoid_: Model, model name, effort level
 
-**Runtime Adapter**:
-The provider-neutral boundary through which the workflow creates, observes, and controls isolated execution contexts.
-_Avoid_: Orca wrapper, terminal driver
-
-**Tracker Adapter**:
-The provider-neutral boundary through which the workflow creates, relates, queries, and updates canonical tracker artifacts and mutable delivery state.
-_Avoid_: Linear client, issue helper
+**Gate**:
+A deterministic script at a handoff between roles or phases. It carries the handoff payload (the ticket, the brief, the report) and embeds the operation itself — posting the approved plan, lighting the label, retiring the role — so no operation lives half in an agent prompt and half somewhere else.
+_Avoid_: Helper script, glue, adapter
 
 **Delivery Phase**:
 Where an Implementation Ticket stands between its brief and its merge; the tracker holds it and reads it back unchanged.

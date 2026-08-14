@@ -2,11 +2,11 @@
 """The whole spawn interface the Orchestrator is allowed to use.
 
 TLDR: the four role verbs take one argument each — a Ticket Key — plus
-`status`, `retire`, `sweep`, `brief`, and the plan gate pair `wait`/`verdict`.
-The Orchestrator never picks a model, a permission flag, a worktree or a
-launch path; every one of those is decided here. If a command below does not
-express what you need, that is a package change, not an improvisation at
-the terminal.
+`status`, `retire`, `sweep`, `brief`, and the plan gate pair `wait`/
+`verdict`. The Orchestrator never picks a model, a permission flag, a
+worktree or a launch path; every one of those is decided here. If a command
+below does not express what you need, that is a package change, not an
+improvisation at the terminal.
 
     .symphonia/bin/spawn plan             GRE-181
     .symphonia/bin/spawn implement        GRE-181
@@ -26,17 +26,12 @@ half of the same interface. No role ever types `orca orchestration` by hand:
     .symphonia/bin/spawn done             GRE-181 --outcome succeeded --file report.md
 
 `plan` derives a worktree from the repo's default base; every later role
-reuses that same worktree, so one Ticket Key means one checkout from plan to
-PR. Roles are Orca dispatches (attached), not child worktrees: they report
-`worker_done` to the Orchestrator's Run.
-
-`wait` is the one loop that hears back from every role — it also drives the
-plan gate: it turns mailbox messages into typed events (`adapters/orca/events.py`)
-and hands them to `workflow.gate_loop.run`, which runs each through
-`adapters/plan_gate.py` and executes what comes back (label the ticket,
-retire the planner, flag a divergence). `verdict` is how the human's
-decision reaches the planner: it never comes from an agent typing
-`APPROVED`/`REVISE` into a reply by hand.
+reuses that same worktree, so one Ticket Key means one checkout from plan
+to PR. `wait` is the one loop that hears back from every role — it turns
+mailbox messages into typed events and hands them to `gate.run`, which
+executes what comes back (label the ticket, retire a role, flag a
+divergence). `verdict` is how the human's decision reaches the planner: it
+never comes from an agent typing `APPROVED`/`REVISE` into a reply by hand.
 """
 from __future__ import annotations
 
@@ -49,82 +44,52 @@ import os
 import subprocess
 import sys
 import time
-# Session ids are minted inside `ClaudeHarness.prepare()` now
-# (`adapters/harnesses/claude.py`, GRE-186 S3), not here — but `uuid` is
-# still imported so the name resolves as `spawn.uuid`. `claude.py` imports
-# the identical shared module object, so a test that patches `uuid4`
-# through this attribute (`self.spawn.uuid`) still reaches the code that
-# actually calls it.
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from adapters import harness_adapter as _harness_adapter
-from adapters import plan_gate as _gate
-from adapters import reports as _reports
-from adapters import runtime_adapter as _contract
-from adapters.linear import adapter as _linear
-from adapters.linear import client as _linear_client
-from adapters.orca import adapter as _cli
-from adapters.orca import events as _events
-from adapters.harnesses import claude as _claude
+import claude as _claude
+import gate as _gate
+import journal as _journal
+import linear as _linear
+import orca as _orca
+import roles as _roles
 import setup_worktree as _setup_worktree
-from workflow import gate_loop as _gate_loop
-from workflow import journal as _journal
-from workflow import roles as _roles
 
-# `.symphonia/`, the package root: two levels up from this file
-# (`src/spawn.py`), one for `src/` and one for the package. Everything below
-# that reads a Resource by path — `roles/`, `config.json` — anchors on this.
+# `.symphonia/`, the package root: everything that reads a Resource by path
+# — `roles/`, `config.json` — anchors on this.
 PACKAGE = Path(__file__).resolve().parents[1]
+ROLES_DIR = PACKAGE / "roles"
 
-RoleName = _contract.RoleName
-Access = _contract.Access
+RoleName = _roles.RoleName
+Access = _roles.Access
+
 GATE_ROLE = RoleName.PLANNER
 """Only the planner's completion is a Human Gate today; `wait` only reacts
 to gate events keyed to this role's dispatch."""
 
 ASK_MAX_MS = 1_800_000
 """What `orca orchestration ask` will actually wait, measured on 1.4.168: a
-larger `--timeout-ms` is clamped to this silently (asking for 99_999_999 came
-back reporting `timeoutMs: 1800000`). A human verdict routinely takes longer
-than 30 minutes, so `submit` resumes the same question by id instead of
-asking a second time."""
+larger `--timeout-ms` is clamped to this silently. A human verdict
+routinely takes longer than 30 minutes, so `submit` resumes the same
+question by id instead of asking a second time."""
 
-# The registry of live spawns, deliberately OUTSIDE every checkout.
-#
-# Both sides of a dispatch read it: the Orchestrator, from its own checkout,
-# and the role itself, from the ticket's worktree — two different copies of
-# this repository. Keeping it under `PACKAGE/.runtime/` meant each side wrote
-# a different file, so a role could not look up its own task id, dispatch id
-# or capability. Override with SYMPHONIA_RUNTIME (the tests do).
-#
-# Writers: `spawn`, `wait`, `verdict`, `retire`, `teardown`, `sweep` — all
-# Orchestrator-side. The role-side verbs (`submit`, `done`) only ever read,
-# so two processes in two checkouts never race for this file.
-#
-# The record shape below (`ticket`, `dispatch`, `task`, `gate_state`, ...) is
-# internal to this package, not a public contract: nothing outside `spawn.py`
-# and `workflow/gate_loop.py` is entitled to depend on it, and it can change
-# shape between versions without notice.
+# The registry of live spawns, deliberately OUTSIDE every checkout: the
+# Orchestrator and the role read it from two different copies of this
+# repository. Writers are all Orchestrator-side (`spawn`, `wait`,
+# `verdict`, `retire`, `sweep`); the role-side verbs (`submit`, `done`)
+# only ever read. The record shape is internal to this package, not a
+# contract.
 RUNTIME_DIR = Path(os.environ.get("SYMPHONIA_RUNTIME", "~/.symphonia/runtime")).expanduser()
 STATE = RUNTIME_DIR / "spawns.json"
 # A sibling, not `STATE` itself: `state_write` swaps the inode via
-# `os.replace`, so an flock held on the file being replaced protects
-# nothing once the swap happens.
+# `os.replace`, so an flock on the file being replaced protects nothing.
 STATE_LOCK = STATE.with_name(STATE.name + ".lock")
-# The baton between roles is a document dropped at a configured directory —
-# not a format this package invents, and (GRE-186 S3) not a path this
-# package hardcodes either: `"handoff_dir"` in `config.json` names it, this
-# function is the one place that reads that key (C5 of the S3 verdict), and
-# every caller below goes through it rather than reading the key itself.
-#
-# It lives outside the repository on purpose: it is never committed, never
-# travels with the branch, and outlives nothing. Its only job is carrying
-# context from the role that just died to the one about to start. Moving it
-# into the worktree would turn a disposable note into a versioned artifact
-# that reviewers have to maintain — do not.
+
+# The baton between roles is a document dropped at `handoff_dir` — outside
+# the repository on purpose: never committed, never travels with the
+# branch. Its only job is carrying context from the role that just died to
+# the one about to start.
 _HANDOFF_DIR_DEFAULT = "~/orca/.context"
 
 
@@ -133,28 +98,10 @@ def _handoff_dir() -> str:
     return config.get("handoff_dir", _HANDOFF_DIR_DEFAULT)
 
 
-# The role matrix (tier, access, role file) lives only in each role file's
-# own frontmatter now — `workflow.roles.load_policies` reads it, and fails
-# at bootstrap rather than letting a missing/malformed declaration launch
-# something undeclared (GRE-186 S1). No cache: every verb call re-reads the
-# four small files, so an edit to a role file takes effect on the next spawn
-# without restarting anything.
-ROLES_DIR = PACKAGE / "roles"
-
-
 def _policies() -> dict[RoleName, _roles.RolePolicy]:
+    # No cache: every verb call re-reads the four small role files, so an
+    # edit takes effect on the next spawn without restarting anything.
     return _roles.load_policies(ROLES_DIR)
-
-
-def _harness() -> _harness_adapter.HarnessAdapter:
-    """The one harness this package composes over — hardcoded, not looked
-    up from `config.json` (decision 6 / item 5 of GRE-186): a registry keyed
-    by provider and a `config.harness` setting are deferred until a second
-    harness exists to prove the seam is real, not speculative."""
-
-    return _claude.ClaudeHarness()
-
-# --- orca CLI ------------------------------------------------------------
 
 
 def _now() -> str:
@@ -162,49 +109,28 @@ def _now() -> str:
 
 
 def orca(*argv: str, expect_lifecycle_ok: bool = False) -> dict:
-    """One orca call, envelope unwrapped, failures loud. The CLI wraps every
-    --json response in {id, ok, result, _meta}.
+    """One orca call, failures as `SystemExit` — the CLI-facing wrapper
+    around `orca.orca()`."""
 
-    Delegates to `adapters.orca.adapter.unwrap_envelope` — the same
-    unwrapper `OrcaRuntimeAdapter._orca` uses (GRE-184 M1) — and turns
-    an `OrcaCliError` into the identical `SystemExit` this function has
-    always raised. Name, signature and error text are unchanged, so `wait`
-    and `verdict` (GRE-185) keep calling this without editing a line.
-
-    `expect_lifecycle_ok` is for the lifecycle messages a role sends
-    (`worker_done`). Measured against Orca 1.4.168: a rejected `worker_done`
-    still answers `ok: true` — the refusal lives in `result.lifecycle` and in
-    the process exit code, not in the envelope. Without this flag a rejected
-    completion reads as a success, which is exactly how a planner ends up
-    never retiring. Note the asymmetry: `lifecycle` is present only on a
-    rejection, so its absence must never be treated as failure.
-    """
-
-    # GRE-184 M5: the transport is `_adapter()._orca`, not a direct
-    # `subprocess_runner` call — the last piece of the seam. `wait`/
-    # `verdict`/`submit`/`done` (GRE-185's boundary) still call this
-    # function by the same name, signature, and error text; nothing below
-    # this line changed.
     try:
-        return _adapter()._orca(*argv, expect_lifecycle_ok=expect_lifecycle_ok)
-    except _cli.OrcaCliError as exc:
+        return _orca.orca(*argv, expect_lifecycle_ok=expect_lifecycle_ok)
+    except _orca.OrcaCliError as exc:
         raise SystemExit(str(exc)) from exc
 
 
-def state_read() -> dict:
-    """The live registry, from the shared runtime file."""
+# --- the registry ----------------------------------------------------------
 
+
+def state_read() -> dict:
     if STATE.exists():
         return json.loads(STATE.read_text())
     return {}
 
 
 def state_write(data: dict) -> None:
-    """Atomic, and 0600 from the moment the bytes exist — the registry holds
-    Dispatch capability tokens, and a token is what authorizes a
-    `worker_done` on someone else's dispatch. Both the directory and the temp
-    file are created narrow rather than widened afterwards: a chmod after the
-    write leaves a window at the default umask."""
+    """Atomic, and 0600 from the moment the bytes exist — the registry
+    holds Dispatch capability tokens, and a token is what authorizes a
+    `worker_done` on someone else's dispatch."""
 
     STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(STATE.parent, 0o700)  # a directory that already existed
@@ -217,29 +143,18 @@ def state_write(data: dict) -> None:
 
 @contextlib.contextmanager
 def state_lock() -> Iterator[None]:
-    """Serializes a read-modify-write cycle of the registry across
-    processes: `wait` can sit on a snapshot for up to 15 minutes while a
-    concurrent `verdict` writes `gate_state` elsewhere, and without this the
-    read-modify-write in either one can silently revert the other's write.
+    """Serializes a read-modify-write of the registry across processes:
+    `wait` can sit on a snapshot for 15 minutes while a concurrent
+    `verdict` writes `gate_state` elsewhere.
 
     Hold this ONLY around a `state_read()`/`state_write()` pair, never
-    around the blocking `check --wait` itself — that wait is the up-to-15-
-    minute part, and holding the lock across it would starve every
-    concurrent `verdict` for as long as `wait` sits idle.
-
-    flock, not a POSIX record lock: two separate `os.open()` calls on
-    `STATE_LOCK` conflict even from the SAME process, because a flock is
-    held by the open file description, not the process. That means this
-    lock does not nest — `teardown()` must never call `state_lock()` while
-    it is invoked from inside `wait`'s critical section (which it is, via
-    `workflow.gate_loop.run`'s `retire_planner`/`retire_role` actions): a
-    second acquisition here would deadlock the one process holding the
-    first. `teardown()` stays unlocked; `wait`, `verdict`, and `sweep`
-    acquire this.
-    """
+    around the blocking `check --wait` itself. flock does not nest —
+    `teardown()` must never take it (it runs inside `wait`'s critical
+    section via `gate.run`); `wait`, `verdict`, `done` and `sweep` acquire
+    it."""
 
     STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(STATE.parent, 0o700)  # a directory that already existed
+    os.chmod(STATE.parent, 0o700)
     fd = os.open(STATE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -247,27 +162,6 @@ def state_lock() -> Iterator[None]:
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-
-
-# --- the runtime adapter, composed -----------------------------------------
-
-
-def _adapter() -> _cli.OrcaRuntimeAdapter:
-    """The production adapter `spawn()` composes its verbs over (GRE-184
-    M4): `find_workspace`/`create_workspace`/`default_base`/`set_phase`/
-    `open_context`/`dispatch`/`snapshot`. `coordinator`/`run_id` are inert
-    placeholders — `bind_control=False` (approval condition #3 of the PR-A
-    plan) means `_ensure_control` never reads them, and none of the methods
-    above reference `self.coordinator` either; only `message_worker`/
-    `respond`/`sweep` do, and this package never calls those. Consequence,
-    same as documented on the flag itself: `spawn`'s production path never
-    exercises control-lost detection — the conformance suite (which always
-    binds) is the only place that check runs."""
-
-    return _cli.OrcaRuntimeAdapter(coordinator="spawn", run_id="spawn", bind_control=False)
-
-
-# --- the spawn itself ----------------------------------------------------
 
 
 # --- the Execution Brief (every role's input) ------------------------------
@@ -282,10 +176,9 @@ def _current_branch(workspace: str) -> str:
 
 
 def _head(workspace: str) -> str:
-    """The commit a worktree is on, or `""` if git could not answer — the
-    same "empty/erro -> empty string" shape as `_current_branch`. Recorded
-    at dispatch as `head_at_dispatch`, the baseline `done()` compares
-    against to catch an empty `succeeded`."""
+    """The commit a worktree is on, or `""` if git could not answer.
+    Recorded at dispatch as `head_at_dispatch`, the baseline `done()`
+    compares against to catch an empty `succeeded`."""
 
     proc = subprocess.run(
         ["git", "-C", workspace, "rev-parse", "HEAD"],
@@ -294,41 +187,26 @@ def _head(workspace: str) -> str:
     return proc.stdout.strip()
 
 
-def _handoff_file(ticket: str) -> tuple[Path | None, int]:
-    """The one handoff a role's Brief may point to, plus how many other
-    files were passed over — item 7 of GRE-187: a role must never have to
-    choose which of two documents to believe.
+def _handoff_file(ticket: str) -> Path | None:
+    """The one handoff a role's Brief may point to:
+    `{handoff_dir}/{ticket_lower}.md`, the only file a role's own "How to
+    finish" instructs it to write — a role must never have to choose which
+    of two documents to believe."""
 
-    The canonical path, `{handoff_dir}/{ticket_lower}.md`, always wins when
-    it exists: it is the only file a role's own "How to finish" instructs
-    it to write, so its presence alone proves it is current. Legacy files
-    from before this round (`{ticket_lower}-*.md`) are a fallback, picked by
-    newest mtime — the lexicographic name mixes role and date and would lie
-    about which one is current.
-    """
-
-    directory = Path(os.path.expanduser(_handoff_dir()))
-    canonical = directory / f"{ticket.lower()}.md"
-    legacy = sorted(directory.glob(f"{ticket.lower()}-*.md"))
-    if canonical.exists():
-        return canonical, len(legacy)
-    if not legacy:
-        return None, 0
-    newest = max(legacy, key=lambda p: p.stat().st_mtime)
-    return newest, len(legacy) - 1
+    path = Path(os.path.expanduser(_handoff_dir())) / f"{ticket.lower()}.md"
+    return path if path.exists() else None
 
 
 def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) -> str:
     """Assembles the Execution Brief injected at dispatch: extracts the
-    ``io:brief-template`` block from the role's own file and fills it from
+    `io:brief-template` block from the role's own file and fills it from
     the ticket. The role opens with the ticket already in hand — zero tool
-    call needed to fetch it (`orca linear` may be disconnected; this reads
-    the tracker adapter directly, same as GRE-174)."""
+    calls needed to fetch it."""
 
     ticket = ticket.upper()
     policy = _policies()[role]
     role_path = ROLES_DIR / policy.role_file
-    template = _reports.extract_block(role_path.read_text(), "md io:brief-template")
+    template = _gate.extract_block(role_path.read_text(), "md io:brief-template")
 
     tracker = tracker or _linear.LinearTracker()
 
@@ -339,16 +217,11 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
         for c in comments
     ) or "None."
 
-    handoff_file, superseded = _handoff_file(ticket)
-    if handoff_file is None:
-        handoff_text = "None — this is the first role on this ticket."
-    else:
-        handoff_text = f"- {handoff_file}"
-        if superseded:
-            handoff_text += (
-                f"\n\n({superseded} older handoff(s) superseded — "
-                f"deliberately not part of your context.)"
-            )
+    handoff_file = _handoff_file(ticket)
+    handoff_text = (
+        f"- {handoff_file}" if handoff_file
+        else "None — this is the first role on this ticket."
+    )
 
     values = {
         "ticket_key": ticket,
@@ -363,7 +236,7 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
         "comments": comment_text,
         "handoff_files": handoff_text,
         "handoff_dir": _handoff_dir(),
-        "handoff_hint": _harness().handoff_hint(),
+        "handoff_hint": _claude.handoff_hint(),
     }
     try:
         return template.format(**values)
@@ -373,18 +246,18 @@ def build_brief(role: RoleName, ticket: str, workspace: str, *, tracker=None) ->
         )
 
 
-# --- role identity: how a role finds its own record -----------------------
+# --- role identity: how a role finds its own record ------------------------
 
 
 def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     """The record of the role calling this, from inside its own terminal.
 
     Identity comes from `ORCA_TERMINAL_HANDLE`, which Orca exports into the
-    pane and `spawn` already stored as `terminal` — an exact match, never a
-    guess. The fallback (the worktree's git toplevel) exists for a pane whose
+    pane and `spawn` stored as `terminal` — an exact match, never a guess.
+    The fallback (the worktree's git toplevel) exists for a pane whose
     environment did not carry the handle; if it matches more than one live
-    role, this fails loudly rather than reporting on someone else's behalf.
-    """
+    role, this fails loudly rather than reporting on someone else's
+    behalf."""
 
     ticket = ticket.upper()
     data = state_read() if data is None else data
@@ -417,42 +290,42 @@ def own_record(ticket: str, data: dict | None = None) -> tuple[str, dict]:
     )
 
 
+# --- the spawn itself ------------------------------------------------------
+
+
 def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None = None) -> dict:
-    """Composed over `OrcaRuntimeAdapter` and one `HarnessAdapter` (GRE-186
-    S3) — every orca call below lives in `_adapter()`'s methods, the launch
-    itself in `_harness().prepare()`, not here. Item 10 of GRE-181 ("failure
-    mid-sequence leaves no orphan"): a fresh workspace is torn down if
-    `set_phase`/`prepare`/`open_context` fails; `dispatch`'s one
-    characterized failure (a dispatch that minted no capability) already
-    rolls its own task/terminal back inside the adapter (GRE-184 M3) —
-    unchanged from what M0 froze, so this wrapper only translates the
-    error, it does not clean up a second time. A workspace is never
-    destroyed once reused.
-    """
+    """Create or reuse the ticket's worktree, launch the role at its
+    declared tier, inject the Execution Brief as the dispatch, and record
+    everything. A failure mid-sequence leaves no orphan: after a fresh
+    worktree is created, ANY later failure — badge, launch, brief
+    (Linear included), dispatch — closes the terminal it may have opened
+    and removes that worktree, so a retry of `spawn plan` starts clean
+    instead of refusing on a leftover checkout. A reused worktree is never
+    destroyed."""
 
     ticket = ticket.upper()
-    adapter = _adapter()
-    workspace = adapter.find_workspace(ticket)
+    try:
+        worktree = _orca.find_worktree(ticket)
+    except _orca.OrcaCliError as exc:
+        raise SystemExit(str(exc)) from exc
     fresh = False
     if fresh_worktree:
-        if workspace is not None:
+        if worktree is not None:
             raise SystemExit(
-                f"{ticket} already has a worktree at {workspace.path}. "
+                f"{ticket} already has a worktree at {worktree.path}. "
                 f"Planning runs once per ticket; use `implement` to continue in it."
             )
         try:
-            workspace = adapter.create_workspace(ticket, base_branch=adapter.default_base())
-        except (RuntimeError, _cli.OrcaCliError) as exc:
+            worktree = _orca.create_worktree(ticket, base_branch=_orca.default_base())
+        except _orca.OrcaCliError as exc:
             raise SystemExit(str(exc)) from exc
         fresh = True
-        # The env files are gitignored, so the new checkout does not have them —
-        # it looks complete and fails the first time something reads `.env`.
-        # Called here rather than relying on Orca's repo setup hook, which is a
-        # per-machine setting and is empty until someone fills it in: a spawn must
-        # not depend on a checkbox. Running it twice is harmless.
-        print(json.dumps(_setup_worktree.setup(Path(workspace.path))), file=sys.stderr)
+        # The env files are gitignored, so the new checkout does not have
+        # them — it looks complete and fails the first time something reads
+        # `.env`. Running this twice is harmless.
+        print(json.dumps(_setup_worktree.setup(Path(worktree.path))), file=sys.stderr)
     else:
-        if workspace is None:
+        if worktree is None:
             raise SystemExit(
                 f"{ticket} has no worktree yet. Run `spawn plan {ticket}` first — "
                 f"every role after the planner reuses the checkout planning created."
@@ -463,71 +336,58 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     policy = _policies()[role]
     if tier:
         try:
-            policy = dataclasses.replace(policy, tier=_contract.CapabilityTier(tier))
+            policy = dataclasses.replace(policy, tier=_roles.CapabilityTier(tier))
         except ValueError:
             raise SystemExit(
                 f"unknown tier {tier!r}; known: "
-                f"{', '.join(t.value for t in _contract.CapabilityTier)}"
+                f"{', '.join(t.value for t in _roles.CapabilityTier)}"
             )
 
-    harness = _harness()
+    terminal = None
     try:
-        adapter.set_phase(workspace, role)
-        prepared = harness.prepare(workspace=workspace, policy=policy)
-        context = adapter.open_context(workspace, role=role, access=policy.access, launch=prepared)
-    except (RuntimeError, _cli.OrcaCliError, _harness_adapter.HarnessRefusal) as exc:
+        _orca.set_phase(worktree, role)
+        launch = _claude.prepare(workspace=worktree.path, policy=policy)
+        terminal = _orca.create_terminal(worktree, role, launch.command)
+        # Every role's input is the Execution Brief, injected: the ticket
+        # is read and formatted here, never left for the role to go fetch.
+        spec = build_brief(role, ticket, worktree.path)
+        dispatched = _orca.dispatch(terminal, spec, ticket=ticket, role=role.value)
+    except (_orca.OrcaCliError, _linear.LinearError, SystemExit) as exc:
         if fresh:
+            # Best-effort, terminal first: `worktree rm` on a checkout
+            # whose pane is still open would otherwise be the one failure
+            # this rollback cannot survive. The original failure is what
+            # gets reported either way.
+            if terminal is not None:
+                try:
+                    _orca.close_terminal(terminal, tab=True)
+                except _orca.OrcaCliError:
+                    pass
             try:
-                adapter.destroy_workspace(workspace)
-            except (RuntimeError, _cli.OrcaCliError):
-                pass  # best-effort; the launch failure is what gets reported
+                _orca.remove_worktree(worktree.path)
+            except _orca.OrcaCliError:
+                pass
+        if isinstance(exc, SystemExit):
+            raise
         raise SystemExit(str(exc)) from exc
-
-    # Every role's input is the Execution Brief, injected: the ticket is
-    # read and formatted here, never left for the role to go fetch.
-    spec = build_brief(role, ticket, workspace.path)
-    try:
-        attempt = adapter.dispatch(context, spec)
-    except _cli.OrcaCliError as exc:
-        raise SystemExit(str(exc)) from exc
-    snap = adapter.snapshot(attempt)
-    head_at_dispatch = _head(workspace.path)
 
     record = {
         "ticket": ticket,
         "role": role.value,
         "tier": policy.tier.value,
-        "access": snap["access"],
-        "worktree": workspace.path,
-        "worktree_id": workspace.id,
-        # The baseline `done()` compares HEAD against to catch a `succeeded`
-        # that changed nothing (GRE-187 item 6). `""` on a git error — never
-        # raised here, since a `spawn` that fails on a measurement it does
-        # not need would be its own bug.
-        "head_at_dispatch": head_at_dispatch,
-        "terminal": snap["terminal"],
-        "task": snap["task"],
-        "dispatch": snap["dispatch"],
-        "capability": snap["capability"],
+        "access": policy.access.value,
+        "worktree": worktree.path,
+        "worktree_id": worktree.id,
+        "head_at_dispatch": _head(worktree.path),
+        "terminal": terminal,
+        "task": dispatched["task"],
+        "dispatch": dispatched["dispatch"],
+        "capability": dispatched["capability"],
         "gate_state": IDLE,
         "approval_rounds": 0,
-        # Honest by construction (decision 3 of the GRE-186 S3 verdict):
-        # `requested` is what launch itself can ever prove; nothing reads
-        # this before `status()` calls `harness.observe()` for the strong
-        # check. Deliberately never re-read afterwards either: this records
-        # what was known at launch, and `observe()` is the live source of
-        # what's known now — reading the record back in its place would
-        # trade a live value for a stale one, the dishonesty this ticket
-        # exists to kill.
-        "tier_evidence": {
-            "kind": "requested",
-            "tier": policy.tier.value,
-            "detail": "recorded at launch; no observation yet",
-        },
-        # The ContextRef <-> HarnessSession association (decision 5): the
-        # loose `session_id`/`transcript` fields this replaces are gone.
-        "session": {"id": snap["session_id"], "observation_ref": snap["observation_ref"]},
-        "command": snap["command"],
+        "session_id": launch.session_id,
+        "transcript": launch.transcript,
+        "command": _orca.shell_join(launch.command),
     }
     data = state_read()
     data[f"{ticket}/{role.value}"] = record
@@ -535,46 +395,33 @@ def spawn(role: RoleName, ticket: str, *, fresh_worktree: bool, tier: str | None
     return record
 
 
-# --- observation ---------------------------------------------------------
+# --- observation -----------------------------------------------------------
 
 
 def status(ticket: str | None) -> list[dict] | dict:
     """Deterministic state per spawn: what the dispatch says, and what tier
-    evidence the harness can produce — `harness.observe()` reads it,
-    never this function guessing from a transcript itself (GRE-186 S3: the
-    model-alias-vs-transcript comparison left the core along with
-    `verify_tier`).
+    evidence the transcript can produce (`claude.observe` reads it — never
+    this function guessing).
 
-    Tolerant of a record from before this round: one with no `session`/
-    `tier_evidence` (the old `model_requested` shape) reads as
-    `evidence_kind="unverifiable"`, named as a pre-GRE-186 record — nothing
-    more elaborate than that; the record format is not a contract (decision
-    5 of the S3 verdict).
+    With a `ticket`, a flat list. Without one — the whole-registry view —
+    that same list under `"spawns"` alongside `"pending_delivery"`: the
+    open Delivery id, read from the persisted receipt, so an unacked `wait`
+    is visible without recovering an id from old stdout."""
 
-    With a `ticket`, this stays the flat list every existing caller indexes
-    into. Without one — the whole-registry view — it wraps that same list
-    under `"spawns"` alongside `"pending_delivery"` (GRE-187): the open
-    Delivery id, read from `workflow.journal`'s receipt, so an unacked
-    `wait` is visible without recovering an id from old stdout."""
-
-    adapter = _adapter()
-    harness = _harness()
     out = []
     for key, rec in sorted(state_read().items()):
         if ticket and not key.startswith(ticket.upper() + "/"):
             continue
         try:
-            dispatch_status = adapter.dispatch_status(rec["task"])
-        except _cli.OrcaCliError:
+            dispatch_status = _orca.dispatch_status(rec["task"])
+        except _orca.OrcaCliError:
             dispatch_status = "unknown"
-        if "session" in rec and "tier_evidence" in rec:
-            session = _harness_adapter.HarnessSession(**rec["session"])
-            requested = _contract.CapabilityTier(rec["tier"])
-            evidence = harness.observe(session, requested)
+        if rec.get("transcript"):
+            evidence = _claude.observe(rec["transcript"], _roles.CapabilityTier(rec["tier"]))
             evidence_kind, evidence_detail = evidence.kind, evidence.detail
         else:
             evidence_kind = "unverifiable"
-            evidence_detail = "pre-GRE-186 record; no session/tier_evidence to observe"
+            evidence_detail = "no transcript recorded for this spawn"
         out.append(
             {
                 "key": key,
@@ -583,8 +430,7 @@ def status(ticket: str | None) -> list[dict] | dict:
                 "evidence_kind": evidence_kind,
                 "evidence_detail": evidence_detail,
                 # A role stuck at `verdict-approved` with an old
-                # `last_event_at` is one whose worker_done never landed —
-                # visible here rather than needing a verb of its own.
+                # `last_event_at` is one whose worker_done never landed.
                 "gate_state": rec.get("gate_state", IDLE),
                 "approval_rounds": rec.get("approval_rounds", 0),
                 "last_event_at": rec.get("last_event_at"),
@@ -599,18 +445,9 @@ def status(ticket: str | None) -> list[dict] | dict:
 
 def retire(ticket: str, role_value: str) -> dict:
     """Stop one role and close its pane. The worktree survives — the next
-    role in the ticket needs it. The Orchestrator's own verb, typed by hand
-    or by a script — not idempotent, unlike `teardown`: a human retiring an
-    already-dead role a second time still deserves the same effects and the
-    same answer, not a silent no-op. This is a deliberate choice, pinned by
-    `RetireRerunsEffectsOnADeadRole` in `test_teardown_sweep.py` —
-    `test_retire_self_guard` only pins the self-guard above, not this.
-
-    `worker-stop` is tried but not relied on: it only knows dispatches that
-    `worker-start` created, and this package launches through `terminal
-    create` so it can set a model and permissions (GRE-179). Closing the
-    terminal is what actually ends the role.
-    """
+    role needs it. The Orchestrator's own verb — not idempotent, unlike
+    `teardown`: a human retiring an already-dead role a second time still
+    gets the same effects run again, not a silent no-op."""
 
     key = f"{ticket.upper()}/{role_value}"
     rec = state_read().get(key)
@@ -618,12 +455,10 @@ def retire(ticket: str, role_value: str) -> dict:
         raise SystemExit(f"no spawn recorded for {key}")
 
     # A role can name its own terminal here — `retire GRE-188 planner` run
-    # from inside the planner's own pane. Nothing below guards against it:
-    # `stop_worker` and `close_terminal` would kill the process running this
-    # very function, so the caller loses its terminal mid-command and never
-    # sees the task get settled, or any error explaining what happened.
-    # Refuse instead. Retiring is the Orchestrator's verb, and it runs from
-    # a terminal that is nobody's role.
+    # from inside the planner's own pane. `stop_worker`/`close_terminal`
+    # would kill the process running this very function, so the caller
+    # loses its terminal mid-command and never sees the task get settled.
+    # Refuse instead: retiring is the Orchestrator's verb.
     own_terminal = os.environ.get("ORCA_TERMINAL_HANDLE", "")
     if own_terminal and own_terminal == rec.get("terminal"):
         raise SystemExit(
@@ -637,14 +472,10 @@ def retire(ticket: str, role_value: str) -> dict:
 
 def teardown(ticket: str, role_value: str) -> dict:
     """Same effects as `retire`, minus the self-guard, plus idempotence: a
-    record already marked `retired` returns immediately, without touching
-    the adapter. Called by the gate loop when a non-planner's `worker_done`
-    arrives, and by `sweep` for a record whose world is already gone — both
-    a replayed Delivery and a repeated `sweep` must be a no-op, which is
-    what the guard here is for. `retire` does not use it: a human retiring
-    an already-dead role by hand still gets the same effects run again, not
-    a silent no-op.
-    """
+    record already marked `retired` returns immediately. Called by
+    `gate.run` when a `worker_done` arrives, and by `sweep` for a record
+    whose world is already gone — both a replayed Delivery and a repeated
+    `sweep` must be a no-op."""
 
     key = f"{ticket.upper()}/{role_value}"
     rec = state_read().get(key)
@@ -657,14 +488,12 @@ def teardown(ticket: str, role_value: str) -> dict:
 
 def _run_teardown(ticket: str, role_value: str) -> dict:
     """Every effect of ending one role's dispatch, best-effort, in a fixed
-    order: `stop_worker` -> `close_terminal --tab` -> settle the Task ->
-    mark `retired` in the registry. Nothing here raises on a failed effect:
-    a dead terminal or an unreachable dispatch is exactly the situation
-    this exists to clean up after, so each failure becomes an `effects`
-    entry instead of aborting before `retired` is written.
-    """
+    order: `stop_worker` -> close the terminal -> settle the Task -> mark
+    `retired`. Nothing here raises on a failed effect: a dead terminal or
+    an unreachable dispatch is exactly what this cleans up after, so each
+    failure becomes an `effects` entry instead of aborting before `retired`
+    is written."""
 
-    adapter = _adapter()
     key = f"{ticket.upper()}/{role_value}"
     rec = state_read().get(key)
     if rec is None:
@@ -672,32 +501,31 @@ def _run_teardown(ticket: str, role_value: str) -> dict:
 
     effects = []
     try:
-        adapter.stop_worker(rec["dispatch"])
+        _orca.stop_worker(rec["dispatch"])
         effects.append("worker-stop")
-    except _cli.OrcaCliError:
+    except _orca.OrcaCliError:
         pass  # expected for terminal-created dispatches
 
     try:
-        adapter.close_terminal(rec["terminal"], tab=True)
+        _orca.close_terminal(rec["terminal"], tab=True)
         effects.append("terminal closed")
-    except _cli.OrcaCliError as exc:
+    except _orca.OrcaCliError as exc:
         effects.append(f"terminal not closed ({exc})")
 
-    # A killed role leaves its Task sitting in `dispatched` forever, which
-    # Reconciliation would read as an attempt still in flight. Settle it —
-    # best-effort like everything else here, so a CLI outage on this one
-    # call cannot stop `retired` from ever being written.
+    # A killed role leaves its Task in `dispatched` forever, which reads as
+    # an attempt still in flight. Settle it — best-effort, so a CLI outage
+    # here cannot stop `retired` from being written.
     dispatch_status = ""
     try:
-        dispatch_status = adapter.dispatch_status(rec["task"], default="")
-    except _cli.OrcaCliError as exc:
+        dispatch_status = _orca.dispatch_status(rec["task"], default="")
+    except _orca.OrcaCliError as exc:
         effects.append(f"task NOT settled ({exc})")
     else:
         if dispatch_status not in ("completed", "failed"):
             try:
-                adapter.settle_task(rec["task"], f"{role_value} retired by the Orchestrator")
+                _orca.settle_task(rec["task"], f"{role_value} retired by the Orchestrator")
                 effects.append("task settled as failed")
-            except _cli.OrcaCliError as exc:
+            except _orca.OrcaCliError as exc:
                 effects.append(f"task NOT settled ({exc})")
 
     data = state_read()
@@ -718,37 +546,27 @@ def sweep(ticket: str | None) -> list[dict]:
     """Audit the registry for a record whose world is already gone — its
     terminal not among Orca's live handles, or its worktree missing from
     disk — and tear it down without being told which ticket/role died.
-    What `retired` records are for `wait`'s gate on a `worker_done`, this is
-    for everything that never reported at all: a role killed by the app
-    quitting, a machine that lost power, a worktree deleted by hand.
+    What `retired` records are for `wait`, this is for everything that
+    never reported at all: the app quit, a machine lost power, a worktree
+    deleted by hand.
 
-    A live record is reported, not touched — `{"key": ..., "live": True}`.
-    Already-retired records are not this verb's business; `teardown`'s own
-    idempotence would no-op them anyway, but skipping them here keeps a
-    `sweep` report about the records that still needed a decision.
-
-    The whole read-decide-teardown loop runs under `state_lock()`: this is
-    the only writer in the package that used to do its read-modify-write
-    unlocked, which let a concurrent `wait`/`verdict` (holding the lock
-    across its own snapshot) silently revert a `teardown` this loop had
-    already run — after that teardown's effects (`close_terminal`,
-    `settle_task`) were already irreversible. `teardown` itself stays
-    unlocked, so this does not nest.
+    A live record is reported, not touched. The whole read-decide-teardown
+    loop runs under `state_lock()` so a concurrent `wait`/`verdict` cannot
+    silently revert a teardown whose effects were already irreversible.
 
     A `list_terminals()` that comes back empty is refused rather than acted
     on: every unretired record would read as "terminal not live" and this
-    loop would tear down every live role in the registry on the strength of
-    one degraded CLI response. No retry, no heuristic — just refuse and say
-    why; the caller can run `sweep` again once the CLI is answering.
-    """
+    loop would tear down every live role on the strength of one degraded
+    CLI response."""
 
-    adapter = _adapter()
-    live_terminals = adapter.list_terminals()
+    try:
+        live_terminals = _orca.list_terminals()
+    except _orca.OrcaCliError as exc:
+        raise SystemExit(str(exc)) from exc
     if not live_terminals:
         raise SystemExit(
             "list_terminals() returned no terminals at all; refusing to treat "
-            "every unretired record as an orphan. Retry once the CLI is "
-            "responding."
+            "every unretired record as an orphan. Retry once the CLI is responding."
         )
     out = []
     with state_lock():
@@ -780,42 +598,25 @@ IDLE = _gate.IDLE
 def wait(*, ack: str | None, timeout_ms: int) -> dict:
     """The one loop the Orchestrator uses to hear back from every role.
     Wraps `orca orchestration check --wait`, then hands the batch to
-    `workflow.gate_loop.run`, which runs each gate event through
-    `apply_gate_event`/`plan_gate.transition` and executes what comes
-    back — label the ticket, retire the planner, flag a divergence —
-    never the Orchestrator reading a message and deciding by itself.
+    `gate.run` — never the Orchestrator reading a message and deciding by
+    itself.
 
     Replay-safe: an unacked Delivery replays the same batch, but every
-    action is guarded by the recorded `gate_state` (and, for plan-question,
-    by the event's own id), so a repeat is a no-op (see `plan_gate.py`).
+    action is guarded by the recorded `gate_state` (and, for a
+    plan-question, the event's own id), so a repeat is a no-op.
 
-    `ack` defaults to the receipt `workflow.journal` persisted from the
-    previous call (GRE-187): the Delivery id no longer has to survive in a
-    terminal's stdout to be ackable, so reopening the Orchestrator's
-    terminal does not force a re-delivery of everything already seen. An
-    explicit `ack` still wins over the receipt — it exists for the one case
-    that isn't "ack whatever came last": re-acking a specific id by hand.
+    `ack` defaults to the receipt persisted from the previous call: the
+    Delivery id no longer has to survive in a terminal's stdout to be
+    ackable. An explicit `--ack` still wins — it exists for re-acking a
+    specific id by hand.
 
-    The Linear tracker is built lazily, only when a gate action actually
-    needs it — a `wait` that observes no gate action (the common case for
-    every role but the planner) must work even without `LINEAR_API_KEY` set.
-
-    The blocking `check --wait` runs BEFORE `state_lock()` is taken — it is
-    the up-to-15-minute wait itself, and holding the lock across it would
-    starve every concurrent `verdict` for as long as this call sits idle.
-    Only the read-modify-write that follows is locked. Inside it, the
-    journal append happens BEFORE `gate_loop.run` (the raw event survives a
-    crash mid-processing even if the round it started is never recorded),
-    and the receipt write happens AFTER `state_write` — the delivery is
-    only marked acked once the outcome it acks is durable on disk. A crash
-    anywhere before the receipt is written leaves the delivery unacked: the
-    next `wait` sends no `--ack`, Orca redelivers the identical batch, and
-    `gate_loop.run` replays it — a no-op by construction (see above).
-    Writing the receipt any earlier would risk acking a delivery whose
-    processing never made it to `state_write`, which silently skips the
-    round it belonged to; a lost receipt (forcing a harmless replay), not a
-    suppressed one, is the failure this ordering exists to prevent.
-    """
+    Ordering inside the lock: the journal append happens BEFORE `gate.run`
+    (the raw event survives a crash mid-processing), and the receipt write
+    happens AFTER `state_write` — the delivery is only marked acked once
+    the outcome it acks is durable. A crash before the receipt leaves the
+    delivery unacked, Orca redelivers, and the replay is a no-op. The
+    failure this ordering prevents is a suppressed delivery; a lost receipt
+    only costs a harmless replay."""
 
     if ack is None:
         ack = _journal.read_receipt(RUNTIME_DIR)
@@ -830,16 +631,13 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     started = time.monotonic()
     batch_raw = orca(*argv)
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    # `orca()` already unwraps the envelope; `parse_check_output` expects the
-    # raw JSON text of `check --peek/--wait --json`, so it is fed back in —
-    # the same helper serves both call sites without a second parser.
-    batch = _events.parse_check_output(json.dumps(batch_raw))
-    events = _events.gate_events(batch.messages)
+    # `orca()` already unwraps the envelope; `parse_check_output` expects
+    # raw JSON text, so it is fed back in — one parser for both call sites.
+    batch = _orca.parse_check_output(json.dumps(batch_raw))
+    events = _orca.gate_events(batch.messages)
     raw_by_id = {m.id: m for m in batch.messages}
-    # Every mailbox message, not just the ones typed as gate events — an
-    # escalation or a non-planner question must stay visible to the
-    # Orchestrator even though the gate itself has nothing to do with it.
-    # Built once, reused for both the journal and the return value.
+    # Every mailbox message, not just the typed gate events — an escalation
+    # or a non-planner question must stay visible to the Orchestrator.
     message_dicts = [
         {
             "id": m.id, "type": m.type, "subject": m.subject,
@@ -848,34 +646,27 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
         for m in batch.messages
     ]
 
+    # The Linear tracker is built lazily, only when a gate action actually
+    # needs it — a `wait` that observes no gate action (the common case)
+    # must work without `LINEAR_API_KEY` set.
     with state_lock():
         data = state_read()
-        # Journaled before processing: the journal is an append-only record,
-        # not state, so a replay re-appending the same lines for the same
-        # `delivery_id` is acceptable — each line already carries that id,
-        # so a duplicate is identifiable by a reader, and deduping it would
-        # need its own persisted "seen" set, which is exactly the kind of
-        # state this module was built to avoid holding (GRE-187 onda 11).
         _journal.append_events(RUNTIME_DIR, batch.delivery_id, message_dicts)
-        actions_taken, unattributed = _gate_loop.run(
+        actions_taken, unattributed = _gate.run(
             events, raw_by_id, data,
             tracker=lambda: _linear.LinearTracker(),
             teardown=teardown,
             gate_role=GATE_ROLE.value,
         )
         state_write(data)
-        # The receipt is written LAST, only after the registry write above
-        # is durable — see the docstring for why (GRE-187 onda 11 reverted
-        # writing it earlier).
         _journal.write_receipt(RUNTIME_DIR, batch.delivery_id)
     return {
         "delivery_id": batch.delivery_id,
         "acked": ack or None,
         # An empty batch back in a couple of seconds, instead of blocking
-        # for the requested timeout, is the anomaly measured live in ondas
-        # 9-10: content-identical to a legitimate empty timeout, elapsed
-        # time is the only observable difference. Surfaced here so it stops
-        # passing for a real timeout unnoticed.
+        # for the requested timeout, is content-identical to a legitimate
+        # empty timeout (measured live) — elapsed time is the only
+        # observable difference, so it is surfaced here.
         "elapsed_ms": elapsed_ms,
         "events": message_dicts,
         "actions": actions_taken,
@@ -885,25 +676,22 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
 
 def verdict(ticket: str, decision: str, notes: str) -> dict:
     """The human's decision, as argv — never typed by an agent. Formats the
-    response in the contract's format (b), replies to the recorded
-    `question_id`, and lifts the `human-gate` label. On `approved`, also
-    posts the one and only copy of the plan the ticket ever gets — the
-    recorded `plan_body` plus the `## Approval` verdict — never on
-    submission (that would post an unapproved plan) and never on `revise`
-    (that would post once per round). `retire` does not happen here: it
-    happens in `wait`, when the planner's `worker_done` arrives with the
-    approved gate_state already recorded — one path for both APPROVED and
-    APPROVED-with-caveats, and it never kills a planner still blocked
-    inside its `ask`.
+    reply, answers the recorded `question_id`, and lifts the `human-gate`
+    label. On `approved`, also posts the one and only copy of the plan the
+    ticket ever gets — never on submission (that would post an unapproved
+    plan) and never on `revise` (that would post once per round). The
+    planner is not retired here: that happens in `wait`, when its
+    `worker_done` arrives with the approved gate_state recorded — one path
+    for both APPROVED and APPROVED-with-caveats, and it never kills a
+    planner still blocked inside its `ask`.
 
     The read, both writes and the reply all happen inside one
-    `state_lock()`: the reply is deliberately inside the lock, not just the
-    registry writes around it. That preserves the two invariants below
-    (state recorded before the reply, `question_id` retained until the
-    reply lands) against a concurrent `wait`, and costs that `wait` only the
-    duration of one local `orca reply` call, not the network round trip
-    `wait` itself makes.
-    """
+    `state_lock()`: the state is recorded BEFORE the reply goes out (the
+    reply unblocks the planner, which may run `spawn done` immediately; a
+    registry still saying `submitted` would refuse the very report the
+    human just authorized), and `question_id` is kept until the reply
+    lands, so a failed reply can be retried instead of stranding the
+    planner in its `ask`."""
 
     ticket = ticket.upper()
     if decision not in ("approved", "revise"):
@@ -912,7 +700,7 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
     key = f"{ticket}/{GATE_ROLE.value}"
     token = "APPROVED" if decision == "approved" else "REVISE"
     note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
-    body = _reports.format_approval_reply(token, note_lines)
+    body = _gate.format_approval_reply(token, note_lines)
 
     with state_lock():
         data = state_read()
@@ -925,11 +713,6 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
         if decision == "revise" and not notes.strip():
             raise SystemExit("REVISE with no --notes/--notes-file says nothing; name the correction")
 
-        # Recorded BEFORE the reply goes out. The reply unblocks the planner,
-        # which may run `spawn done` immediately; a registry that still said
-        # `submitted` would refuse the very report the human just authorized.
-        # `question_id` is kept until the reply lands, so a failed reply can
-        # be retried instead of stranding the planner in its `ask`.
         rec["gate_state"] = _gate.VERDICT_APPROVED if decision == "approved" else _gate.VERDICT_REVISE
         rec["last_event_at"] = _now()
         data[key] = rec
@@ -940,8 +723,8 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
         data[key] = rec
         state_write(data)
 
-    # The label is cosmetic next to the verdict; losing Linear must not make
-    # a delivered verdict look like a failure.
+    # The label is cosmetic next to the verdict; losing Linear must not
+    # make a delivered verdict look like a failure.
     tracker = None
     label = "cleared"
     try:
@@ -952,13 +735,8 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
 
     result = {"ticket": ticket, "decision": token, "label": label}
     if decision == "approved":
-        # Published here, on the approved path only — never on submission,
-        # which would put an unapproved plan on the ticket, and never on a
-        # REVISE, which would post one comment per round. `plan_body` is the
-        # raw submission `wait` recorded off the genuine plan-question; a
-        # record from before this round carries no such field. `body` is the
-        # same `## Approval` text just sent in the reply above — reused
-        # instead of recomputed from the same token/notes.
+        # `plan_body` is the raw submission `wait` recorded off the genuine
+        # plan-question; `body` is the same `## Approval` text just sent.
         plan_body = rec.get("plan_body")
         if plan_body is None:
             result["plan_copy"] = "NOT posted (no plan_body recorded)"
@@ -974,16 +752,11 @@ def verdict(ticket: str, decision: str, notes: str) -> dict:
 
 def brief(ticket: str, body_path: str) -> dict:
     """Post a wave's coordination note as a ticket comment — the
-    Orchestrator's sanctioned way to hand a role a cut of work, instead of
-    typing into the tracker's own client by hand. `build_brief` already
-    composes every ticket comment into the Execution Brief every role
-    opens with, so posting the comment IS the whole job here — unlike
-    `verdict`, where posting a comment is a side effect of a verdict
-    already delivered (and a tracker failure there is reported, not
-    raised), here nothing else happens if the post fails, so there is no
-    try/except: `LinearError` (`linear_not_connected` included) propagates
-    with its own traceback, never a silent fallback to another client.
-    """
+    Orchestrator's sanctioned way to hand a role a cut of work.
+    `build_brief` already composes every ticket comment into the Execution
+    Brief the next dispatch opens with, so posting the comment IS the whole
+    job; nothing else happens if the post fails, so `LinearError`
+    propagates loudly."""
 
     ticket = ticket.upper()
     path = Path(body_path)
@@ -997,29 +770,25 @@ def brief(ticket: str, body_path: str) -> dict:
     return {"ticket": ticket, "posted": True, "comment": comment.id}
 
 
-# --- the role's own two verbs ---------------------------------------------
+# --- the role's own two verbs ----------------------------------------------
 #
 # Everything above is run by the Orchestrator. The two below are run BY A
-# ROLE, inside its own dispatched terminal, and they are the return half of
-# what `spawn plan` is on the way in: the role writes a body, the script
-# builds and checks the message. Three things measured on Orca 1.4.168 are
-# why this cannot be left to a role typing `orca orchestration` by hand:
+# ROLE, inside its own dispatched terminal. Three things measured on Orca
+# 1.4.168 are why this cannot be left to a role typing `orca orchestration`
+# by hand:
 #
 #   1. `--payload` and the structured flags (`--task-id`, `--dispatch-id`,
-#      `--outcome`) are MUTUALLY EXCLUSIVE — using both is `invalid_argument`
-#      and no message is sent at all. Anything the gate needs beyond those
-#      three fields therefore forces one single `--payload` carrying all of
-#      them, which is not the shape Orca's own preamble teaches.
+#      `--outcome`) are MUTUALLY EXCLUSIVE — using both is
+#      `invalid_argument` and no message is sent at all.
 #   2. An injected dispatch mints a capability, and a lifecycle message
 #      without it is refused with `dispatch_capability_invalid`.
-#   3. A dispatch grants exactly one `worker_done`. A second is refused, so a
-#      malformed report cannot be corrected — the body has to be checked
-#      BEFORE the single shot is spent, which is what these verbs do.
+#   3. A dispatch grants exactly one `worker_done`. A second is refused, so
+#      the body has to be checked BEFORE the single shot is spent.
 
 
 def _payload_for(rec: dict, outcome: str, extra: dict | None = None) -> str:
-    """The one `--payload` a lifecycle message is allowed to carry: the three
-    fields Orca reconciles on, plus whatever the gate needs."""
+    """The one `--payload` a lifecycle message is allowed to carry: the
+    three fields Orca reconciles on, plus whatever the gate needs."""
 
     payload = {
         "taskId": rec["task"],
@@ -1031,18 +800,16 @@ def _payload_for(rec: dict, outcome: str, extra: dict | None = None) -> str:
 
 
 def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
-    """Send a Local Technical Plan for a verdict and block until it arrives.
+    """Send a Local Technical Plan for a verdict and block until it
+    arrives. The verdict is parsed here and returned as a field — the reply
+    is written by a script on the coordinator's side (`spawn verdict`) and
+    read by a script here, so `APPROVED`/`REVISE` never depends on a model
+    reading prose.
 
-    The verdict is parsed here and returned as a field. That is the other
-    half of `spawn verdict`: the reply is written by a script on the
-    coordinator's side and read by a script on the planner's side, so
-    `APPROVED`/`REVISE` never depends on a model reading prose.
-
-    `ask` caps its own wait at 30 minutes, and a human verdict routinely
+    `ask` caps its own wait at 30 minutes and a human verdict routinely
     takes longer, so a timeout is resumed by message id rather than asked
     again — a second `ask` would be a second question, and the gate would
-    have two submissions to reconcile.
-    """
+    have two submissions to reconcile."""
 
     ticket = ticket.upper()
     key, rec = own_record(ticket)
@@ -1050,7 +817,7 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
         raise SystemExit(f"{key} is not the planner; only the planner submits a plan for a verdict")
 
     body = Path(body_path).read_text()
-    submission = _reports.parse_plan_submission(body)  # loud, before anything is sent
+    submission = _gate.parse_plan_submission(body)  # loud, before anything is sent
     if submission.ticket.upper() != ticket:
         raise SystemExit(
             f"the '## Plan' line says {submission.ticket!r} but you are dispatched on {ticket!r}"
@@ -1071,8 +838,8 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
         argv += ["--resume", message_id] if message_id else ["--question", body]
         slice_ms = min(ASK_MAX_MS, max_wait_ms - waited)
         result = orca(*argv, "--timeout-ms", str(slice_ms))
-        # `ask` answers with its own object and no {id, ok, result} envelope:
-        # {answer, messageId, answerMessageId, threadId, timedOut, timeoutMs}.
+        # `ask` answers with its own object and no {id, ok, result}
+        # envelope: {answer, messageId, timedOut, timeoutMs, ...}.
         waited += int(result.get("timeoutMs") or slice_ms)
         message_id = str(result.get("messageId") or message_id or "")
         answer = result.get("answer")
@@ -1084,8 +851,8 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
             )
 
     try:
-        parsed = _reports.parse_approval_reply(str(answer))
-    except _reports.MalformedReport as exc:
+        parsed = _gate.parse_approval_reply(str(answer))
+    except _gate.MalformedReport as exc:
         raise SystemExit(
             f"the verdict on question {message_id} does not follow the approval format "
             f"({exc}). It was answered by hand instead of by `spawn verdict`. Do NOT "
@@ -1101,10 +868,9 @@ def submit(ticket: str, body_path: str, *, max_wait_ms: int) -> dict:
 
 
 def _worktree_measurement(workspace: str) -> tuple[str, bool] | None:
-    """`(HEAD, tree is dirty)`, or `None` if git itself could not answer —
-    a worktree gone missing, a full disk, a repository in a broken state.
+    """`(HEAD, tree is dirty)`, or `None` if git itself could not answer.
     `None` is not "clean": the caller must never read a failed measurement
-    as proof that nothing changed (GRE-187 item 6 verdict ressalva)."""
+    as proof that nothing changed."""
 
     head_proc = subprocess.run(
         ["git", "-C", workspace, "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -1120,24 +886,17 @@ def _worktree_measurement(workspace: str) -> tuple[str, bool] | None:
 def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> dict:
     """The single `worker_done` a dispatch allows, built and checked here.
 
-    For the planner it also refuses to fire before the gate recorded an
-    approval — that check is what protects the one shot, since a `worker_done`
-    that arrives without a recorded approval is flagged and cannot be resent.
-
-    Two more refusals, both role-side and local (GRE-187 item 6): an empty
-    body, for any role and either outcome — a `failed` with no explanation
-    serves nobody either — and, for a write-access non-planner role
+    For the planner it refuses to fire before the gate recorded an approval
+    — a `worker_done` without one is flagged and cannot be resent. Two more
+    refusals, both local and BEFORE anything is sent: an empty body, for
+    any role and either outcome; and, for a write-access non-planner role
     reporting `succeeded`, a worktree that shows no change at all against
-    `head_at_dispatch`. Both fire BEFORE anything is sent, same as the
-    planner's parse checks above: the one shot a dispatch grants is never
-    spent on an empty success.
+    `head_at_dispatch` — an empty success is exactly what this gate exists
+    to catch.
 
-    A third case never refuses: the same role reporting `succeeded` with a
-    dirty tree but no new commit. That is real work, just not persisted —
-    refusing it would destroy the report to save a five-second `git commit`.
-    It is accepted and flagged `uncommitted_work: true` on the record
-    instead, so the Orchestrator can check without opening the worktree.
-    """
+    A dirty tree with no new commit is real work, just not persisted:
+    accepted and flagged `uncommitted_work` on the record instead, so the
+    Orchestrator can check without opening the worktree."""
 
     ticket = ticket.upper()
     if outcome not in ("succeeded", "failed"):
@@ -1158,62 +917,42 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
                 f"the plan for {ticket} is not approved (gate state {state!r}); a planner's "
                 f"worker_done is only valid after APPROVED, and you get exactly one"
             )
-        _reports.parse_planner_done(body)  # loud, before the shot is spent
+        _gate.parse_planner_done(body)  # loud, before the shot is spent
         rounds = int(rec.get("approval_rounds", 1)) or 1
         # Only `## Approval` is rewritten, and only to state what the gate
-        # counted. Everything else in the body is the planner's and is passed
-        # through untouched — a report may carry sections this package does
-        # not know about, and there is no second worker_done to resend them.
-        body = _reports.set_approval_rounds(body, rounds)
+        # counted. Everything else in the body is the planner's.
+        body = _gate.set_approval_rounds(body, rounds)
         extra = {"planApproved": True, "approvalRounds": rounds}
 
     if outcome == "succeeded" and rec.get("access") == "write" and rec["role"] != GATE_ROLE.value:
-        baseline = rec.get("head_at_dispatch")
-        if not baseline:
-            # No baseline means the whole check is skipped, dirty-tree half
-            # included — not just the HEAD comparison. A record from before
-            # this round has no dirty-tree evidence to trust either, and
-            # refusing on a partial check would trap an old record with a
-            # clean tree, which is exactly what this skip exists to avoid.
+        measured = _worktree_measurement(rec["worktree"])
+        if measured is None:
             print(
-                f"note: {ticket}/{rec['role']} has no head_at_dispatch recorded "
-                f"(pre-GRE-187 dispatch); skipping the empty-success check entirely "
-                f"(HEAD comparison and dirty-tree check both)", file=sys.stderr,
+                f"note: could not measure {rec['worktree']} (git error); "
+                f"skipping the empty-success check", file=sys.stderr,
             )
         else:
-            measured = _worktree_measurement(rec["worktree"])
-            if measured is None:
-                print(
-                    f"note: could not measure {rec['worktree']} (git error); "
-                    f"skipping the empty-success check", file=sys.stderr,
+            head_now, dirty = measured
+            baseline = rec.get("head_at_dispatch")
+            if head_now == baseline and not dirty:
+                raise SystemExit(
+                    f"{ticket}/{rec['role']}: outcome=succeeded but the worktree shows no "
+                    f"change — HEAD is still {head_now} (same as at dispatch) and `git "
+                    f"status --porcelain` is empty. If there genuinely was nothing to do, "
+                    f"report `--outcome failed --file <report explaining why>` instead, "
+                    f"so the Orchestrator can decide."
                 )
-            else:
-                head_now, dirty = measured
-                if head_now == baseline and not dirty:
-                    raise SystemExit(
-                        f"{ticket}/{rec['role']}: outcome=succeeded but the worktree shows no "
-                        f"change — HEAD is still {head_now} (same as at dispatch) and `git "
-                        f"status --porcelain` is empty. An empty success is exactly what this "
-                        f"gate exists to catch. If there genuinely was nothing to do, report "
-                        f"`--outcome failed --file <report explaining why>` instead, so the "
-                        f"Orchestrator can decide."
-                    )
-                if head_now == baseline and dirty:
-                    # The dirty tree is real work — this is not the empty
-                    # success above — but it never made it into a commit, and
-                    # uncommitted work does not survive the worktree. Accept,
-                    # never refuse: flag it on the record so the Orchestrator
-                    # can check without opening the worktree by hand.
-                    print(
-                        f"note: {ticket}/{rec['role']} outcome=succeeded but HEAD is still "
-                        f"{head_now} (same as at dispatch) — the tree is dirty but nothing was "
-                        f"committed; flagging uncommitted_work on the record", file=sys.stderr,
-                    )
-                    with state_lock():
-                        data = state_read()
-                        if key in data:
-                            data[key]["uncommitted_work"] = True
-                            state_write(data)
+            if head_now == baseline and dirty:
+                print(
+                    f"note: {ticket}/{rec['role']} outcome=succeeded but HEAD is still "
+                    f"{head_now} — the tree is dirty but nothing was committed; "
+                    f"flagging uncommitted_work on the record", file=sys.stderr,
+                )
+                with state_lock():
+                    data = state_read()
+                    if key in data:
+                        data[key]["uncommitted_work"] = True
+                        state_write(data)
 
     argv = [
         "orchestration", "send",
@@ -1226,8 +965,8 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
     if rec.get("capability"):
         argv += ["--dispatch-capability", rec["capability"]]
     if files_modified.strip():
-        # Never as `--files-modified`: that is a structured flag, and one of
-        # those alongside `--payload` is refused outright.
+        # Never as `--files-modified`: that is a structured flag, and one
+        # of those alongside `--payload` is refused outright.
         payload = json.loads(argv[argv.index("--payload") + 1])
         payload["filesModified"] = [f.strip() for f in files_modified.split(",") if f.strip()]
         argv[argv.index("--payload") + 1] = json.dumps(payload)
@@ -1236,7 +975,7 @@ def done(ticket: str, body_path: str, *, outcome: str, files_modified: str) -> d
     return {"ticket": ticket, "role": rec["role"], "outcome": outcome, "reported": key}
 
 
-# --- CLI -----------------------------------------------------------------
+# --- CLI -------------------------------------------------------------------
 
 VERBS = {
     "plan": (RoleName.PLANNER, True),
@@ -1255,7 +994,7 @@ def main() -> int:
         p.add_argument(
             "--tier",
             help="HUMAN OVERRIDE ONLY. Run this role at another Capability Tier "
-            "than the matrix says. The Orchestrator never passes this.",
+            "than its role file declares. The Orchestrator never passes this.",
         )
     p = sub.add_parser("status")
     p.add_argument("ticket", nargs="?")
@@ -1280,8 +1019,8 @@ def main() -> int:
     p = sub.add_parser("brief")
     p.add_argument("ticket")
     p.add_argument("--file", required=True, help="Path to the coordination note to post.")
-    # The role's own two verbs. Run inside a dispatched terminal, by the role
-    # itself — the Orchestrator never calls these.
+    # The role's own two verbs. Run inside a dispatched terminal, by the
+    # role itself — the Orchestrator never calls these.
     p = sub.add_parser("submit")
     p.add_argument("ticket")
     p.add_argument("--file", required=True, help="Path to the plan submission body.")

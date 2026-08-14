@@ -27,7 +27,7 @@ access: write
 
 The payload × body rule governs every shape below — see
 `.symphonia/README.md`, "Rules the package encodes"; this file and
-`.symphonia/src/adapters/reports.py` only point to it, never restate it.
+`.symphonia/src/gate.py` only point to it, never restate it.
 
 ### Execution Brief (input)
 

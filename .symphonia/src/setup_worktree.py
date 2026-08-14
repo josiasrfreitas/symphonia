@@ -19,7 +19,7 @@ setup script):
     .symphonia/bin/setup-worktree
 
 Note what this does NOT solve: `LINEAR_API_KEY` already reaches every
-worktree through `~/.symphonia/.env` (see `adapters/env.py`), by design —
+worktree through `~/.symphonia/.env` (see `env.py`), by design —
 a role reads it from a different checkout. The copy is for everything else
 that reads a `.env` from the directory it runs in.
 """

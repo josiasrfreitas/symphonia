@@ -5,25 +5,7 @@
   "stop_check_from_stop": 3,
   "handoff_dir": "~/orca/.context",
   "linear": {
-    "team_key": "SYM",
-    "root_issue": "SYM-1",
     "attention_label": "needs-attention",
-    "gate_label": "human-gate",
-    "kind_label_prefix": "kind:",
-    "type_label_prefix": "type:",
-    "delivery_heading": "## Symphonia delivery",
-    "phase_status": {
-      "briefed": "Briefed",
-      "planning": "Planning",
-      "plan-gate": "Planning",
-      "implementing": "Implementing",
-      "reviewing": "In Review",
-      "merge-gate": "Awaiting Merge",
-      "merged": "Done"
-    },
-    "close_status": {
-      "done": "Done",
-      "canceled": "Canceled"
-    }
+    "gate_label": "human-gate"
   }
 }
