@@ -8,10 +8,12 @@ the fact, without re-fetching from the mailbox. `delivery.json` is the
 receipt for the one Delivery still unacked, so a `wait` that reopens after
 the terminal died can auto-ack instead of re-delivering everything.
 
-Neither function takes a lock: both are meant to be called from inside the
-`state_lock()` critical section `spawn.wait` already holds. A second
-exclusion mechanism here is exactly what GRE-187's write scope ruled out —
-this module composes with the lock that exists, it does not invent one.
+Neither function takes a lock: `append_events` is called from inside the
+registry transaction `spawn.wait` holds, and `write_receipt` right after it
+commits — the receipt only marks a delivery acked once the outcome it acks
+is durable. A second exclusion mechanism here is exactly what GRE-187's
+write scope ruled out — this module composes with the transaction that
+exists, it does not invent one.
 """
 from __future__ import annotations
 
@@ -65,7 +67,7 @@ def read_receipt(runtime_dir: Path | str) -> str | None:
 
 def write_receipt(runtime_dir: Path | str, delivery_id: str) -> None:
     """Records the Delivery still open, atomically (same replace-a-tmp
-    pattern as `spawn.state_write`, so a crash mid-write never leaves a
+    pattern as the registry write, so a crash mid-write never leaves a
     half-written receipt). An empty `delivery_id` — the batch that carried
     nothing to ack — removes the receipt instead of writing one."""
 

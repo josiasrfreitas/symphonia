@@ -113,5 +113,9 @@ Authored content the Source reads at run time but never executes — role contra
 _Avoid_: Docs, assets, data files
 
 **Artifact**:
-Anything an execution produces — the spawn registry, a handoff baton, a transcript, an instantiated Execution DAG, a report. Never committed and never reviewed; it lives outside every checkout. A ticket attachment is an Artifact the tracker keeps.
+Anything an execution produces — the Spawn Registry, a handoff baton, a transcript, an instantiated Execution DAG, a report. Never committed and never reviewed; it lives outside every checkout. A ticket attachment is an Artifact the tracker keeps.
 _Avoid_: Output, state file, log
+
+**Spawn Registry**:
+The Artifact recording every Role Context this package started — who runs where, under which Attempt. Held outside every checkout, read as a snapshot, written only inside its own transaction.
+_Avoid_: State file, spawns.json, the registry dict

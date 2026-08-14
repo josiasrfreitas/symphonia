@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence, Union
 
+from gate import PLAN_QUESTION, WORKER_DONE
 from roles import RoleName
 
 
@@ -357,22 +358,13 @@ def _payload_of(record: dict) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def parse_check_output(text: str) -> CheckBatch:
-    """Parse `check --peek/--wait --json` output. The real CLI wraps
-    everything in the `{id, ok, result, _meta}` envelope — the batch lives
-    under `result` and the envelope's top-level `id` is the request id, NOT
-    a delivery id. Also tolerates an unwrapped dict or a bare list."""
+def _batch(data: dict) -> CheckBatch:
+    """The `check` result as a typed batch. `data` is already unwrapped by
+    `orca()` — the batch lives under the envelope's `result`, and the
+    envelope's top-level `id` is the request id, NOT a delivery id
+    (measured on 1.4.168)."""
 
-    data = json.loads(text) if text.strip() else []
-    if isinstance(data, dict) and "ok" in data:
-        if not data.get("ok"):
-            raise ValueError(f"orca check failed: {json.dumps(data.get('error'))}")
-        data = _first(data, "result", default={})
-    if isinstance(data, dict):
-        delivery = str(_first(data, "deliveryId", "delivery_id"))
-        raw_messages = _first(data, "messages", default=[])
-    else:
-        delivery, raw_messages = "", data
+    delivery = str(_first(data, "deliveryId", "delivery_id"))
     messages = tuple(
         OrchestrationMessage(
             id=str(_first(m, "id", "messageId", "message_id")),
@@ -383,10 +375,79 @@ def parse_check_output(text: str) -> CheckBatch:
             thread_id=str(_first(m, "threadId", "thread_id")),
             sender=str(_first(m, "from", "sender")),
         )
-        for m in raw_messages
+        for m in _first(data, "messages", default=[])
         if isinstance(m, dict)
     )
     return CheckBatch(delivery_id=delivery, messages=messages)
+
+
+def check_wait(*, ack: str | None, timeout_ms: int) -> CheckBatch:
+    """One blocking mailbox check. An empty batch back within seconds,
+    instead of blocking for the requested timeout, is content-identical to
+    a legitimate empty timeout (measured live) — the caller times the call
+    if it needs to tell them apart."""
+
+    argv = [
+        "orchestration", "check", "--wait",
+        "--types", "worker_done,escalation,question",
+        "--timeout-ms", str(timeout_ms),
+    ]
+    if ack:
+        argv += ["--ack", ack]
+    return _batch(orca(*argv))
+
+
+ASK_MAX_MS = 1_800_000
+"""What `orca orchestration ask` will actually wait, measured on 1.4.168:
+a larger `--timeout-ms` is clamped to this silently. A human verdict
+routinely takes longer than 30 minutes, so `spawn submit` resumes the same
+question by id instead of asking a second time."""
+
+
+def ask(
+    terminal: str, *, question: str | None = None, resume: str | None = None,
+    capability: str | None = None, timeout_ms: int,
+) -> dict:
+    """One `ask` slice: a new `question` or a `--resume` of a pending
+    message id, never both. Answers with its own object and NO `{id, ok,
+    result}` envelope: `{answer, messageId, timedOut, timeoutMs, ...}`
+    (measured on 1.4.168)."""
+
+    argv = ["orchestration", "ask", "--from", terminal]
+    if capability:
+        argv += ["--dispatch-capability", capability]
+    argv += ["--resume", resume] if resume else ["--question", question or ""]
+    return orca(*argv, "--timeout-ms", str(timeout_ms))
+
+
+def reply(question_id: str, body: str) -> None:
+    """The coordinator's answer to a pending `ask`. Delivered to the worker
+    that asked — it never comes back through the coordinator's mailbox
+    (measured on 1.4.168), which is why there is no reply event in
+    `gate_events`."""
+
+    orca("orchestration", "reply", "--id", question_id, "--body", body)
+
+
+def send_worker_done(
+    terminal: str, *, subject: str, body: str, payload: dict, capability: str | None,
+) -> None:
+    """The one lifecycle message a dispatch grants. Everything structured
+    travels inside `--payload`: `--payload` and the structured flags
+    (`--task-id`, `--dispatch-id`, `--outcome`, `--files-modified`) are
+    MUTUALLY EXCLUSIVE — sending both is `invalid_argument` and no message
+    goes out at all (measured on 1.4.168)."""
+
+    orca(
+        "orchestration", "send",
+        "--from", terminal,
+        "--type", "worker_done",
+        "--subject", subject,
+        "--body", body,
+        "--payload", json.dumps(payload),
+        *(["--dispatch-capability", capability] if capability else []),
+        expect_lifecycle_ok=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -429,8 +490,8 @@ def gate_events(messages: tuple[OrchestrationMessage, ...]) -> tuple[GateEvent, 
         task_id = str(_first(m.payload, "taskId", "task_id"))
         dispatch_id = str(_first(m.payload, "dispatchId", "dispatch_id"))
         if m.type == "question":
-            out.append(PlanQuestion("plan-question", m.id, task_id, dispatch_id, m.body))
+            out.append(PlanQuestion(PLAN_QUESTION, m.id, task_id, dispatch_id, m.body))
         elif m.type == "worker_done":
             outcome = str(_first(m.payload, "outcome"))
-            out.append(WorkerDone("worker-done", m.id, task_id, dispatch_id, outcome, m.body))
+            out.append(WorkerDone(WORKER_DONE, m.id, task_id, dispatch_id, outcome, m.body))
     return tuple(out)

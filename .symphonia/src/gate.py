@@ -210,11 +210,20 @@ def set_approval_rounds(body: str, approval_rounds: int) -> str:
 
 # --- the state machine ------------------------------------------------------
 
+# The two event kinds the gate judges. Coined HERE and imported by
+# `orca.gate_events`, which mints the events — one origin, because a
+# renamed or mistyped kind on either side would not error: it would fall
+# through `transition`'s final return and silently disconnect the gate.
+PLAN_QUESTION = "plan-question"
+WORKER_DONE = "worker-done"
+
 IDLE = "idle"
 SUBMITTED = "submitted"
 VERDICT_APPROVED = "verdict-approved"
 VERDICT_REVISE = "verdict-revise"
 RETIRED = "retired"
+
+STATES = frozenset({IDLE, SUBMITTED, VERDICT_APPROVED, VERDICT_REVISE, RETIRED})
 
 # Actions are values, not calls: `run` executes them against the tracker
 # and the runtime.
@@ -258,7 +267,7 @@ def transition(
 
     kind = getattr(event, "kind", None)
 
-    if kind == "plan-question":
+    if kind == PLAN_QUESTION:
         if event.message_id == last_question_id:
             return Transition(state, ())  # the same submission, replayed
         if state == RETIRED:
@@ -271,7 +280,7 @@ def transition(
             return Transition(state, (), question_id=event.message_id)
         return Transition(SUBMITTED, (LABEL_ON,), question_id=event.message_id)
 
-    if kind == "worker-done":
+    if kind == WORKER_DONE:
         if state == RETIRED:
             return Transition(state, ())  # guarded: retire fires once
         if event.outcome != "succeeded":
@@ -307,6 +316,16 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
     never silently accepted or ignored."""
 
     state = rec.get("gate_state", IDLE)
+    if state not in STATES:
+        # The registry is an Artifact humans can edit and old versions
+        # wrote; a state outside the vocabulary must stop the wait, not
+        # transition as if it were IDLE — guessing could fire an action
+        # (label, retire) a second time.
+        raise ValueError(
+            f"registry record for {rec.get('ticket')}/{rec.get('role')} carries "
+            f"unknown gate_state {state!r} (known: {sorted(STATES)}); fix the "
+            f"Spawn Registry record and run `wait` again"
+        )
     raw = raw_by_id.get(event.message_id)
 
     # Orca does not drop a refused lifecycle message: it rewrites the
@@ -321,7 +340,7 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
             f"{rejection.get('code')}: {rejection.get('reason')}",
         )]
 
-    if event.kind == "plan-question":
+    if event.kind == PLAN_QUESTION:
         if not is_plan_submission(event.question):
             return []
         try:
@@ -347,7 +366,7 @@ def apply_gate_event(rec: dict, event, raw_by_id: dict) -> list[tuple[str, str |
                 # so `spawn done` never asks the planner how many there
                 # were. Re-asking the same pending question is not a round.
                 rec["approval_rounds"] = int(rec.get("approval_rounds", 0)) + 1
-    elif event.kind == "worker-done":
+    elif event.kind == WORKER_DONE:
         report_ok = True
         try:
             report = parse_planner_done(event.summary)
@@ -421,8 +440,8 @@ def run(
             continue
         rec = data[key]
         ticket = rec["ticket"]
-        if not key.endswith(f"/{gate_role}"):
-            if event.kind == "worker-done" and not rec.get("retired"):
+        if rec.get("role") != gate_role:
+            if event.kind == WORKER_DONE and not rec.get("retired"):
                 teardown(ticket, rec["role"])
                 rec["retired"] = True
                 actions_taken.append({"ticket": ticket, "action": RETIRE_ROLE})
@@ -434,9 +453,9 @@ def run(
                 resolved_tracker().set_gate(ticket, False)
             elif action == RETIRE_PLANNER:
                 teardown(ticket, gate_role)
-                # `teardown` re-reads and rewrites the registry on its own;
-                # without this the caller's write would put this stale copy
-                # back and resurrect the retired role.
+                # Set here as well as inside `teardown`: this loop only
+                # promises its caller a mutated dict, not a teardown that
+                # mutates — a test's injected fake may not.
                 rec["retired"] = True
             elif action == FLAG_MALFORMED:
                 resolved_tracker().set_attention(
