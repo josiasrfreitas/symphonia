@@ -191,10 +191,14 @@ the Orchestrator's job, once per wave; stop it with `kill $(cat
 ~/.symphonia/runtime/watch.pid)` — `spawn` never starts one on its own.
 While one is alive, `spawn wait` does not race it for the mailbox: it reads
 the watcher's journal instead and marks that in its output as `"mode":
-"watcher"` (`"mode": "consumed"` is a normal, direct `wait`). Any batch
-that comes back with zero events sleeps a 30-second floor before checking
-again — the same instant-empty-return anomaly `elapsed_ms` exists to
-surface (see above) would otherwise spin the watcher hot.
+"watcher"` (`"mode": "consumed"` is a normal, direct `wait`), with
+`delivery_id`/`acked`/`elapsed_ms`/`unattributed` all null/0 — the same
+four keys either mode returns. An explicit `--ack` refuses in this mode
+instead of being silently dropped; it would race the watcher's own
+auto-ack. Any batch that comes back with zero events sleeps a 30-second
+floor before checking again — the same instant-empty-return anomaly
+`elapsed_ms` exists to surface (see above) would otherwise spin the
+watcher hot.
 
 ## Where the decisions live
 

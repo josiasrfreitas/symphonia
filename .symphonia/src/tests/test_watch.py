@@ -79,6 +79,14 @@ class ReadEvents(unittest.TestCase):
         self.assertEqual([e["id"] for e in events], ["m-3", "m-4"])
         self.assertEqual(len(JOURNAL.read_events(self.runtime_dir, 100)), 5)
 
+    def test_a_truncated_trailing_line_is_skipped_not_raised(self):
+        JOURNAL.append_events(self.runtime_dir, "d-1", [self._msg("m-1")])
+        path = self.runtime_dir / JOURNAL.EVENTS_FILE
+        with path.open("a") as handle:
+            handle.write('{"id": "m-2", "type": "x", "subject":')  # torn write, no newline
+        events = JOURNAL.read_events(self.runtime_dir, 10)
+        self.assertEqual([e["id"] for e in events], ["m-1"])
+
 
 class RuntimeCase(unittest.TestCase):
     """A redirected `SYMPHONIA_RUNTIME`, for tests that go through `spawn`
@@ -115,6 +123,17 @@ class WaitGuard(RuntimeCase):
         self.assertEqual(result["watcher_pid"], os.getpid())
         self.assertEqual(result["actions"], [])
         self.assertEqual([e["id"] for e in result["events"]], ["m-1"])
+        self.assertEqual(
+            {k: result[k] for k in ("delivery_id", "acked", "elapsed_ms", "unattributed")},
+            {"delivery_id": None, "acked": None, "elapsed_ms": 0, "unattributed": []},
+        )
+
+    def test_explicit_ack_with_watcher_alive_refuses_instead_of_being_dropped(self):
+        WATCH.write_pidfile(self.runtime_dir, os.getpid())
+        with mock.patch.object(SPAWN._orca, "check_wait") as check:
+            with self.assertRaisesRegex(SPAWN.Refusal, "watcher"):
+                SPAWN.wait(ack="d-1", timeout_ms=1000)
+        check.assert_not_called()
 
     def test_stale_pidfile_and_no_pidfile_both_consume_directly(self):
         for pid in (2**30, None):
@@ -220,6 +239,13 @@ class WatchDaemon(RuntimeCase):
             result = SPAWN.watch_daemon(timeout_ms=1000)
         self.assertEqual(result["pid"], 4242)
         self.assertTrue(result["log"].endswith("watch.log"))
+
+    def test_refuses_before_popen_if_a_watcher_is_already_alive(self):
+        WATCH.write_pidfile(self.runtime_dir, os.getpid())
+        with mock.patch.object(SPAWN.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(SPAWN.Refusal, "already running"):
+                SPAWN.watch_daemon(timeout_ms=1000)
+        popen.assert_not_called()
 
     def test_kills_the_child_and_refuses_if_the_pidfile_never_appears(self):
         fake_proc = mock.Mock(pid=4242)

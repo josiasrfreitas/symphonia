@@ -622,11 +622,13 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
 
     A live `watch` (pidfile points at a live pid) already owns the
     mailbox, so this does NOT call `check --wait` or open a transaction —
-    that race is exactly what `watch.py`'s module docstring argues is
-    unnecessary to lock against. Instead it returns
-    `{"mode": "watcher", "watcher_pid": ..., "events": [...], "actions":
-    []}`, a view of what the watcher already journaled (`actions` is
-    always empty: applied asynchronously, never re-run here).
+    see `watch.py`'s module docstring for why that race needs no lock.
+    Instead it returns the journal view: `"mode": "watcher"`, `"events"`
+    from the journal, `"actions": []` (applied asynchronously, never
+    re-run here), and the same `"delivery_id"`/`"acked"`/`"elapsed_ms"`/
+    `"unattributed"` keys `_consume_once` returns, null/0 — one stable
+    shape regardless of mode. An explicit `ack` would race the watcher's
+    own auto-ack, so it refuses instead of being silently dropped.
 
     With no live watcher (a stale pidfile does not count), this is
     `_consume_once` with `"mode": "consumed"` added — same ordering,
@@ -636,11 +638,21 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     runtime_dir = _registry.runtime_dir()
     pid = _watch.read_pidfile(runtime_dir)
     if pid is not None and _watch.alive(pid):
+        if ack is not None:
+            raise Refusal(
+                f"a watcher (pid {pid}) is consuming the mailbox; an explicit "
+                f"--ack here would race its own auto-ack. Kill the watcher "
+                f"(`kill {pid}`) if you need to re-ack {ack!r} by hand."
+            )
         return {
             "mode": "watcher",
             "watcher_pid": pid,
+            "delivery_id": None,
+            "acked": None,
+            "elapsed_ms": 0,
             "events": _journal.read_events(runtime_dir, _WATCHER_VIEW_LIMIT),
             "actions": [],
+            "unattributed": [],
         }
 
     result = _consume_once(ack=ack, timeout_ms=timeout_ms)
@@ -671,11 +683,23 @@ def _watch_log(runtime_dir: Path, message: str) -> None:
         handle.write(f"{_now()} {message}\n")
 
 
+def _refuse_if_watcher_alive(runtime_dir: Path) -> None:
+    """Shared by `watch()` and `watch_daemon()`: visibility, not a second
+    lock — see `watch.py`'s module docstring for why one watcher is enough.
+    A stale pidfile does not refuse; only a live one does."""
+
+    pid = _watch.read_pidfile(runtime_dir)
+    if pid is not None and _watch.alive(pid):
+        raise Refusal(
+            f"a watcher is already running (pid {pid}); only one may consume the "
+            f"mailbox at a time. `spawn wait` already reads its journal instead "
+            f"of racing it."
+        )
+
+
 def watch(*, timeout_ms: int = 900_000, _max_cycles: int | None = None) -> None:
     """`_consume_once` in a loop, as a persistent process: no model, no
-    prompt. Refuses if a watcher is already alive (visibility, not a second
-    lock — `watch.py`'s module docstring); a stale pidfile does not block a
-    new one.
+    prompt. Refuses via `_refuse_if_watcher_alive` if one is already up.
 
     Error policy (decision 3): a check-phase `OrcaCliError` is transient
     (network, a degraded CLI, nothing written yet) — logs, sleeps the
@@ -687,13 +711,7 @@ def watch(*, timeout_ms: int = 900_000, _max_cycles: int | None = None) -> None:
     consuming directly the moment the watcher is gone."""
 
     runtime_dir = _registry.runtime_dir()
-    pid = _watch.read_pidfile(runtime_dir)
-    if pid is not None and _watch.alive(pid):
-        raise Refusal(
-            f"a watcher is already running (pid {pid}); only one may consume the "
-            f"mailbox at a time. `spawn wait` already reads its journal instead "
-            f"of racing it."
-        )
+    _refuse_if_watcher_alive(runtime_dir)
 
     # SIGTERM's default action skips `finally` and leaves the pidfile
     # pointing at a dead process — a plain `kill` needs the loop to unwind
@@ -729,9 +747,15 @@ def watch_daemon(*, timeout_ms: int = 900_000) -> dict:
     session=True` alone survives the Orchestrator's terminal closing — no
     double-fork needed) and poll for its pidfile instead of returning the
     instant `Popen` does, so a pid is never reported for a child that died
-    on import; not appearing in time kills the child and refuses."""
+    on import; not appearing in time kills the child and refuses.
+
+    Guards with `_refuse_if_watcher_alive` BEFORE the `Popen` (launching
+    the daemon twice in one wave is the common case) so the refusal names
+    the real cause instead of a startup poll timing out for the wrong
+    reason."""
 
     runtime_dir = _registry.runtime_dir()
+    _refuse_if_watcher_alive(runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_path = runtime_dir / _WATCH_LOG_FILE
     # The child inherits its own duplicated fd across Popen; the parent's
@@ -1070,7 +1094,8 @@ def main() -> int:
         "--ack",
         help="Delivery id to acknowledge before waiting again. Normally automatic "
         "— the previous Delivery's id is read from the persisted receipt. Pass "
-        "this only to re-ack a specific id by hand.",
+        "this only to re-ack a specific id by hand; refused while a `watch` is "
+        "alive, since it would race its own auto-ack.",
     )
     p.add_argument("--timeout-ms", type=int, default=900000)
     p = sub.add_parser("watch")
