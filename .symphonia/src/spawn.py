@@ -2,11 +2,11 @@
 """The whole spawn interface the Orchestrator is allowed to use.
 
 TLDR: the four role verbs take one argument each — a Ticket Key — plus
-`status`, `retire`, `sweep`, `brief`, and the plan gate pair `wait`/
-`verdict`. The Orchestrator never picks a model, a permission flag, a
-worktree or a launch path; every one of those is decided here. If a command
-below does not express what you need, that is a package change, not an
-improvisation at the terminal.
+`status`, `retire`, `sweep`, `brief`, `watch`, and the plan gate pair
+`wait`/`verdict`. The Orchestrator never picks a model, a permission flag,
+a worktree or a launch path; every one of those is decided here. If a
+command below does not express what you need, that is a package change,
+not an improvisation at the terminal.
 
     .symphonia/bin/spawn plan             GRE-181
     .symphonia/bin/spawn implement        GRE-181
@@ -17,6 +17,7 @@ improvisation at the terminal.
     .symphonia/bin/spawn sweep           [GRE-181]
     .symphonia/bin/spawn brief            GRE-181 --file cut.md
     .symphonia/bin/spawn wait             [--ack <delivery_id>] [--timeout-ms <ms>]
+    .symphonia/bin/spawn watch            [--timeout-ms <ms>] [--daemon]
     .symphonia/bin/spawn verdict          GRE-181 approved|revise [--notes <text>|--notes-file <path>]
 
 And two verbs a ROLE runs, inside its own dispatched terminal — the return
@@ -27,10 +28,13 @@ half of the same interface. No role ever types `orca orchestration` by hand:
 
 `plan` derives a worktree from the repo's default base; every later role
 reuses that same worktree, so one Ticket Key means one checkout from plan
-to PR. `wait` is the one loop that hears back from every role — it turns
-mailbox messages into typed events and hands them to `gate.run`, which
-executes what comes back (label the ticket, retire a role, flag a
-divergence). `verdict` is how the human's decision reaches the planner: it
+to PR. `wait` is the interactive way to hear back from every role — it
+turns mailbox messages into typed events and hands them to `gate.run`,
+which executes what comes back (label the ticket, retire a role, flag a
+divergence). `watch` is the same loop as a persistent process, so the
+mailbox keeps being consumed even if the Orchestrator's own terminal dies
+mid-wave; while it runs, `wait` reads its journal instead of racing it for
+the mailbox. `verdict` is how the human's decision reaches the planner: it
 never comes from an agent typing `APPROVED`/`REVISE` into a reply by hand.
 
 Every verb refuses with `Refusal`, never `SystemExit`: `main()` is the one
@@ -43,6 +47,7 @@ import argparse
 import dataclasses
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -57,6 +62,7 @@ import orca as _orca
 import registry as _registry
 import roles as _roles
 import setup_worktree as _setup_worktree
+import watch as _watch
 
 # `.symphonia/`, the package root: everything that reads a Resource by path
 # — `roles/`, `config.json` — anchors on this.
@@ -529,19 +535,18 @@ def sweep(ticket: str | None) -> list[dict]:
 IDLE = _gate.IDLE
 
 
-def wait(*, ack: str | None, timeout_ms: int) -> dict:
-    """The one loop the Orchestrator uses to hear back from every role.
-    Wraps the blocking mailbox check, then hands the batch to `gate.run` —
-    never the Orchestrator reading a message and deciding by itself.
-
-    Replay-safe: an unacked Delivery replays the same batch, but every
-    action is guarded by the recorded `gate_state` (and, for a
-    plan-question, the event's own id), so a repeat is a no-op.
+def _consume_once(*, ack: str | None, timeout_ms: int) -> dict:
+    """One cycle of the mailbox loop: check -> journal -> `gate.run` ->
+    receipt -> return dict. Moved verbatim out of `wait()` (GRE-187 stage B)
+    so `watch()`'s loop and the interactive `wait()` below run the exact
+    same ordering — nothing here changed to make the extraction, which is
+    the point: the guarantee below does not depend on who calls this.
 
     `ack` defaults to the receipt persisted from the previous call: the
     Delivery id no longer has to survive in a terminal's stdout to be
-    ackable. An explicit `--ack` still wins — it exists for re-acking a
-    specific id by hand.
+    ackable. An explicit `ack` still wins — it exists for re-acking a
+    specific id by hand; `watch()` never passes one, it always follows the
+    persisted receipt.
 
     Ordering: the journal append happens inside the transaction BEFORE
     `gate.run` (the raw event survives a crash mid-processing), and the
@@ -581,8 +586,8 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     ]
 
     # The Linear tracker is built lazily, only when a gate action actually
-    # needs it — a `wait` that observes no gate action (the common case)
-    # must work without `LINEAR_API_KEY` set.
+    # needs it — a call that observes no gate action (the common case) must
+    # work without `LINEAR_API_KEY` set.
     with _registry.transaction() as data:
         _journal.append_events(_registry.runtime_dir(), batch.delivery_id, message_dicts)
         actions_taken, unattributed = _gate.run(
@@ -604,6 +609,178 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
         "actions": actions_taken,
         "unattributed": unattributed,
     }
+
+
+_WATCHER_VIEW_LIMIT = 50
+"""Journaled events `wait` shows while a watcher is alive. No cursor
+(Approval emenda 1, deliberately not built) — a plain tail, generous enough
+for one wave's worth of messages."""
+
+
+def wait(*, ack: str | None, timeout_ms: int) -> dict:
+    """The Orchestrator's way to hear back from every role.
+
+    A live `watch` (pidfile points at a live pid) already owns the
+    mailbox, so this does NOT call `check --wait` or open a transaction —
+    see `watch.py`'s module docstring for why that race needs no lock.
+    Instead it returns the journal view: `"mode": "watcher"`, `"events"`
+    from the journal, `"actions": []` (applied asynchronously, never
+    re-run here), and the same `"delivery_id"`/`"acked"`/`"elapsed_ms"`/
+    `"unattributed"` keys `_consume_once` returns, null/0 — one stable
+    shape regardless of mode. An explicit `ack` would race the watcher's
+    own auto-ack, so it refuses instead of being silently dropped.
+
+    With no live watcher (a stale pidfile does not count), this is
+    `_consume_once` with `"mode": "consumed"` added — same ordering,
+    replay-safety and auto-ack. `mode` is on every return so the caller can
+    always tell the two apart without inspecting anything else."""
+
+    runtime_dir = _registry.runtime_dir()
+    pid = _watch.read_pidfile(runtime_dir)
+    if pid is not None and _watch.alive(pid):
+        if ack is not None:
+            raise Refusal(
+                f"a watcher (pid {pid}) is consuming the mailbox; an explicit "
+                f"--ack here would race its own auto-ack. Kill the watcher "
+                f"(`kill {pid}`) if you need to re-ack {ack!r} by hand."
+            )
+        return {
+            "mode": "watcher",
+            "watcher_pid": pid,
+            "delivery_id": None,
+            "acked": None,
+            "elapsed_ms": 0,
+            "events": _journal.read_events(runtime_dir, _WATCHER_VIEW_LIMIT),
+            "actions": [],
+            "unattributed": [],
+        }
+
+    result = _consume_once(ack=ack, timeout_ms=timeout_ms)
+    result["mode"] = "consumed"
+    return result
+
+
+# --- the watcher: the mailbox loop as a process, not a typed command -------
+
+EMPTY_BATCH_FLOOR_MS = 30_000
+"""Sleep floor after any zero-event batch. `check --wait` can return
+instantly instead of blocking for the timeout requested — the anomaly
+`elapsed_ms` exists to surface (GRE-187 stage A), cause unfixed, in
+`orca`. Without this floor a watcher hitting it spins hot."""
+
+_WATCH_LOG_FILE = "watch.log"
+_DAEMON_STARTUP_TIMEOUT_S = 5.0
+_DAEMON_STARTUP_POLL_S = 0.1
+
+
+def _watch_log(runtime_dir: Path, message: str) -> None:
+    """One timestamped line in `watch.log` — the only trace a watcher that
+    stopped itself leaves."""
+
+    directory = Path(runtime_dir)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / _WATCH_LOG_FILE).open("a") as handle:
+        handle.write(f"{_now()} {message}\n")
+
+
+def _refuse_if_watcher_alive(runtime_dir: Path) -> None:
+    """Shared by `watch()` and `watch_daemon()`: visibility, not a second
+    lock — see `watch.py`'s module docstring for why one watcher is enough.
+    A stale pidfile does not refuse; only a live one does."""
+
+    pid = _watch.read_pidfile(runtime_dir)
+    if pid is not None and _watch.alive(pid):
+        raise Refusal(
+            f"a watcher is already running (pid {pid}); only one may consume the "
+            f"mailbox at a time. `spawn wait` already reads its journal instead "
+            f"of racing it."
+        )
+
+
+def watch(*, timeout_ms: int = 900_000, _max_cycles: int | None = None) -> None:
+    """`_consume_once` in a loop, as a persistent process: no model, no
+    prompt. Refuses via `_refuse_if_watcher_alive` if one is already up.
+
+    Error policy (decision 3): a check-phase `OrcaCliError` is transient
+    (network, a degraded CLI, nothing written yet) — logs, sleeps the
+    floor, continues. Any other exception is in the processing phase,
+    inside the transaction `_consume_once` opens (a corrupted `gate_state`
+    included): it aborted without writing, so continuing would crash-loop
+    against state only a human can fix — this logs it and re-raises.
+    `finally` always removes the pidfile, so `wait` degrades back to
+    consuming directly the moment the watcher is gone."""
+
+    runtime_dir = _registry.runtime_dir()
+    _refuse_if_watcher_alive(runtime_dir)
+
+    # SIGTERM's default action skips `finally` and leaves the pidfile
+    # pointing at a dead process — a plain `kill` needs the loop to unwind
+    # through the same cleanup a crash does.
+    def _on_sigterm(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    _watch.write_pidfile(runtime_dir, os.getpid())
+    try:
+        cycles = 0
+        while _max_cycles is None or cycles < _max_cycles:
+            cycles += 1
+            try:
+                result = _consume_once(ack=None, timeout_ms=timeout_ms)
+            except _orca.OrcaCliError as exc:
+                _watch_log(runtime_dir, f"check failed, sleeping the floor: {exc}")
+                time.sleep(EMPTY_BATCH_FLOOR_MS / 1000)
+                continue
+            except Exception as exc:
+                _watch_log(runtime_dir, f"stopping on error: {exc}")
+                raise
+            if result["events"]:
+                print(json.dumps(result), flush=True)
+            elif result["elapsed_ms"] < EMPTY_BATCH_FLOOR_MS:
+                time.sleep((EMPTY_BATCH_FLOOR_MS - result["elapsed_ms"]) / 1000)
+    finally:
+        _watch.remove_pidfile(runtime_dir)
+
+
+def watch_daemon(*, timeout_ms: int = 900_000) -> dict:
+    """`--daemon`: re-exec `spawn watch` in a new session (`start_new_
+    session=True` alone survives the Orchestrator's terminal closing — no
+    double-fork needed) and poll for its pidfile instead of returning the
+    instant `Popen` does, so a pid is never reported for a child that died
+    on import; not appearing in time kills the child and refuses.
+
+    Guards with `_refuse_if_watcher_alive` BEFORE the `Popen` (launching
+    the daemon twice in one wave is the common case) so the refusal names
+    the real cause instead of a startup poll timing out for the wrong
+    reason."""
+
+    runtime_dir = _registry.runtime_dir()
+    _refuse_if_watcher_alive(runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path = runtime_dir / _WATCH_LOG_FILE
+    # The child inherits its own duplicated fd across Popen; the parent's
+    # copy must be closed right after or every launch leaks one.
+    with open(log_path, "a") as log_handle:
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "watch", "--timeout-ms", str(timeout_ms)],
+            stdout=log_handle, stderr=log_handle, start_new_session=True,
+        )
+    deadline = time.monotonic() + _DAEMON_STARTUP_TIMEOUT_S
+    pid = None
+    while time.monotonic() < deadline:
+        seen = _watch.read_pidfile(runtime_dir)
+        if seen == proc.pid and _watch.alive(seen):
+            pid = seen
+            break
+        time.sleep(_DAEMON_STARTUP_POLL_S)
+    if pid is None:
+        proc.kill()
+        proc.wait()
+        raise Refusal(
+            f"watcher did not write its pidfile within {_DAEMON_STARTUP_TIMEOUT_S}s; "
+            f"it likely died on startup — see {log_path}"
+        )
+    return {"pid": pid, "log": str(log_path)}
 
 
 def verdict(ticket: str, decision: str, notes: str) -> dict:
@@ -917,9 +1094,17 @@ def main() -> int:
         "--ack",
         help="Delivery id to acknowledge before waiting again. Normally automatic "
         "— the previous Delivery's id is read from the persisted receipt. Pass "
-        "this only to re-ack a specific id by hand.",
+        "this only to re-ack a specific id by hand; refused while a `watch` is "
+        "alive, since it would race its own auto-ack.",
     )
     p.add_argument("--timeout-ms", type=int, default=900000)
+    p = sub.add_parser("watch")
+    p.add_argument("--timeout-ms", type=int, default=900000)
+    p.add_argument(
+        "--daemon", action="store_true",
+        help="Launch the loop as a detached process and return once it is up. "
+        "Stop it with `kill $(cat ~/.symphonia/runtime/watch.pid)`.",
+    )
     p = sub.add_parser("verdict")
     p.add_argument("ticket")
     p.add_argument("decision", choices=["approved", "revise"])
@@ -957,6 +1142,11 @@ def main() -> int:
             print(json.dumps(sweep(args.ticket), indent=2))
         elif args.verb == "wait":
             print(json.dumps(wait(ack=args.ack, timeout_ms=args.timeout_ms), indent=2))
+        elif args.verb == "watch":
+            if args.daemon:
+                print(json.dumps(watch_daemon(timeout_ms=args.timeout_ms), indent=2))
+            else:
+                watch(timeout_ms=args.timeout_ms)
         elif args.verb == "verdict":
             notes = args.notes
             if args.notes_file:

@@ -53,6 +53,32 @@ def append_events(runtime_dir: Path | str, delivery_id: str, messages: Sequence[
         handle.write(lines)
 
 
+def read_events(runtime_dir: Path | str, limit: int) -> list[dict]:
+    """The last `limit` journaled events, oldest first — `wait`'s only read
+    path while a watcher is alive (GRE-187 stage B): the watcher already
+    owns the mailbox, so this is a plain tail of what it already appended,
+    never a re-check. No cursor, by design: every call re-reads the tail of
+    the file, so there is no cursor file to lose or let drift from what was
+    actually shown.
+
+    `append_events` writes a batch in one `write()`, but that write is not
+    atomic against a concurrent reader — a line caught mid-write does not
+    parse. With a live watcher this is the only path `wait` has, so one bad
+    line must not fail the whole read: it is skipped, not raised."""
+
+    path = Path(runtime_dir) / EVENTS_FILE
+    if not path.exists() or limit <= 0:
+        return []
+    lines = path.read_text().splitlines()[-limit:]
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
 def read_receipt(runtime_dir: Path | str) -> str | None:
     """The pending Delivery id, or None if there isn't one — read from
     disk, never from a stdout a terminal may have lost."""

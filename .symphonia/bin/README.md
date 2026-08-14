@@ -14,6 +14,7 @@
 .symphonia/bin/spawn sweep           [<TICKET>]         # audits for a role whose world is already gone, tears it down
 .symphonia/bin/spawn brief            <TICKET> --file <cut.md>  # posts a wave's coordination note to the ticket
 .symphonia/bin/spawn wait            [--ack <delivery_id>] [--timeout-ms <ms>]
+.symphonia/bin/spawn watch           [--timeout-ms <ms>] [--daemon]  # the same loop, as a process
 .symphonia/bin/spawn verdict          <TICKET> approved|revise [--notes <text>|--notes-file <path>]
 ```
 
@@ -179,6 +180,26 @@ clean `git status`. An empty body is refused for every role, on either
 outcome. Both checks run before anything is sent, so an empty success never
 reaches the registry to begin with.
 
+**The watcher is not supervised.** `spawn watch --daemon` (GRE-187) runs the
+same mailbox loop as `wait`, as a detached process, so killing the
+Orchestrator's terminal mid-wave does not stop the workflow. Nothing
+restarts it if it dies — there is no CI or hook in this repo to do that — so
+the guarantee is visibility, not supervision: a watcher that stopped on a
+processing error leaves why in `~/.symphonia/runtime/watch.log` before it
+removes its own pidfile (`~/.symphonia/runtime/watch.pid`). Starting it is
+the Orchestrator's job, once per wave; stop it with `kill $(cat
+~/.symphonia/runtime/watch.pid)` — `spawn` never starts one on its own.
+While one is alive, `spawn wait` does not race it for the mailbox: it reads
+the watcher's journal instead and marks that in its output as `"mode":
+"watcher"` (`"mode": "consumed"` is a normal, direct `wait`), with
+`delivery_id`/`acked`/`elapsed_ms`/`unattributed` all null/0 — the same
+four keys either mode returns. An explicit `--ack` refuses in this mode
+instead of being silently dropped; it would race the watcher's own
+auto-ack. Any batch that comes back with zero events sleeps a 30-second
+floor before checking again — the same instant-empty-return anomaly
+`elapsed_ms` exists to surface (see above) would otherwise spin the
+watcher hot.
+
 ## Where the decisions live
 
 | File | Decides |
@@ -188,6 +209,8 @@ reaches the registry to begin with.
 | `src/spawn.py` (behind the `bin/spawn` entrypoint) | The verbs, worktree policy, what a role is told at dispatch, the Execution Brief (`build_brief`), the registry |
 | `src/gate.py` | The whole plan gate: the report formats and their parsers, the state machine (submission, verdict, retire), and the loop that executes gate actions |
 | `src/orca.py` | Every `orca` CLI call and the parsing of what the mailbox answers |
+| `src/journal.py` | The event journal and the delivery receipt persisted on disk |
+| `src/watch.py` | The watcher's pidfile — visibility into whether one is alive, never a lock |
 | `src/linear.py` | Every Linear call: ticket read, comments, Needs Attention, the `human-gate` label |
 | `roles/*.md` | What each role does and never does, and the I/O shapes it reads and writes |
 | `src/setup_worktree.py` (behind the `bin/setup-worktree` entrypoint) | What a fresh checkout needs and git does not bring: the env files |
