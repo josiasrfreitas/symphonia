@@ -549,7 +549,18 @@ def wait(*, ack: str | None, timeout_ms: int) -> dict:
     marked acked once the outcome it acks is durable. A crash before the
     receipt leaves the delivery unacked, Orca redelivers, and the replay is
     a no-op. The failure this ordering prevents is a suppressed delivery; a
-    lost receipt only costs a harmless replay."""
+    lost receipt only costs a harmless replay.
+
+    Teardowns are NOT individually durable: they run inside this
+    transaction, so an abort after a teardown's external effects (terminal
+    closed, task settled) loses the `retired` mark and the replay runs the
+    teardown again. That is safe by construction of `_run_teardown` — every
+    effect is best-effort and converges: a closed terminal fails to close
+    and becomes an `effects` entry, a settled task reads completed/failed
+    and is skipped. A replayed teardown costs duplicate `effects` lines,
+    never corrupted state; per-teardown durability would cost a commit per
+    record inside the event loop, the second critical section this design
+    exists to avoid."""
 
     if ack is None:
         ack = _journal.read_receipt(_registry.runtime_dir())
