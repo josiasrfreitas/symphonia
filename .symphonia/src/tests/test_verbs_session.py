@@ -148,16 +148,18 @@ class Claim(unittest.TestCase):
         self.assertEqual(refusal["kind"], INJECTION.REFUSED)
         self.assertIn("SYM-11", refusal["blocked"])
 
-    def test_a_blocker_outside_the_map_blocks_and_says_it_is_external(self):
+    def test_a_blocker_outside_the_map_blocks_the_claim(self):
         # Refusing too much is recoverable; claiming work that is not ready
-        # is not. The text has to say the blocker is external, or the fix
-        # looks impossible.
-        refusal, _ = refusal_of(
+        # is not. That the refusal calls the blocker external is a property
+        # of `_shared.blocking_phrase`, tested there — here the assertion is
+        # that an unseeable blocker refuses at all, and names its key.
+        target = child("SYM-12", blocked_by=("OTHER-9",))
+        refusal, fake = refusal_of(
             CLAIM, ["claim", "--map", "SYM-8", "--ticket", "SYM-12", "--assignee", "ana"],
-            session([child("SYM-12", blocked_by=("OTHER-9",))]))
+            session([target]))
         self.assertEqual(refusal["kind"], INJECTION.REFUSED)
         self.assertIn("OTHER-9", refusal["blocked"])
-        self.assertIn("external to this map", refusal["blocked"])
+        self.assertEqual([c[0] for c in fake.calls], ["list_children"])
 
 
 # --- resolve ----------------------------------------------------------------
@@ -169,7 +171,7 @@ class ResolveRefuses(unittest.TestCase):
     def test_an_unowned_ticket_is_refused(self):
         refusal, fake = refusal_of(RESOLVE, self.ARGV, session([child("SYM-12")]))
         self.assertEqual(refusal["kind"], INJECTION.REFUSED)
-        self.assertIn("no owner", refusal["blocked"])
+        self.assertIn("SYM-12", refusal["blocked"])
         self.assertIn("map claim", refusal["example"])
         self.assertEqual([c[0] for c in fake.calls], ["list_children"])
 

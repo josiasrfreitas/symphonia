@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 
-from injection import INCOMPLETE, REFUSED, Refusal, Refused
+from injection import INCOMPLETE, Refusal, Refused
 
 # --- the map's body ---------------------------------------------------------
 
@@ -208,6 +208,23 @@ def external_blockers(child, children) -> list[str]:
     return [key for key in child.blocked_by if key not in keys]
 
 
+def blocking_phrase(child, children) -> str:
+    """The blockers still holding `child`, named for a reader: the ones
+    this map owns by key alone, the ones it does not own marked external.
+
+    Written once because `claim`, `resolve` and `describe` all say it. The
+    three said it in three places before, and the third had already drifted
+    to a different wording — which is the drift this module exists to stop.
+    """
+
+    external = set(external_blockers(child, children))
+    return ", ".join(
+        f"{key} (external to this map, so its state is unknown here)"
+        if key in external else key
+        for key in open_blockers(child, children)
+    )
+
+
 def takeable(children) -> list:
     """Open, unclaimed, and nothing left blocking it — the frontier."""
 
@@ -232,14 +249,9 @@ def describe(child, children) -> str:
     marks = []
     if child.assignee:
         marks.append(f"claimed by {child.assignee}")
-    blocking = open_blockers(child, children)
+    blocking = blocking_phrase(child, children)
     if blocking:
-        external = set(external_blockers(child, children))
-        named = ", ".join(
-            f"{key} (external to this map, state unknown)" if key in external else key
-            for key in blocking
-        )
-        marks.append(f"blocked by {named}")
+        marks.append(f"blocked by {blocking}")
     if not marks:
         marks.append(f"open ({child.state})")
     return f"{child.key} — {child.title} — " + "; ".join(marks)
@@ -279,7 +291,7 @@ def render_frontier(map_key: str, children) -> str:
 
 
 def _trimmed(text: str) -> str:
-    lines = [line for line in (text or "").splitlines()]
+    lines = (text or "").splitlines()
     if len(lines) <= LOW_RES_LINES:
         return "\n".join(lines).strip() or "(empty)"
     cut = len(lines) - LOW_RES_LINES

@@ -15,9 +15,10 @@ resolution comment is missing or wears the wrong heading, a section the
 body has lost. It lists; it never raises. A malformed map is still a map,
 and refusing to describe it would leave the reader with nothing to fix.
 
-A ticket ruled out under `## Out of scope` counts as accounted for: leaving
-scope is an act of scope, not a step on the route, so its line lives there
-and not in the decisions index.
+A ticket ruled out under `## Out of scope` is exempt from both closed-ticket
+checks: leaving scope is an act of scope, not a step on the route, so its
+line lives there and not in the decisions index — and it produces no
+resolution to comment.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ SPEC = {
 }
 
 
-def _verdict(fog: str | None, frontier) -> list[str]:
+def _verdict(fog: str | None, frontier, children) -> list[str]:
     unmet = []
     if frontier:
         unmet.append(
@@ -42,13 +43,30 @@ def _verdict(fog: str | None, frontier) -> list[str]:
         unmet.append(f"the body has no “{S.FOG}” section, so the fog cannot be read")
     elif fog.strip():
         unmet.append(f"“{S.FOG}” is not empty: {len(fog.strip().splitlines())} line(s) of fog")
+    # An empty frontier is not an empty table: a child that is claimed or
+    # blocked is open work `takeable()` does not count. The rule stays
+    # "empty frontier + empty fog" — `brief --map` checks the same one and
+    # moving it here would move it there too — but the text may not say the
+    # route is walked while somebody is still on it.
+    on_the_table = [
+        c for c in children
+        if not S.is_closed(c) and c.key not in {f.key for f in frontier}
+    ]
+    held = []
+    if on_the_table:
+        held = [
+            f"Still open, off the frontier: {len(on_the_table)} ticket(s) — "
+            "every one is claimed or blocked, so none can be picked up now: "
+            + ", ".join(c.key for c in on_the_table)
+        ]
+
     if unmet:
-        return ["Not at the destination:"] + [f"- {reason}" for reason in unmet]
+        return ["Not at the destination:"] + [f"- {reason}" for reason in unmet] + held
+    walked = "" if on_the_table else " Every step has been walked and nothing is left unspecified."
     return [
         "At the destination: the frontier is empty and "
-        f"“{S.FOG}” holds nothing. Every step has been walked and nothing is "
-        "left unspecified."
-    ]
+        f"“{S.FOG}” holds nothing." + walked
+    ] + held
 
 
 def _lint(body: str, children, comments_of) -> list[str]:
@@ -71,7 +89,12 @@ def _lint(body: str, children, comments_of) -> list[str]:
     for child in children:
         if not S.is_closed(child):
             continue
-        if child.key not in indexed and child.key not in ruled_out:
+        if child.key in ruled_out:
+            # Ruled out of the destination. That is an act of scope, not a
+            # step on the route: it owes the map neither an index line nor
+            # a resolution, and demanding either is the same false pending.
+            continue
+        if child.key not in indexed:
             pending.append(
                 f"{child.key} is closed but has no line in “{S.DECISIONS}” "
                 f"(nor in “{S.OUT_OF_SCOPE}”)"
@@ -95,7 +118,7 @@ def run(params: dict, *, tracker) -> str:
     children = box.list_children(key)
 
     lines = [f"# Validation of {key}", ""]
-    lines += _verdict(S.section(map_item.body, S.FOG), S.takeable(children))
+    lines += _verdict(S.section(map_item.body, S.FOG), S.takeable(children), children)
 
     pending = _lint(map_item.body, children, box.list_comments)
     lines += ["", f"Format ({len(pending)} pending):" if pending else "Format: nothing pending."]

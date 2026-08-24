@@ -29,17 +29,17 @@ SPEC = {
                '--question "which headings does it fix?" --type research',
 }
 
-REWIRE_EXAMPLE = "map ticket --map SYM-8 --key SYM-12 --blocked-by SYM-11"
+_REWIRE_EXAMPLE = "map ticket --map SYM-8 --key SYM-12 --blocked-by SYM-11"
 
-CREATE_PARAMS = ("title", "question", "type")
+_CREATE_PARAMS = ("title", "question", "type")
 
 
 def _create(params: dict, tracker, blocked_by, priority, user_requested) -> str:
-    missing = [name for name in CREATE_PARAMS if name not in params]
+    missing = [name for name in _CREATE_PARAMS if name not in params]
     if missing:
         S.refuse(
             blocked="ticket was called with neither form complete: creating needs "
-                    + ", ".join(f"--{name}" for name in CREATE_PARAMS)
+                    + ", ".join(f"--{name}" for name in _CREATE_PARAMS)
                     + " (missing: " + ", ".join(f"--{name}" for name in missing)
                     + "), rewiring needs --key",
             accepted="one whole form: --title --question --type to create, "
@@ -48,7 +48,7 @@ def _create(params: dict, tracker, blocked_by, priority, user_requested) -> str:
             kind=INCOMPLETE,
         )
     values = {}
-    for name in CREATE_PARAMS:
+    for name in _CREATE_PARAMS:
         value = params[name]
         if not isinstance(value, str) or not value.strip():
             S.refuse(
@@ -94,7 +94,7 @@ def _create(params: dict, tracker, blocked_by, priority, user_requested) -> str:
 
 
 def _rewire(params: dict, tracker, key, blocked_by, priority, user_requested) -> str:
-    collided = [name for name in CREATE_PARAMS if name in params]
+    collided = [name for name in _CREATE_PARAMS if name in params]
     if collided:
         S.refuse(
             blocked="ticket was called with both forms at once: --key rewires a card "
@@ -102,14 +102,14 @@ def _rewire(params: dict, tracker, key, blocked_by, priority, user_requested) ->
                     + " would create a new one",
             accepted="one form per call: --key alone to rewire, "
                      "or --title --question --type alone to create",
-            example=REWIRE_EXAMPLE,
+            example=_REWIRE_EXAMPLE,
             kind=REFUSED,
         )
     if not blocked_by and not priority:
         S.refuse(
             blocked=f"--key {key} says which card to rewire but not what to change",
             accepted="--blocked-by <keys> or --priority <level> alongside --key",
-            example=REWIRE_EXAMPLE,
+            example=_REWIRE_EXAMPLE,
             kind=INCOMPLETE,
         )
 
@@ -132,8 +132,8 @@ def _rewire(params: dict, tracker, key, blocked_by, priority, user_requested) ->
 
 
 def run(params: dict, *, tracker) -> str:
-    key = S.optional(params, "key", example=REWIRE_EXAMPLE)
-    raw_blockers = S.optional(params, "blocked-by", example=REWIRE_EXAMPLE)
+    key = S.optional(params, "key", example=_REWIRE_EXAMPLE)
+    raw_blockers = S.optional(params, "blocked-by", example=_REWIRE_EXAMPLE)
     blocked_by = S.keys(raw_blockers) if raw_blockers else []
     priority = S.optional(params, "priority", example=SPEC["example"] + " --priority high --user-requested")
     user_requested = S.flag(params, "user-requested")

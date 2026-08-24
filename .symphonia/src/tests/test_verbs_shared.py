@@ -202,7 +202,24 @@ class Ordering(unittest.TestCase):
         self.assertEqual(S.open_blockers(children[0], children), ["OTHER-9"])
         self.assertEqual(S.external_blockers(children[0], children), ["OTHER-9"])
         self.assertEqual(S.takeable(children), [])
+        self.assertEqual(
+            S.blocking_phrase(children[0], children),
+            "OTHER-9 (external to this map, so its state is unknown here)")
         self.assertIn("external to this map", S.describe(children[0], children))
+
+    def test_the_blocking_phrase_marks_only_the_blockers_it_cannot_see(self):
+        # One phrase for `claim`, `resolve` and `describe`. It lived in
+        # three copies, and the third had already drifted to a different
+        # wording — this asserts the one wording all three now say.
+        children = [child("SYM-1", blocked_by=("SYM-2", "OTHER-9")), child("SYM-2")]
+        self.assertEqual(
+            S.blocking_phrase(children[0], children),
+            "SYM-2, OTHER-9 (external to this map, so its state is unknown here)")
+
+    def test_the_blocking_phrase_is_empty_when_nothing_blocks(self):
+        children = [child("SYM-1", blocked_by=("SYM-2",)),
+                    child("SYM-2", state="Done", state_type="completed")]
+        self.assertEqual(S.blocking_phrase(children[0], children), "")
 
     def test_the_frontier_excludes_claimed_closed_and_blocked(self):
         children = [

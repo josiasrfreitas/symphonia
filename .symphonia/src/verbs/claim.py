@@ -56,16 +56,10 @@ def run(params: dict, *, tracker) -> str:
             example=f"map frontier --map {map_key}",
             kind=REFUSED,
         )
-    blocking = S.open_blockers(target, children)
+    blocking = S.blocking_phrase(target, children)
     if blocking:
-        external = set(S.external_blockers(target, children))
-        named = ", ".join(
-            f"{key} (external to this map, so its state is unknown here)"
-            if key in external else key
-            for key in blocking
-        )
         S.refuse(
-            blocked=f"{ticket_key} is still blocked by: {named}",
+            blocked=f"{ticket_key} is still blocked by: {blocking}",
             accepted="a ticket whose blockers are all closed — the frontier holds "
                      "exactly those",
             example=f"map frontier --map {map_key}",

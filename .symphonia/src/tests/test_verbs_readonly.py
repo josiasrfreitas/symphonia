@@ -78,6 +78,30 @@ class Verdict(unittest.TestCase):
         self.assertIn("At the destination", result.out)
         self.assertIn("Format: nothing pending.", result.out)
 
+    def test_open_work_off_the_frontier_is_named_not_swallowed(self):
+        # `takeable()` excludes the claimed and the blocked, so a map whose
+        # every open child has an owner has an empty frontier. The verdict
+        # stays the same — the rule is "empty frontier + empty fog", and
+        # `brief --map` checks the same one — but the text may not say the
+        # route is walked while somebody is still walking it.
+        children = [child("SYM-12", assignee="Ana"),
+                    child("SYM-13", blocked_by=("OTHER-9",))]
+        fake = reading(children, body())
+        result = call(VALIDATE, ["validate", "--map", "SYM-8"], fake)
+        self.assertIn("At the destination", result.out)
+        self.assertNotIn("Every step has been walked", result.out)
+        self.assertIn("Still open, off the frontier: 2 ticket(s)", result.out)
+        self.assertIn("SYM-12", result.out)
+        self.assertIn("SYM-13", result.out)
+
+    def test_a_truly_finished_map_still_says_every_step_was_walked(self):
+        fake = reading([child("SYM-12", **DONE)], body(
+            decisions=S.index_line("SYM-12", "t", "https://x/SYM-12", "done")),
+            {"SYM-12": resolved()})
+        result = call(VALIDATE, ["validate", "--map", "SYM-8"], fake)
+        self.assertIn("Every step has been walked", result.out)
+        self.assertNotIn("Still open, off the frontier", result.out)
+
     def test_fog_left_is_not_the_end_even_with_an_empty_frontier(self):
         fake = reading([], body(fog="which door"))
         result = call(VALIDATE, ["validate", "--map", "SYM-8"], fake)
@@ -132,6 +156,16 @@ class Lint(unittest.TestCase):
             body(out_of_scope="- SYM-12: dropped, wrong destination"),
             {"SYM-12": resolved()})
         self.assertFalse(any("has no line" in p for p in pending), pending)
+
+    def test_a_ticket_ruled_out_of_scope_owes_no_resolution_comment(self):
+        # The same exemption, on the other closed-ticket check. Leaving
+        # scope produces no resolution to comment, so demanding one is the
+        # same false pending as demanding the index line.
+        pending, _ = self.pending(
+            [child("SYM-12", **DONE)],
+            body(out_of_scope="- SYM-12: dropped, wrong destination"),
+            {"SYM-12": []})
+        self.assertEqual(pending, [])
 
     def test_an_index_line_for_a_stranger_is_pending(self):
         pending, _ = self.pending(
@@ -203,6 +237,13 @@ class Graph(unittest.TestCase):
         for key, name in (("SYM_1", "closed"), ("SYM_2", "ready"),
                           ("SYM_3", "claimed"), ("SYM_4", "blocked")):
             self.assertIn(f"class {key} {name}", result.out)
+
+    def test_the_root_is_not_painted_as_a_claimed_ticket(self):
+        # The map is not a ticket, so it wears neither `claimed` nor any
+        # other ticket state.
+        result = call(GRAPH, ["graph", "--map", "SYM-8"],
+                      FakeTracker(children=[child("SYM-12")]))
+        self.assertIn("class SYM_8 root", result.out)
 
     def test_an_external_blocker_gets_its_own_marked_node(self):
         children = [child("SYM-12", blocked_by=("OTHER-9",))]

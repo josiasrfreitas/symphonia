@@ -35,6 +35,14 @@ Injection, composed by this script and read by an agent. To refuse from
 inside a verb, raise `injection.Refused` — every other exception keeps its
 traceback, because a bug must not read as a polite refusal.
 
-No verb exists yet: SYM-10 builds the dispatcher, SYM-11 and SYM-12 fill
-this package.
+The eight verbs, in the order a route uses them: `new` opens a map,
+`ticket` puts a question on it or rewires one already there, `frontier`
+says what can be worked now, `claim` takes one and hands back the ticket
+plus the map in low resolution, `resolve` answers it and indexes the
+decision, `validate` says whether the map is finished and what is
+malformed, `graph` draws it, and `brief` writes the briefing an agent
+starts from.
+
+`_shared.py` is not a verb — `discover()` skips it — it is where the
+seven bureaucracy verbs keep the body formats they all write and read.
 """
