@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Thin entrypoint. The map tool itself lives in `src/map.py` — see
+`docs/adr/0001-package-lives-in-the-dot-directory.md` for why the package
+cannot just be imported by name and needs this one `sys.path` bootstrap.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from map import main
+
+raise SystemExit(main())

@@ -1,6 +1,8 @@
-"""Everything this package asks of Linear: one GraphQL client and the five
+"""Everything this package asks of Linear: one GraphQL client and the twelve
 tracker operations the workflow actually performs — read a ticket, read its
-comments, post a comment, flag Needs Attention, toggle the Human Gate label.
+comments, post a comment, flag Needs Attention, toggle the Human Gate label,
+create a card, link a blocker, assign, close, patch a body section, list
+children, set a neutral priority.
 
 Transport is GraphQL over urllib, authenticated with `LINEAR_API_KEY` from
 the environment (`env.load()` fills it from a `.env` if the shell did not).
@@ -80,6 +82,27 @@ class Item:
 
 
 @dataclass(frozen=True)
+class Child:
+    """One child card, with everything the frontier needs to order and
+    filter it — nothing more."""
+
+    key: str
+    url: str
+    title: str
+    state: str
+    state_type: str
+    """The provider's state category (`backlog`, `unstarted`, `started`,
+    `completed`, `canceled`) — what a script branches on, since the state
+    *name* is a team setting a human can rename."""
+    assignee: str
+    """Display name, or `""` when unclaimed."""
+    blocked_by: tuple[str, ...]
+    """Keys of the cards that block this one."""
+    priority: str
+    """`high`, `medium`, `low`, or `""` when unset."""
+
+
+@dataclass(frozen=True)
 class Comment:
     id: str
     body: str
@@ -88,8 +111,69 @@ class Comment:
     """ISO-8601, as the provider returns it."""
 
 
+# The neutral priority vocabulary (SYM-8): three names, provider numbers
+# kept here. Linear's `urgent` (1) is deliberately not exposed — a fourth
+# level is a workflow decision, not a mapping detail.
+PRIORITY = {"high": 2, "medium": 3, "low": 4}
+
+_PRIORITY_NAME = {number: name for name, number in PRIORITY.items()}
+
+
+def _as_int(value) -> int | None:
+    return None if value is None else int(value)
+
+
+def _outside_fences(lines: list[str]) -> list[bool]:
+    """One flag per line: is it outside every fenced code block? A `## `
+    inside a ``` or ~~~ fence is a template someone is quoting, not a
+    heading — the body of a design ticket is full of them."""
+
+    flags = []
+    fence = ""
+    for line in lines:
+        opener = line.lstrip()[:3]
+        if fence:
+            flags.append(False)
+            if opener == fence:
+                fence = ""
+        elif opener in ("```", "~~~"):
+            flags.append(False)
+            fence = opener
+        else:
+            flags.append(True)
+    return flags
+
+
+def patch_section(body: str, heading: str, content: str) -> str:
+    """Replace the body of the `## <heading>` section, keeping every other
+    section exactly as written — including its trailing newline; append the
+    section at the end when it does not exist yet. Headings inside fenced
+    code blocks are text, not structure. Pure — the network call around it
+    is `LinearTracker.patch_body_section`."""
+
+    lines = body.splitlines()
+    outside = _outside_fences(lines)
+    marker = f"## {heading}"
+    try:
+        start = next(
+            i for i, line in enumerate(lines)
+            if outside[i] and line.strip() == marker
+        )
+    except StopIteration:
+        prefix = body.rstrip("\n")
+        return (prefix + "\n\n" if prefix else "") + f"{marker}\n{content}\n"
+    end = next(
+        (i for i in range(start + 1, len(lines)) if outside[i] and lines[i].startswith("## ")),
+        len(lines),
+    )
+    tail = lines[end:]
+    separator = [""] if tail else []  # the blank line the replaced section owned
+    patched = "\n".join(lines[: start + 1] + content.splitlines() + separator + tail)
+    return patched + "\n" if body.endswith("\n") else patched
+
+
 class LinearTracker:
-    """The five operations, over `LinearClient`."""
+    """The twelve operations, over `LinearClient`."""
 
     def __init__(self, client: LinearClient | None = None, config: dict | None = None):
         self._c = client or LinearClient()
@@ -136,6 +220,44 @@ class LinearTracker:
             {"id": node["id"], "label": label_id},
         )
 
+    def _user_id(self, name_or_email: str) -> str:
+        """Resolve a person to their id by display name or email. Zero
+        matches or more than one both raise: picking one of two people
+        named "Ana" silently is worse than refusing."""
+
+        data = self._c.query(
+            """query($who: String!) { users(filter: {or: [
+              {name: {eq: $who}}, {email: {eq: $who}}]}) {
+                nodes { id name email } } }""",
+            {"who": name_or_email},
+        )
+        nodes = data["users"]["nodes"]
+        if not nodes:
+            raise LinearError(f"no such user: {name_or_email!r}")
+        if len(nodes) > 1:
+            names = ", ".join(f"{n.get('name')} <{n.get('email')}>" for n in nodes)
+            raise LinearError(
+                f"{name_or_email!r} matches more than one user ({names}); "
+                f"use the email, which is unique"
+            )
+        return nodes[0]["id"]
+
+    def _done_state_id(self, team_id: str) -> str:
+        """The team's first `completed` workflow state, by position. A team
+        may have several (Done, Shipped); the first is the one a board
+        shows leftmost, and closing into it is what `close_item` means."""
+
+        data = self._c.query(
+            """query($team: ID!) { workflowStates(filter: {
+              team: {id: {eq: $team}}, type: {eq: "completed"}}) {
+                nodes { id name position } } }""",
+            {"team": team_id},
+        )
+        nodes = data["workflowStates"]["nodes"]
+        if not nodes:
+            raise LinearError(f"team {team_id} has no workflow state of type 'completed'")
+        return sorted(nodes, key=lambda n: n.get("position", 0))[0]["id"]
+
     # --- reading -----------------------------------------------------------
 
     def get_item(self, id: str) -> Item:
@@ -165,6 +287,45 @@ class LinearTracker:
                 body=c["body"],
                 author_name=(c["user"] or {}).get("name", ""),
                 created_at=c["createdAt"],
+            )
+            for c in connection["nodes"]
+        ]
+
+    def list_children(self, id: str) -> list[Child]:
+        """Every child card with what the frontier needs: state, owner,
+        blockers, priority. Blockers come from each child's *inverse*
+        relations — the relation is stored on the blocker, so the card
+        being blocked only sees it from the other side."""
+
+        node = self._issue(id)
+        data = self._c.query(
+            """query($id: String!) { issue(id: $id) {
+              children(first: 100) { pageInfo { hasNextPage }
+                nodes { identifier url title priority
+                  state { name type } assignee { name }
+                  inverseRelations { nodes { type issue { identifier } } } } } } }""",
+            {"id": node["id"]},
+        )
+        connection = data["issue"]["children"]
+        # Same rule as `list_comments`: no silent caps.
+        if connection["pageInfo"]["hasNextPage"]:
+            raise LinearError("more children than one page holds; refusing to truncate silently")
+        return [
+            Child(
+                key=c["identifier"],
+                url=c["url"],
+                title=c["title"],
+                state=(c["state"] or {}).get("name", ""),
+                state_type=(c["state"] or {}).get("type", ""),
+                assignee=(c["assignee"] or {}).get("name", ""),
+                blocked_by=tuple(
+                    r["issue"]["identifier"]
+                    for r in (c.get("inverseRelations") or {}).get("nodes", [])
+                    if r.get("type") == "blocks" and r.get("issue")
+                ),
+                # Linear types `priority` as a Float, so 2 may arrive as
+                # 2.0; the map is keyed by int.
+                priority=_PRIORITY_NAME.get(_as_int(c.get("priority")), ""),
             )
             for c in connection["nodes"]
         ]
@@ -203,3 +364,109 @@ class LinearTracker:
 
         node = self._issue(id)
         self._toggle_label(node, self._cfg["gate_label"], waiting)
+
+    def create_item(
+        self,
+        title: str,
+        body: str,
+        *,
+        parent: str | None = None,
+        labels: tuple[str, ...] | list[str] = (),
+        team: str | None = None,
+    ) -> ItemRef:
+        """Create a card, optionally under a parent and with labels. The
+        team is inherited from the parent when not given; with neither, the
+        call refuses rather than guessing at a workspace default."""
+
+        parent_node = self._issue(parent) if parent else None
+        team_id = team or (parent_node["team"]["id"] if parent_node else None)
+        if not team_id:
+            raise LinearError(
+                "create_item needs a team: pass team=, or parent= to inherit the parent's"
+            )
+        payload: dict = {"teamId": team_id, "title": title, "description": body}
+        if parent_node:
+            payload["parentId"] = parent_node["id"]
+        if labels:
+            payload["labelIds"] = [self._label_id(team_id, name) for name in labels]
+        data = self._c.query(
+            """mutation($input: IssueCreateInput!) {
+              issueCreate(input: $input) { issue { id identifier url } } }""",
+            {"input": payload},
+        )
+        issue = data["issueCreate"]["issue"]
+        return ItemRef(id=issue["id"], key=issue["identifier"], url=issue["url"])
+
+    def add_blocker(self, id: str, blocked_by: str) -> None:
+        """Record that `id` cannot start until `blocked_by` is done.
+
+        Direction, because it is the one thing easy to invert: Linear's
+        `blocks` relation reads `issueId` blocks `relatedIssueId`, so the
+        *blocker* is `issueId` and the card being blocked is
+        `relatedIssueId`."""
+
+        blocked = self._issue(id)
+        blocker = self._issue(blocked_by)
+        self._c.query(
+            """mutation($input: IssueRelationCreateInput!) {
+              issueRelationCreate(input: $input) { success } }""",
+            {"input": {
+                "type": "blocks",
+                "issueId": blocker["id"],
+                "relatedIssueId": blocked["id"],
+            }},
+        )
+
+    def assign(self, id: str, assignee: str) -> None:
+        """Claim a card for one person, by display name or email."""
+
+        node = self._issue(id)
+        self._c.query(
+            """mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) { success } }""",
+            {"id": node["id"], "input": {"assigneeId": self._user_id(assignee)}},
+        )
+
+    def close_item(self, id: str) -> None:
+        """Move a card into its team's completed state."""
+
+        node = self._issue(id)
+        self._c.query(
+            """mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) { success } }""",
+            {"id": node["id"], "input": {"stateId": self._done_state_id(node["team"]["id"])}},
+        )
+
+    def patch_body_section(self, id: str, heading: str, content: str) -> None:
+        """Rewrite one `## <heading>` section of a card's body and leave
+        the rest byte for byte as it was — the index line a map keeps is
+        script-written, the prose around it is the user's."""
+
+        node = self._issue(id)
+        body = patch_section(node["description"] or "", heading, content)
+        self._c.query(
+            """mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) { success } }""",
+            {"id": node["id"], "input": {"description": body}},
+        )
+
+    def set_priority(self, id: str, level: str, *, user_requested: bool) -> None:
+        """Set the neutral priority. Priority is the user's field (SYM-8):
+        without `user_requested=True` this refuses, so an agent cannot
+        promote its own work by deciding it matters."""
+
+        if not user_requested:
+            raise LinearError(
+                "priority is the user's field: set_priority needs user_requested=True, "
+                "which only a `--user-requested` call from the user carries"
+            )
+        if level not in PRIORITY:
+            raise LinearError(
+                f"unknown priority {level!r}; use one of {', '.join(PRIORITY)}"
+            )
+        node = self._issue(id)
+        self._c.query(
+            """mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) { success } }""",
+            {"id": node["id"], "input": {"priority": PRIORITY[level]}},
+        )
