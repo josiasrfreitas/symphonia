@@ -21,8 +21,10 @@ SPEC = {
     "example": "map brief --file briefing.md --parent SYM-9",
 }
 
-OPEN_STATES = ("completed", "canceled")
-"""A child outside these two state categories is still on the frontier.
+CLOSED_STATES = ("completed", "canceled")
+"""The two state categories that take a child off the frontier; a child in
+any other one is still on it.
+
 `state_type` and not the state *name*, which is a team setting a human can
 rename. A ticket closed for being out of scope lands in `canceled` and so
 counts as closed — which is right: it left the map by a decision, not by
@@ -38,7 +40,8 @@ def _map_is_closed(tracker, key: str) -> None:
     "the map is not finished" would send the reader looking in the wrong
     half."""
 
-    open_children = [c.key for c in tracker.list_children(key) if c.state_type not in OPEN_STATES]
+    open_children = [c.key for c in tracker.list_children(key)
+                     if c.state_type not in CLOSED_STATES]
     if open_children:
         raise Refused(Refusal(
             blocked=(f"the map {key} still has {len(open_children)} open ticket(s) on its "

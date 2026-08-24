@@ -151,18 +151,43 @@ def checkable_criteria(text: str) -> list[str]:
 
 
 def fog_items(body: str) -> list[str]:
-    """The items still in the fog of a Decision Map body: the bullets
-    under `FOG_HEADING`. Comments and blank lines are not items — the
-    skill's own template leaves an HTML comment in the empty section, so
-    counting it would make every fresh map look unfinished."""
+    """Whatever is still in the fog of a Decision Map body: every line
+    with content under `FOG_HEADING`.
+
+    Prose counts, not only bullets. The `wayfinder` skill *recommends*
+    writing the fog loosely ("don't pre-slice the fog into ticket-sized
+    pieces") and its template leaves the section with an HTML comment and
+    no example marker — so a bullets-only parser reads a hand-written
+    paragraph as an empty fog and lets `brief --map` open the
+    construction card over a map still open. SYM-11's twin measures the
+    same section as `text.strip()`; this is the same meaning.
+
+    Comments are not content, and the comment stripped is the whole
+    `<!-- ... -->` block: once every other line counts, a comment spanning
+    three lines would otherwise be three items of fog that nobody wrote."""
 
     items = []
+    open_comment = False
     for line in section(body, FOG_HEADING):
-        stripped = line.strip()
-        if stripped.startswith("<!--") or not stripped:
+        text = line
+        if open_comment:
+            end = text.find("-->")
+            if end < 0:
+                continue
+            text, open_comment = text[end + len("-->"):], False
+        while True:
+            start = text.find("<!--")
+            if start < 0:
+                break
+            end = text.find("-->", start + len("<!--"))
+            if end < 0:
+                text, open_comment = text[:start], True
+                break
+            text = text[:start] + " " + text[end + len("-->"):]
+        stripped = text.strip()
+        if not stripped:
             continue
-        if stripped.startswith(("- ", "* ")):
-            items.append(stripped[2:].strip())
+        items.append(stripped.lstrip("-*").strip() or stripped)
     return items
 
 
@@ -256,9 +281,12 @@ def read_document(path: str, *, what: str, example: str) -> str:
 
     try:
         text = Path(path).expanduser().read_text(encoding="utf-8")
-    except OSError as err:
+    except (OSError, UnicodeDecodeError) as err:
+        # `UnicodeDecodeError` is a `ValueError`, not an `OSError`: a file
+        # that exists but is not UTF-8 is still caller error, and the
+        # sentence below is the one that says so.
         raise Refused(Refusal(
-            blocked=f"cannot read the {what} at {path!r}: {err.strerror or err}",
+            blocked=f"cannot read the {what} at {path!r}: {getattr(err, 'strerror', None) or err}",
             accepted="a path to a readable UTF-8 markdown file",
             example=example,
             kind=REFUSED,
@@ -306,7 +334,11 @@ def main(argv: list[str] | None = None, *, handoff_dir: str | Path | None = None
                 example=HANDOFF_EXAMPLE,
                 kind=INCOMPLETE,
             ))
-        ticket = params["ticket"].strip()
+        # Upper-cased like `spawn.done` does: otherwise `--ticket sym-8`
+        # demands a lower-case header and `--ticket SYM-8` an upper-case
+        # one, while both write the same file — two valid framings of one
+        # document, and a refusal pointing at the wrong side.
+        ticket = params["ticket"].strip().upper()
         text = read_document(params["file"], what="handoff", example=HANDOFF_EXAMPLE)
         path = write_handoff(
             ticket, text,

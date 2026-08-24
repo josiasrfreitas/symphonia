@@ -156,6 +156,27 @@ class FogItems(unittest.TestCase):
         )
         self.assertEqual(INTAKE.fog_items(body), ["como paginar", "como versionar"])
 
+    def test_fog_written_as_prose_is_not_an_empty_fog(self):
+        # The skill recommends writing the fog loosely and its template
+        # fixes no example marker, so the hand-written form has no
+        # bullets at all. Counting only bullets read this as an empty fog
+        # and let the construction card open over a map still open.
+        body = self.EMPTY.replace(
+            f"{INTAKE.FOG_HEADING}\n\n",
+            f"{INTAKE.FOG_HEADING}\n\nAinda não sabemos como o gate do briefing\n"
+            "conversa com o mapa. Área para revisitar.\n\n",
+        )
+        self.assertEqual(len(INTAKE.fog_items(body)), 2)
+
+    def test_a_comment_spanning_lines_is_one_comment_not_three_items(self):
+        # The price of counting every line: a multi-line `<!-- ... -->`
+        # would otherwise be fog nobody wrote.
+        body = self.EMPTY.replace(
+            '<!-- see "Fog of war" -->',
+            "<!-- see \"Fog of war\"\n     for what belongs here\n     and what does not -->",
+        )
+        self.assertEqual(INTAKE.fog_items(body), [])
+
     def test_the_heading_is_the_literal_the_wayfinder_skill_writes(self):
         # SYM-11 declares the twin as `verbs/_shared.FOG`; the two strings
         # must be the same one, in English, exactly as the skill writes it.
@@ -247,6 +268,26 @@ class Main(unittest.TestCase):
                 ["handoff", "--ticket", "SYM-8", "--file", str(Path(tmp) / "nope.md")], tmp)
             self.assertEqual(code, 2)
             self.assertIn("Kind: refused", err)
+
+    def test_a_file_that_is_not_utf8_is_a_refusal_not_a_traceback(self):
+        # `UnicodeDecodeError` is a `ValueError`, so it escaped a bare
+        # `except OSError` and reached the agent as a stack trace.
+        with tempfile.TemporaryDirectory() as tmp:
+            draft = Path(tmp) / "latin1.md"
+            draft.write_bytes(b"# Handoff \xe2\x80\x94 intake SYM-8\n\nRegistro da porta\xe9\n")
+            code, _, err = call(["handoff", "--ticket", "SYM-8", "--file", str(draft)], tmp)
+            self.assertEqual(code, 2)
+            self.assertIn("Kind: refused", err)
+
+    def test_the_ticket_key_is_normalised_the_way_spawn_normalises_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            draft = Path(tmp) / "draft.md"
+            draft.write_text(HANDOFF, encoding="utf-8")
+            code, out, err = call(["handoff", "--ticket", "sym-8", "--file", str(draft)], tmp)
+            # One document, one framing: the lower-case call is held to
+            # the same header and lands on the same file.
+            self.assertEqual(code, 0, err)
+            self.assertIn("sym-8-intake.md", out)
 
     def test_a_missing_parameter_names_it(self):
         with tempfile.TemporaryDirectory() as tmp:
