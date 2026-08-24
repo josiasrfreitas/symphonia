@@ -1,6 +1,6 @@
 ---
 role: standards-reviewer
-capability_tier: frontier
+capability_tier: high
 access: read
 ---
 

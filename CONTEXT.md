@@ -60,6 +60,10 @@ _Avoid_: Model, model name, effort level
 A deterministic script at a handoff between roles or phases. It carries the handoff payload (the ticket, the brief, the report) and embeds the operation itself — posting the approved plan, lighting the label, retiring the role — so no operation lives half in an agent prompt and half somewhere else.
 _Avoid_: Helper script, glue, adapter
 
+**Context Injection**:
+Everything a script hands an agent to read — a verb's response, a guided-mode correction, a gate refusal, a handoff payload. Always composed by script, never by another agent.
+_Avoid_: Prompt, response, output, dependency injection
+
 **Delivery Phase**:
 Where an Implementation Ticket stands between its brief and its merge; the tracker holds it and reads it back unchanged.
 _Avoid_: Status, state, column

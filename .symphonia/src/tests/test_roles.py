@@ -20,18 +20,20 @@ from roles import load_policies
 
 ROLES_DIR = PACKAGE.parent / "roles"
 
-# The matrix decided on GRE-179, now declared in each role file's own
-# frontmatter instead of a second table here. The two reviewers deliberately
-# sit on different rungs (2026-08-12): they read the same diff with different
-# eyes, so a second model is a second perspective, not a redundant one. Spec
-# checks the delivery against the approved plan; standards reads the repo's
-# own idiom, which is where line-by-line prose reading pays. The tier ladder
-# itself never moves — only which rung a role stands on.
+# The matrix declared in each role file's own frontmatter, not in a second
+# table here. Every role stands on `high` (opus) by the user's instruction of
+# 2026-08-24, which replaces the spread decided on GRE-179: the planner and
+# the standards reviewer came down from `frontier`, the implementer came up
+# from `standard`. It also retires the 2026-08-12 rule that the two reviewers
+# sit on different rungs — they now read the same diff with the same model,
+# and the second perspective comes from the brief each one carries, not from
+# a second model. The tier ladder itself never moves — only which rung a role
+# stands on.
 DECLARED = {
-    RoleName.PLANNER: ("frontier", "write"),
-    RoleName.IMPLEMENTER: ("standard", "write"),
+    RoleName.PLANNER: ("high", "write"),
+    RoleName.IMPLEMENTER: ("high", "write"),
     RoleName.SPEC_REVIEWER: ("high", "read"),
-    RoleName.STANDARDS_REVIEWER: ("frontier", "read"),
+    RoleName.STANDARDS_REVIEWER: ("high", "read"),
 }
 
 
