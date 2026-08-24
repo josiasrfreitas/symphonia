@@ -291,11 +291,13 @@ class Parse(unittest.TestCase):
 
 
 class Discovery(unittest.TestCase):
-    def test_the_verbs_package_is_still_empty(self):
-        # Deliberately brittle: this assertion is what breaks the day the
-        # first real verb lands (SYM-11), forcing whoever adds it to say so
-        # here rather than letting the dispatcher grow silently.
-        self.assertEqual(MAP.discover(), {})
+    def test_a_registered_verb_is_discovered_by_convention(self):
+        # This started as `assertEqual(MAP.discover(), {})` — deliberately
+        # brittle, so the first verb to land had to say so here. It has
+        # landed. Each vertical now asserts only its OWN verbs and never
+        # the whole set: SYM-11 and SYM-12 are open in parallel, and an
+        # equality here would make each one break the other on merge.
+        self.assertIn("brief", MAP.discover())
 
 
 if __name__ == "__main__":
