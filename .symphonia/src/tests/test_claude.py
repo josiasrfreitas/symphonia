@@ -51,14 +51,14 @@ class TestArgvIsDecidedByThePolicy(unittest.TestCase):
     def test_planner_argv(self):
         self.assertEqual(
             _prepare(RoleName.PLANNER).command,
-            ("claude", "--model", "fable", "--effort", "medium",
+            ("claude", "--model", "opus", "--effort", "medium",
              "--permission-mode", "bypassPermissions", "--session-id", FIXED_UUID),
         )
 
     def test_implementer_argv(self):
         self.assertEqual(
             _prepare(RoleName.IMPLEMENTER).command,
-            ("claude", "--model", "sonnet", "--effort", "high",
+            ("claude", "--model", "opus", "--effort", "medium",
              "--permission-mode", "bypassPermissions", "--session-id", FIXED_UUID),
         )
 

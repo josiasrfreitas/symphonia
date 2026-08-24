@@ -1,6 +1,6 @@
 ---
 role: planner
-capability_tier: frontier
+capability_tier: high
 access: write
 ---
 
