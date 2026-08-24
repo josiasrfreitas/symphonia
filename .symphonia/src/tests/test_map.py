@@ -1,7 +1,7 @@
 """Tests for `map` — the dispatcher, the stateless guided mode, and the
 seam that hands a verb its tracker factory. The registry is injected as a
 dict of stand-in modules; the real `verbs/` package is touched only by the
-one test that asserts it is still empty. Run either way:
+one test that asserts which verbs are registered. Run either way:
 
     cd .symphonia/src && python3 -m unittest tests.test_map
     python3 .symphonia/src/tests/test_map.py
@@ -291,11 +291,14 @@ class Parse(unittest.TestCase):
 
 
 class Discovery(unittest.TestCase):
-    def test_the_verbs_package_is_still_empty(self):
-        # Deliberately brittle: this assertion is what breaks the day the
-        # first real verb lands (SYM-11), forcing whoever adds it to say so
-        # here rather than letting the dispatcher grow silently.
-        self.assertEqual(MAP.discover(), {})
+    def test_the_v2_verbs_are_registered(self):
+        # Was `assertEqual(MAP.discover(), {})` until SYM-11 landed the first
+        # verbs. It stays an `assertIn` of *these* verbs only: SYM-12 adds
+        # `brief` on a parallel branch, and naming the whole set here would
+        # turn every future verb into a conflict on this line.
+        registered = MAP.discover()
+        for name in ("new", "ticket"):
+            self.assertIn(name, registered)
 
 
 if __name__ == "__main__":
