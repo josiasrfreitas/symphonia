@@ -245,6 +245,36 @@ def describe(child, children) -> str:
     return f"{child.key} — {child.title} — " + "; ".join(marks)
 
 
+# --- rendering the frontier -------------------------------------------------
+
+
+def render_frontier(map_key: str, children) -> str:
+    """The two lists `map frontier` prints, and that `map resolve` prints
+    again once the ticket it closed has changed them. One renderer, so the
+    frontier an agent reads after resolving looks like the one it read
+    before claiming."""
+
+    lines = []
+    ready = takeable(children)
+    if ready:
+        lines.append(f"Takeable now ({len(ready)}), highest priority first:")
+        lines += [
+            f"- {c.key} — {c.title}"
+            + (f" — priority {c.priority}" if c.priority else " — no priority set")
+            for c in ready
+        ]
+    elif children:
+        lines.append("Takeable now: none — every open ticket is claimed or blocked.")
+    else:
+        lines.append(f"Takeable now: none — map {map_key} has no tickets yet.")
+
+    rest = held_back(children)
+    if rest:
+        lines += ["", f"Held back ({len(rest)}):"]
+        lines += [f"- {describe(c, children)}" for c in rest]
+    return "\n".join(lines)
+
+
 # --- the map in low resolution ----------------------------------------------
 
 

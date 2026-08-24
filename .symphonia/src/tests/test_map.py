@@ -297,7 +297,7 @@ class Discovery(unittest.TestCase):
         # `brief` on a parallel branch, and naming the whole set here would
         # turn every future verb into a conflict on this line.
         registered = MAP.discover()
-        for name in ("new", "ticket"):
+        for name in ("new", "ticket", "frontier", "claim", "resolve"):
             self.assertIn(name, registered)
 
 
