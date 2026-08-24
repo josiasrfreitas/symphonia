@@ -6,7 +6,7 @@
 
 Every folder here is 100% one of three things:
 
-- **Source** — what is written, reviewed, and imported or executed. Lives under `src/`: a flat set of modules (`spawn.py`, `orca.py`, `claude.py`, `linear.py`, `gate.py`, `map.py`, `injection.py`, `roles.py`, `journal.py`, `env.py`, `setup_worktree.py`) plus `verbs/` and `tests/`. `bin/` itself is Source too — the three thin executable entrypoints, kept outside `src/` as the stable CLI surface (per ADR-0001), with their body living in `src/`.
+- **Source** — what is written, reviewed, and imported or executed. Lives under `src/`: a flat set of modules (`spawn.py`, `orca.py`, `claude.py`, `linear.py`, `gate.py`, `map.py`, `injection.py`, `roles.py`, `journal.py`, `registry.py`, `watch.py`, `env.py`, `setup_worktree.py`) plus `verbs/` and `tests/`. `bin/` itself is Source too — the three thin executable entrypoints, kept outside `src/` as the stable CLI surface (per ADR-0001), with their body living in `src/`.
 - **Resource** — content Source reads but never executes: `roles/`, `skills/`, `config.json`, `DEPENDENCIES.md`. Siblings of `src/`, not inside it.
 - **Artifact** — what a run produces: the spawn registry, handoff documents, transcripts, an instantiated DAG. Never committed, and lives outside every checkout (`~/.symphonia/runtime/`, `~/orca/.context`).
 

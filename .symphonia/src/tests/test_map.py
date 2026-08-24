@@ -129,6 +129,65 @@ class MissingParameter(unittest.TestCase):
         self.assertEqual(first.err, second.err)
 
 
+class ValuelessParameter(unittest.TestCase):
+    """`--map` with nothing after it is not a value. Guessing `True` where
+    a key was expected is the one thing this tool must never do."""
+
+    def test_a_bare_flag_where_a_value_belongs_is_refused(self):
+        registry = {"ticket": verb_module("ticket", required=("map",))}
+        result = call(["ticket", "--map"], registry)
+        self.assertEqual(result.code, MAP.REFUSED_EXIT)
+        got = fields(result.err)
+        self.assertEqual(got["kind"], INJECTION.INCOMPLETE)
+        self.assertIn("map", got["blocked"])
+
+    def test_the_verb_never_runs_with_true_where_a_value_belongs(self):
+        seen: list = []
+        registry = {"ticket": verb_module(
+            "ticket",
+            required=("map",),
+            run=lambda params, *, tracker: seen.append(params) or "ran",
+        )}
+        call(["ticket", "--map"], registry)
+        self.assertEqual(seen, [])
+
+
+class EmptyParameter(unittest.TestCase):
+    def test_empty_is_not_reported_as_absent(self):
+        registry = {"ticket": verb_module("ticket", required=("map",))}
+        got = fields(call(["ticket", "--map", ""], registry).err)
+        self.assertEqual(got["kind"], INJECTION.INCOMPLETE)
+        self.assertIn("empty", got["blocked"])
+        self.assertNotIn("without", got["blocked"])
+
+
+class EveryExampleIsACallThisToolAccepts(unittest.TestCase):
+    """`injection.Refusal.example` promises "one concrete call that would
+    work" — so it comes from the verb's own SPEC, never from a bare
+    `map <verb>` this same tool would turn around and refuse."""
+
+    def test_the_no_verb_example_is_a_registered_verbs_own(self):
+        registry = {"frontier": verb_module("frontier")}
+        self.assertEqual(
+            fields(call([], registry).err)["example"],
+            registry["frontier"].SPEC["example"],
+        )
+
+    def test_the_near_miss_example_is_the_neighbours_own(self):
+        registry = {"frontier": verb_module("frontier")}
+        self.assertEqual(
+            fields(call(["frontiar"], registry).err)["example"],
+            registry["frontier"].SPEC["example"],
+        )
+
+    def test_an_unknown_verb_with_no_near_miss_still_shows_a_working_call(self):
+        registry = {"frontier": verb_module("frontier")}
+        self.assertEqual(
+            fields(call(["zzzzzz"], registry).err)["example"],
+            registry["frontier"].SPEC["example"],
+        )
+
+
 class NoTracebackEverReachesTheCaller(unittest.TestCase):
     def test_none_of_the_refusals_print_a_traceback(self):
         registry = {"frontier": verb_module("frontier")}
@@ -218,8 +277,11 @@ class Parse(unittest.TestCase):
         )
 
     def test_a_stray_value_is_refused_not_swallowed(self):
-        with self.assertRaises(INJECTION.Refused):
+        # Nothing is missing from `map ticket SYM-8` — the shape is wrong,
+        # and supplying more of the same does not fix it. That is REFUSED.
+        with self.assertRaises(INJECTION.Refused) as caught:
             MAP.parse(["ticket", "SYM-8"])
+        self.assertEqual(caught.exception.refusal.kind, INJECTION.REFUSED)
 
     def test_no_verb_leaves_the_verb_empty(self):
         self.assertEqual(MAP.parse(["--map", "SYM-8"]), ("", {"map": "SYM-8"}))

@@ -83,6 +83,36 @@ class PatchSection(unittest.TestCase):
         self.assertIn("## Index\na\nb\nc", out)
         self.assertIn("## Fog", out)
 
+    # A `## ` inside a fenced code block is a template, not a heading. The
+    # body of SYM-8 carries exactly this, so the section this tool patches
+    # in a real card depends on the distinction.
+    FENCED = "## Plan\nx\n\n```md\n## Fake\ntemplate\n```\n\n## End\nz\n"
+
+    def test_a_fenced_heading_does_not_end_the_section_early(self):
+        out = LINEAR.patch_section(self.FENCED, "Plan", "y")
+        self.assertEqual(out, "## Plan\ny\n\n## End\nz\n")
+
+    def test_a_fenced_heading_is_not_a_section_to_patch(self):
+        out = LINEAR.patch_section(self.FENCED, "Fake", "replaced")
+        self.assertIn("```md\n## Fake\ntemplate\n```", out)
+        self.assertTrue(out.endswith("## Fake\nreplaced\n"))
+
+    def test_a_fenced_heading_survives_a_patch_of_a_later_section(self):
+        out = LINEAR.patch_section(self.FENCED, "End", "w")
+        self.assertIn("## Plan\nx\n\n```md\n## Fake\ntemplate\n```", out)
+        self.assertTrue(out.endswith("## End\nw\n"))
+
+    def test_a_tilde_fence_hides_a_heading_the_same_way(self):
+        body = "## Plan\nx\n\n~~~\n## Fake\n~~~\n\n## End\nz\n"
+        self.assertEqual(LINEAR.patch_section(body, "Plan", "y"), "## Plan\ny\n\n## End\nz\n")
+
+    def test_the_trailing_newline_is_not_eaten(self):
+        self.assertTrue(LINEAR.patch_section(self.BODY, "Fog", "none left").endswith("\n"))
+        self.assertTrue(LINEAR.patch_section(self.BODY, "Index", "new").endswith("\n"))
+
+    def test_a_body_without_a_trailing_newline_does_not_grow_one(self):
+        self.assertEqual(LINEAR.patch_section("## A\nold", "A", "new"), "## A\nnew")
+
 
 # --- creating ---------------------------------------------------------------
 

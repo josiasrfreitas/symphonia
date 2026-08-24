@@ -211,7 +211,10 @@ watcher hot.
 | `src/orca.py` | Every `orca` CLI call and the parsing of what the mailbox answers |
 | `src/journal.py` | The event journal and the delivery receipt persisted on disk |
 | `src/watch.py` | The watcher's pidfile — visibility into whether one is alive, never a lock |
-| `src/linear.py` | Every Linear call: ticket read, comments, Needs Attention, the `human-gate` label |
+| `src/linear.py` | Every Linear call: the twelve tracker operations — ticket read, comments, Needs Attention, the `human-gate` label, create, blocker, assign, close, patch a body section, list children, neutral priority |
+| `src/map.py` (behind the `bin/map` entrypoint) | The `map` dispatcher: how a verb is found, how a call is parsed, and the stateless guided mode that answers an incomplete call instead of asking |
+| `src/injection.py` | The one Context Injection refusal format — what blocked it, what would be accepted, one example, and the kind (incomplete vs refused) |
+| `src/verbs/` | The verbs themselves, one module per verb, discovered by convention; its `__init__.py` holds the contract every verb module must meet |
 | `roles/*.md` | What each role does and never does, and the I/O shapes it reads and writes |
 | `src/setup_worktree.py` (behind the `bin/setup-worktree` entrypoint) | What a fresh checkout needs and git does not bring: the env files |
 | `config.json` | The calibration numbers, plus the `handoff_dir` a role's baton document is written to |

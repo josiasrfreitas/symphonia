@@ -16,6 +16,11 @@ A verb module exposes exactly two names:
     def run(params: dict, *, tracker) -> str:
         ...
 
+Every name in `required` takes a value, and `map` guarantees each one
+arrives as a non-empty string. A parameter that is a bare `--flag` stays
+out of `required`: `check` refuses `--key` with nothing after it rather
+than passing `True` where the verb expected `SYM-8`.
+
 `params` is what the caller passed, already checked against `required` —
 a verb never re-validates presence, and never asks the user for a missing
 value: `map` refuses first, in the one Context Injection format

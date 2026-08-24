@@ -123,22 +123,53 @@ def _as_int(value) -> int | None:
     return None if value is None else int(value)
 
 
+def _outside_fences(lines: list[str]) -> list[bool]:
+    """One flag per line: is it outside every fenced code block? A `## `
+    inside a ``` or ~~~ fence is a template someone is quoting, not a
+    heading — the body of a design ticket is full of them."""
+
+    flags = []
+    fence = ""
+    for line in lines:
+        opener = line.lstrip()[:3]
+        if fence:
+            flags.append(False)
+            if opener == fence:
+                fence = ""
+        elif opener in ("```", "~~~"):
+            flags.append(False)
+            fence = opener
+        else:
+            flags.append(True)
+    return flags
+
+
 def patch_section(body: str, heading: str, content: str) -> str:
     """Replace the body of the `## <heading>` section, keeping every other
-    section exactly as written; append the section at the end when it does
-    not exist yet. Pure — the network call around it is
-    `LinearTracker.patch_body_section`."""
+    section exactly as written — including its trailing newline; append the
+    section at the end when it does not exist yet. Headings inside fenced
+    code blocks are text, not structure. Pure — the network call around it
+    is `LinearTracker.patch_body_section`."""
 
     lines = body.splitlines()
+    outside = _outside_fences(lines)
     marker = f"## {heading}"
     try:
-        start = next(i for i, line in enumerate(lines) if line.strip() == marker)
+        start = next(
+            i for i, line in enumerate(lines)
+            if outside[i] and line.strip() == marker
+        )
     except StopIteration:
         prefix = body.rstrip("\n")
         return (prefix + "\n\n" if prefix else "") + f"{marker}\n{content}\n"
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    end = next(
+        (i for i in range(start + 1, len(lines)) if outside[i] and lines[i].startswith("## ")),
+        len(lines),
+    )
     tail = lines[end:]
-    return "\n".join(lines[: start + 1] + content.splitlines() + [""] * bool(tail) + tail)
+    separator = [""] if tail else []  # the blank line the replaced section owned
+    patched = "\n".join(lines[: start + 1] + content.splitlines() + separator + tail)
+    return patched + "\n" if body.endswith("\n") else patched
 
 
 class LinearTracker:

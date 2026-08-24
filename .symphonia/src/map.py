@@ -65,17 +65,30 @@ def parse(argv: list[str]) -> tuple[str, dict]:
             params[key] = token
             key = None
         else:
+            # Nothing is missing here — the shape is wrong, and more of
+            # the same does not fix it. That is REFUSED, not INCOMPLETE.
             raise Refused(Refusal(
                 blocked=f"the value {token!r} came before any --parameter",
                 accepted="values follow the parameter they belong to",
                 example="map frontier --map SYM-8",
-                kind=INCOMPLETE,
+                kind=REFUSED,
             ))
     return verb, params
 
 
 def _verb_list(registry: dict) -> str:
     return ", ".join(sorted(registry)) if registry else ""
+
+
+def _example(registry: dict, prefer: str = "") -> str:
+    """A call that really works, taken from a verb's own `SPEC` — the
+    field promises "one concrete call that would work", and `map <verb>`
+    with no parameters is a call this same tool would refuse."""
+
+    if not registry:
+        return "map <verb> --key value — none exists yet in this build"
+    name = prefer if prefer in registry else sorted(registry)[0]
+    return registry[name].SPEC["example"]
 
 
 def resolve(verb: str, registry: dict) -> Any:
@@ -86,10 +99,7 @@ def resolve(verb: str, registry: dict) -> Any:
         raise Refused(Refusal(
             blocked="no verb was given",
             accepted=f"one of: {known}" if known else "no verbs are registered yet",
-            example=(
-                f"map {sorted(registry)[0]}" if registry
-                else "map <verb> --key value — none exists yet in this build"
-            ),
+            example=_example(registry),
             kind=INCOMPLETE,
         ))
     if verb in registry:
@@ -98,28 +108,46 @@ def resolve(verb: str, registry: dict) -> Any:
     raise Refused(Refusal(
         blocked=f"{verb!r} is not a verb of this tool",
         accepted=f"one of: {known}" if known else "no verbs are registered yet",
-        example=(
-            f"map {near[0]}" if near
-            else "map <verb> --key value — none exists yet in this build"
-        ),
+        example=_example(registry, near[0] if near else ""),
         kind=REFUSED,
     ))
 
 
 def check(spec: dict, params: dict) -> None:
     """The stateless guided mode: a call missing a required parameter is
-    answered with the names it is missing, not with a question."""
+    answered with the names it is missing, not with a question. Three
+    gaps, three answers — absent, valueless, empty — because a refusal
+    that names the wrong gap teaches the wrong fix.
 
-    missing = [name for name in spec.get("required", ()) if not params.get(name)]
-    if not missing:
-        return
-    raise Refused(Refusal(
-        blocked=f"{spec['name']} was called without: {', '.join(missing)}",
-        accepted="every required parameter in the same call: "
-                 + ", ".join(f"--{name}" for name in spec.get("required", ())),
-        example=spec["example"],
-        kind=INCOMPLETE,
-    ))
+    Only `required` names are checked here, and a required name always
+    takes a value: a boolean flag belongs outside `required`, by the
+    contract in `verbs/__init__.py`."""
+
+    required = tuple(spec.get("required", ()))
+    accepted = ("every required parameter in the same call, each with a value: "
+                + ", ".join(f"--{name} <value>" for name in required))
+
+    def refuse(blocked: str) -> None:
+        raise Refused(Refusal(
+            blocked=blocked,
+            accepted=accepted,
+            example=spec["example"],
+            kind=INCOMPLETE,
+        ))
+
+    absent = [name for name in required if name not in params]
+    if absent:
+        refuse(f"{spec['name']} was called without: {', '.join(absent)}")
+    # `parse` writes True for a `--key` with nothing after it. Handing that
+    # to a verb that expected `SYM-8` is guessing, which this tool does not do.
+    valueless = [name for name in required if not isinstance(params[name], str)]
+    if valueless:
+        refuse(f"{spec['name']} got no value after: "
+               + ", ".join(f"--{name}" for name in valueless))
+    empty = [name for name in required if not params[name].strip()]
+    if empty:
+        refuse(f"{spec['name']} was given an empty value for: "
+               + ", ".join(f"--{name}" for name in empty))
 
 
 def _tracker_factory() -> Callable[[], Any]:
