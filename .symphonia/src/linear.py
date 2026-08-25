@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -22,6 +23,10 @@ from pathlib import Path
 from env import SHARED_ENV, load
 
 API_URL = "https://api.linear.app/graphql"
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+"""What Linear hands back as a team id. `--team` takes either this or the
+team key, and only the key needs a round trip to resolve."""
 
 CONFIG = Path(__file__).resolve().parents[1] / "config.json"
 
@@ -179,6 +184,7 @@ class LinearTracker:
         self._c = client or LinearClient()
         self._cfg = config or json.loads(CONFIG.read_text())["linear"]
         self._label_ids: dict[tuple[str, str], str] = {}
+        self._team_ids: dict[str, str] = {}
 
     def _issue(self, id: str) -> dict:
         """Fetch one issue by UUID or key (`issue` accepts both)."""
@@ -192,15 +198,52 @@ class LinearTracker:
             raise LinearError(f"no such issue: {id}")
         return data["issue"]
 
+    def _team_id(self, team: str) -> str:
+        """A team's UUID, from either its UUID or its key (`SYM`).
+
+        Every mutation wants the UUID, but the key is what a person knows
+        and what `map new --team SYM` is documented with. Passing the key
+        straight through as `teamId` reached Linear as `Argument
+        Validation Error`, which names nothing a caller can act on."""
+
+        if _UUID.fullmatch(team):
+            return team
+        if team not in self._team_ids:
+            data = self._c.query(
+                "query($key: String!) { teams(filter: {key: {eq: $key}}) { nodes { id } } }",
+                {"key": team},
+            )
+            nodes = data["teams"]["nodes"]
+            if not nodes:
+                raise LinearError(
+                    f"no team with the key {team!r}; pass the key shown on a card "
+                    f"(the SYM of SYM-123) or the team's UUID"
+                )
+            self._team_ids[team] = nodes[0]["id"]
+        return self._team_ids[team]
+
     def _label_id(self, team_id: str, name: str) -> str:
+        """The id of the label called `name` that this team can use.
+
+        A Linear label is either scoped to one team or shared across the
+        whole workspace, and both are usable on a card of this team — so
+        both are searched. Looking only at team-scoped labels made every
+        workspace label read as missing, and the create that followed came
+        back `duplicate label name`: the tool could not use a label it
+        could not see, and could not create it either."""
+
         if (team_id, name) not in self._label_ids:
             data = self._c.query(
                 """query($team: ID!, $name: String!) {
-                  issueLabels(filter: {name: {eq: $name}, team: {id: {eq: $team}}}) {
-                    nodes { id } } }""",
+                  issueLabels(filter: {name: {eq: $name}, or: [
+                    {team: {id: {eq: $team}}}, {team: {null: true}}]}) {
+                    nodes { id team { id } } } }""",
                 {"team": team_id, "name": name},
             )
-            nodes = data["issueLabels"]["nodes"]
+            # A workspace label and a team label may share a name; the
+            # team's own is the more specific and wins.
+            nodes = sorted(data["issueLabels"]["nodes"],
+                           key=lambda n: n["team"] is None)
             if not nodes:
                 created = self._c.query(
                     """mutation($input: IssueLabelCreateInput!) {
@@ -379,7 +422,8 @@ class LinearTracker:
         call refuses rather than guessing at a workspace default."""
 
         parent_node = self._issue(parent) if parent else None
-        team_id = team or (parent_node["team"]["id"] if parent_node else None)
+        team_id = (self._team_id(team) if team
+                   else (parent_node["team"]["id"] if parent_node else None))
         if not team_id:
             raise LinearError(
                 "create_item needs a team: pass team=, or parent= to inherit the parent's"

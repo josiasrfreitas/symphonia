@@ -19,9 +19,15 @@ import linear as LINEAR
 
 CONFIG = {"attention_label": "needs-attention", "gate_label": "human-gate"}
 
+TEAM_UUID = "0cb59d39-f336-4a9c-ace6-bec65dac49f5"
+"""A team id shaped the way Linear really returns one. The tests below
+that pass a team by hand use this and not a readable stand-in: `--team`
+now tells a UUID from a team key by its shape, so a fixture like
+`"team-1"` would exercise the key path while claiming to be an id."""
+
 ISSUE = {
     "id": "uuid-1", "identifier": "SYM-8", "url": "https://linear.app/x/SYM-8",
-    "title": "the map", "description": "## Index\nold\n", "team": {"id": "team-1"},
+    "title": "the map", "description": "## Index\nold\n", "team": {"id": TEAM_UUID},
 }
 
 
@@ -126,7 +132,7 @@ class CreateItem(unittest.TestCase):
         ref = tr.create_item("child", "body", parent="SYM-8")
         self.assertEqual((ref.key, ref.url), ("SYM-9", "https://linear.app/x/SYM-9"))
         payload = client.mutations()[0][1]["input"]
-        self.assertEqual(payload["teamId"], "team-1")
+        self.assertEqual(payload["teamId"], TEAM_UUID)
         self.assertEqual(payload["parentId"], "uuid-1")
 
     def test_refuses_without_parent_or_team(self):
@@ -137,10 +143,73 @@ class CreateItem(unittest.TestCase):
 
     def test_labels_become_label_ids(self):
         tr, client = tracker(
-            {"issueLabels": {"nodes": [{"id": "label-1"}]}}, self.CREATED,
+            {"issueLabels": {"nodes": [{"id": "label-1", "team": {"id": TEAM_UUID}}]}},
+            self.CREATED,
         )
-        tr.create_item("mapa", "body", labels=("wayfinder:map",), team="team-1")
+        tr.create_item("mapa", "body", labels=("wayfinder:map",), team=TEAM_UUID)
         self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-1"])
+
+    def test_a_team_key_is_resolved_to_the_team_id(self):
+        """`map new --team SYM` is the documented call. The key reaches
+        Linear as `teamId` only after this round trip; sent raw it came
+        back as `Argument Validation Error`."""
+
+        tr, client = tracker(
+            {"teams": {"nodes": [{"id": TEAM_UUID}]}},
+            {"issueLabels": {"nodes": [{"id": "label-1", "team": None}]}},
+            self.CREATED,
+        )
+        tr.create_item("mapa", "body", labels=("wayfinder:map",), team="SYM")
+        self.assertEqual(client.calls[0][1], {"key": "SYM"})
+        self.assertEqual(client.mutations()[0][1]["input"]["teamId"], TEAM_UUID)
+
+    def test_a_team_id_is_not_looked_up(self):
+        tr, client = tracker(self.CREATED)
+        tr.create_item("mapa", "body", team=TEAM_UUID)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_refuses_a_team_key_nobody_has(self):
+        tr, _ = tracker({"teams": {"nodes": []}})
+        with self.assertRaises(LINEAR.LinearError) as caught:
+            tr.create_item("mapa", "body", team="NOPE")
+        self.assertIn("NOPE", str(caught.exception))
+
+
+class LabelLookup(unittest.TestCase):
+    """A label is either the team's or the whole workspace's, and a card of
+    this team can wear either. Searching only the team's made every
+    workspace label read as missing."""
+
+    CREATED = CreateItem.CREATED
+
+    def test_a_workspace_label_is_found_and_not_recreated(self):
+        tr, client = tracker(
+            {"issueLabels": {"nodes": [{"id": "label-ws", "team": None}]}},
+            self.CREATED,
+        )
+        tr.create_item("mapa", "body", labels=("wayfinder:map",), team=TEAM_UUID)
+        self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-ws"])
+        self.assertEqual(len(client.mutations()), 1)  # nothing was created
+
+    def test_the_teams_own_label_wins_over_a_workspace_namesake(self):
+        tr, client = tracker(
+            {"issueLabels": {"nodes": [
+                {"id": "label-ws", "team": None},
+                {"id": "label-team", "team": {"id": TEAM_UUID}},
+            ]}},
+            self.CREATED,
+        )
+        tr.create_item("mapa", "body", labels=("human-gate",), team=TEAM_UUID)
+        self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-team"])
+
+    def test_a_label_nobody_has_is_still_created(self):
+        tr, client = tracker(
+            {"issueLabels": {"nodes": []}},
+            {"issueLabelCreate": {"issueLabel": {"id": "label-new"}}},
+            self.CREATED,
+        )
+        tr.create_item("mapa", "body", labels=("wayfinder:new",), team=TEAM_UUID)
+        self.assertEqual(client.mutations()[1][1]["input"]["labelIds"], ["label-new"])
 
 
 class AddBlocker(unittest.TestCase):
