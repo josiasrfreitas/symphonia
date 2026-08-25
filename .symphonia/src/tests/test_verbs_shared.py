@@ -22,6 +22,7 @@ PACKAGE = Path(__file__).resolve().parents[1]  # .symphonia/src
 sys.path.insert(0, str(PACKAGE))
 
 import injection as INJECTION
+import intake as INTAKE
 import map as MAP
 from linear import Child, Item, ItemRef
 from verbs import _shared as S
@@ -149,6 +150,31 @@ class Sections(unittest.TestCase):
         # every map written by the skill stops being readable here.
         self.assertEqual(S.FOG, "Not yet specified")
 
+    def test_a_section_holding_only_a_comment_is_empty(self):
+        # The `wayfinder` template leaves `## Not yet specified` holding one
+        # `<!-- see "Fog of war"... -->` and nothing else. Counting the
+        # comment read every map the skill wrote as a map whose fog is
+        # still full, so `validate` never declared the end of one.
+        body = self.BODY.replace(
+            "## Not yet specified\nwhich door",
+            '## Not yet specified\n\n<!-- see "Fog of war": ... -->',
+        )
+        self.assertTrue(S.empty_section(body, S.FOG))
+
+    def test_a_comment_spanning_lines_is_still_not_content(self):
+        body = self.BODY.replace(
+            "## Not yet specified\nwhich door",
+            "## Not yet specified\n\n<!-- one\ntwo\nthree -->",
+        )
+        self.assertTrue(S.empty_section(body, S.FOG))
+
+    def test_content_beside_a_comment_is_still_content(self):
+        body = self.BODY.replace(
+            "## Not yet specified\nwhich door",
+            "## Not yet specified\n\n<!-- hint -->\nwhich door",
+        )
+        self.assertFalse(S.empty_section(body, S.FOG))
+
     def test_a_new_body_has_all_five_sections_three_of_them_empty(self):
         body = S.blank_map_body("ship it", "brownfield")
         for heading in S.SECTIONS:
@@ -156,6 +182,39 @@ class Sections(unittest.TestCase):
         self.assertEqual(S.section(body, S.DESTINATION), "ship it")
         for heading in (S.DECISIONS, S.FOG, S.OUT_OF_SCOPE):
             self.assertTrue(S.empty_section(body, heading), heading)
+
+
+class TheTwinsAgree(unittest.TestCase):
+    """The fog is measured twice — `_shared.empty_section` here and
+    `intake.fog_items` in the other vertical — and the two constants are
+    still duplicated (debt of the V4, SYM-13). While two readings exist
+    they have to give the same answer on the same body, or `validate` and
+    `brief --map` disagree about whether a map is finished. They did
+    disagree once, on exactly the third case below, and each side was
+    green on its own: the twins were never run against one another until
+    both were already merged."""
+
+    CASES = (
+        ('<!-- see "Fog of war": ... -->', True),
+        ("- como paginar\n- como versionar", False),
+        ("which door do we take", False),
+        ("", True),
+        ("<!-- one\ntwo -->", True),
+        ('<!-- hint -->\nwhich door', False),
+    )
+
+    def test_both_halves_read_the_same_fog_the_same_way(self):
+        for content, expected_empty in self.CASES:
+            body = (
+                f"## Destination\nship it\n\n"
+                f"## Not yet specified\n{content}\n\n"
+                f"## Out of scope\n"
+            )
+            with self.subTest(content=content):
+                self.assertEqual(S.empty_section(body, S.FOG), expected_empty)
+                self.assertEqual(
+                    not INTAKE.fog_items(body), expected_empty
+                )
 
 
 class IndexLine(unittest.TestCase):

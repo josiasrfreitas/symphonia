@@ -96,12 +96,39 @@ def section(body: str, heading: str) -> str | None:
     return "\n".join(lines[start + 1:end]).strip("\n")
 
 
+def _without_comments(text: str) -> str:
+    """`text` with every `<!-- ... -->` block removed, comments spanning
+    more than one line included."""
+
+    out = []
+    rest = text
+    while True:
+        start = rest.find("<!--")
+        if start < 0:
+            out.append(rest)
+            break
+        out.append(rest[:start])
+        end = rest.find("-->", start + len("<!--"))
+        if end < 0:
+            break
+        rest = rest[end + len("-->"):]
+    return "".join(out)
+
+
 def empty_section(body: str, heading: str) -> bool:
     """True when the section exists and holds nothing but whitespace. An
-    absent section is not empty — it is missing, and `validate` says so."""
+    absent section is not empty — it is missing, and `validate` says so.
+
+    A comment is not content. The `wayfinder` skill's template leaves
+    `## Not yet specified` holding one `<!-- see "Fog of war"... -->` and
+    nothing else, so a bare `text.strip()` reads every map the skill wrote
+    as a map whose fog is still full — and `validate` would never declare
+    the end of one. SYM-12's twin, `intake.fog_items`, already discounts
+    comments; this is the same meaning, which is the whole point of the
+    two being twins."""
 
     text = section(body, heading)
-    return text is not None and not text.strip()
+    return text is not None and not _without_comments(text).strip()
 
 
 def blank_map_body(destination: str, notes: str = "") -> str:
