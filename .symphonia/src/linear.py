@@ -25,8 +25,13 @@ from env import SHARED_ENV, load
 API_URL = "https://api.linear.app/graphql"
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-"""What Linear hands back as a team id. `--team` takes either this or the
-team key, and only the key needs a round trip to resolve."""
+"""The shape of a team id. `--team` takes either this or the team key, and
+only the key needs a round trip to resolve.
+
+Case-insensitive not because Linear returns anything but lowercase, but
+because this is the gate that decides id-or-key: a UUID pasted in upper
+case is still an id, and reading it as a team key would send it to a
+lookup that can only fail."""
 
 CONFIG = Path(__file__).resolve().parents[1] / "config.json"
 
@@ -204,13 +209,18 @@ class LinearTracker:
         Every mutation wants the UUID, but the key is what a person knows
         and what `map new --team SYM` is documented with. Passing the key
         straight through as `teamId` reached Linear as `Argument
-        Validation Error`, which names nothing a caller can act on."""
+        Validation Error`, which names nothing a caller can act on.
+
+        The key is matched ignoring case: `--team sym` is the same team a
+        person means, and a refusal over capitalisation would name the
+        key back at them without naming the case as the cause."""
 
         if _UUID.fullmatch(team):
             return team
         if team not in self._team_ids:
             data = self._c.query(
-                "query($key: String!) { teams(filter: {key: {eq: $key}}) { nodes { id } } }",
+                "query($key: String!) { teams(filter: {key: {eqIgnoreCase: $key}}) "
+                "{ nodes { id } } }",
                 {"key": team},
             )
             nodes = data["teams"]["nodes"]
@@ -230,20 +240,26 @@ class LinearTracker:
         both are searched. Looking only at team-scoped labels made every
         workspace label read as missing, and the create that followed came
         back `duplicate label name`: the tool could not use a label it
-        could not see, and could not create it either."""
+        could not see, and could not create it either.
+
+        `eqIgnoreCase` and not `eq`, because Linear rejects a duplicate
+        name without regard to case. An exact match would miss a
+        `Wayfinder:Map` written by hand and fall through to the same
+        refused create — the bug above, with a different spelling.
+
+        At most one label comes back: Linear refuses a team label that
+        shares a name with a workspace one, so the two scopes cannot both
+        hold it and there is nothing to break a tie between."""
 
         if (team_id, name) not in self._label_ids:
             data = self._c.query(
                 """query($team: ID!, $name: String!) {
-                  issueLabels(filter: {name: {eq: $name}, or: [
+                  issueLabels(filter: {name: {eqIgnoreCase: $name}, or: [
                     {team: {id: {eq: $team}}}, {team: {null: true}}]}) {
-                    nodes { id team { id } } } }""",
+                    nodes { id } } }""",
                 {"team": team_id, "name": name},
             )
-            # A workspace label and a team label may share a name; the
-            # team's own is the more specific and wins.
-            nodes = sorted(data["issueLabels"]["nodes"],
-                           key=lambda n: n["team"] is None)
+            nodes = data["issueLabels"]["nodes"]
             if not nodes:
                 created = self._c.query(
                     """mutation($input: IssueLabelCreateInput!) {
