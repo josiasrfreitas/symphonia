@@ -1,7 +1,7 @@
 """Tests for `map` — the dispatcher, the stateless guided mode, and the
 seam that hands a verb its tracker factory. The registry is injected as a
 dict of stand-in modules; the real `verbs/` package is touched only by the
-one test that asserts it is still empty. Run either way:
+one test that asserts which verbs are registered. Run either way:
 
     cd .symphonia/src && python3 -m unittest tests.test_map
     python3 .symphonia/src/tests/test_map.py
@@ -291,12 +291,18 @@ class Parse(unittest.TestCase):
 
 
 class Discovery(unittest.TestCase):
+    # `assertEqual(MAP.discover(), {})` lived here until the verbs landed —
+    # deliberately brittle, so the first one to arrive had to say so. Both
+    # verticals have now landed, each asserting only its OWN verbs. Keep it
+    # that way: an equality over the whole set would turn every future verb
+    # into a conflict on this line.
+
+    def test_the_v2_verbs_are_registered(self):
+        registered = MAP.discover()
+        for name in ("new", "ticket", "frontier", "claim", "resolve", "validate", "graph"):
+            self.assertIn(name, registered)
+
     def test_a_registered_verb_is_discovered_by_convention(self):
-        # This started as `assertEqual(MAP.discover(), {})` — deliberately
-        # brittle, so the first verb to land had to say so here. It has
-        # landed. Each vertical now asserts only its OWN verbs and never
-        # the whole set: SYM-11 and SYM-12 are open in parallel, and an
-        # equality here would make each one break the other on merge.
         self.assertIn("brief", MAP.discover())
 
 
