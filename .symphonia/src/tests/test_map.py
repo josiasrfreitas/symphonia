@@ -291,14 +291,19 @@ class Parse(unittest.TestCase):
 
 
 class Discovery(unittest.TestCase):
+    # `assertEqual(MAP.discover(), {})` lived here until the verbs landed —
+    # deliberately brittle, so the first one to arrive had to say so. Both
+    # verticals have now landed, each asserting only its OWN verbs. Keep it
+    # that way: an equality over the whole set would turn every future verb
+    # into a conflict on this line.
+
     def test_the_v2_verbs_are_registered(self):
-        # Was `assertEqual(MAP.discover(), {})` until SYM-11 landed the first
-        # verbs. It stays an `assertIn` of *these* verbs only: SYM-12 adds
-        # `brief` on a parallel branch, and naming the whole set here would
-        # turn every future verb into a conflict on this line.
         registered = MAP.discover()
         for name in ("new", "ticket", "frontier", "claim", "resolve", "validate", "graph"):
             self.assertIn(name, registered)
+
+    def test_a_registered_verb_is_discovered_by_convention(self):
+        self.assertIn("brief", MAP.discover())
 
 
 if __name__ == "__main__":
