@@ -1,79 +1,32 @@
-"""Tests for `verbs/_shared.py` and for the two verbs that write cards,
-`new` and `ticket`.
+"""Tests for `verbs/_shared.py` — the body formats the bureaucracy verbs
+write and read.
 
-Offline, like every test in this package (ADR-0002): the tracker is a fake
-injected through `map.main(..., tracker=...)`, so nothing here needs
-`LINEAR_API_KEY` and nothing here reaches Linear. Each refusal is asserted
-on its `kind` and on a field of `injection.as_dict` — never on a substring
-of prose, which is the part a rewrite is allowed to change.
+Nothing here needs a tracker: these are pure functions over markdown, so
+the file survived the removal of the faked-tracker tests intact. What went
+with them is `new` and `ticket` — the two verbs that write cards — whose
+behaviour is now covered by nothing.
+
+`TheTwinsAgree` is the one to keep an eye on: it holds `_shared.empty_section`
+and `intake.fog_items` to the same answer, and it is what stops the two
+readings of the fog from drifting apart again. Run either way:
 
     cd .symphonia/src && python3 -m unittest tests.test_verbs_shared
 """
 from __future__ import annotations
 
-import io
 import sys
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 
 PACKAGE = Path(__file__).resolve().parents[1]  # .symphonia/src
 sys.path.insert(0, str(PACKAGE))
 
 import injection as INJECTION
 import intake as INTAKE
-import map as MAP
 from linear import Child, Item, ItemRef
 from verbs import _shared as S
-from verbs import new as NEW
-from verbs import ticket as TICKET
 
 
-class FakeTracker:
-    """Records every call and answers with what the test canned."""
-
-    def __init__(self, *, item=None, children=(), comments=()):
-        self.calls: list[tuple] = []
-        self.item = item
-        self.children = list(children)
-        self.comments = list(comments)
-        self.created = ItemRef(id="uuid-new", key="SYM-99", url="https://x/SYM-99")
-
-    def create_item(self, title, body, *, parent=None, labels=(), team=None):
-        self.calls.append(("create_item", title, body, parent, tuple(labels), team))
-        return self.created
-
-    def add_blocker(self, id, blocked_by):
-        self.calls.append(("add_blocker", id, blocked_by))
-
-    def set_priority(self, id, level, *, user_requested):
-        self.calls.append(("set_priority", id, level, user_requested))
-
-    def get_item(self, id):
-        self.calls.append(("get_item", id))
-        return self.item
-
-    def list_children(self, id):
-        self.calls.append(("list_children", id))
-        return self.children
-
-    def list_comments(self, id):
-        self.calls.append(("list_comments", id))
-        return self.comments
-
-    def assign(self, id, assignee):
-        self.calls.append(("assign", id, assignee))
-
-    def close_item(self, id):
-        self.calls.append(("close_item", id))
-
-    def post_comment(self, id, body):
-        self.calls.append(("post_comment", id, body))
-        return SimpleNamespace(id="c1", body=body, author_name="", created_at="")
-
-    def patch_body_section(self, id, heading, content):
-        self.calls.append(("patch_body_section", id, heading, content))
 
 
 def child(key, *, title="t", state="Todo", state_type="unstarted",
@@ -90,32 +43,8 @@ def item(key="SYM-8", title="Intake v2", body=""):
                 title=title, body=body)
 
 
-def call(module, argv, tracker=None):
-    """Run one verb through the real dispatcher, capturing what a caller
-    would see. Going through `map.main` is the point: `required` is checked
-    by `map.check`, so a test that called `run` directly would be testing a
-    path no user takes."""
-
-    fake = tracker or FakeTracker()
-    registry = {module.SPEC["name"]: module}
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        code = MAP.main(argv, registry=registry, tracker=lambda: fake)
-    return SimpleNamespace(code=code, out=out.getvalue(), err=err.getvalue(), tracker=fake)
 
 
-def refusal_of(module, argv, tracker=None):
-    """The `Refusal` a call raises, as the dict `injection.as_dict` makes —
-    so a test asserts on `kind` and on a named field, not on prose."""
-
-    fake = tracker or FakeTracker()
-    verb, params = MAP.parse(argv)
-    MAP.check(module.SPEC, params)
-    try:
-        module.run(params, tracker=lambda: fake)
-    except INJECTION.Refused as refused:
-        return INJECTION.as_dict(refused.refusal), fake
-    raise AssertionError(f"{argv} was not refused")
 
 
 # --- _shared: the map's body ------------------------------------------------
@@ -327,125 +256,15 @@ class Optionals(unittest.TestCase):
 # --- new --------------------------------------------------------------------
 
 
-class New(unittest.TestCase):
-    def test_it_creates_a_labelled_map_with_the_five_sections(self):
-        result = call(NEW, ["new", "--title", "Intake v2",
-                            "--destination", "three doors", "--team", "SYM"])
-        self.assertEqual(result.code, 0)
-        (_, title, body, parent, labels, team), = result.tracker.calls
-        self.assertEqual((title, parent, labels, team),
-                         ("Intake v2", None, (S.MAP_LABEL,), "SYM"))
-        self.assertEqual(S.section(body, S.DESTINATION), "three doors")
-        self.assertIn("SYM-99", result.out)
-
-    def test_notes_land_in_their_own_section(self):
-        result = call(NEW, ["new", "--title", "t", "--destination", "d",
-                            "--team", "SYM", "--notes", "brownfield"])
-        body = result.tracker.calls[0][2]
-        self.assertEqual(S.section(body, S.NOTES), "brownfield")
-
-    def test_the_team_is_required_by_the_dispatcher(self):
-        result = call(NEW, ["new", "--title", "t", "--destination", "d"])
-        self.assertEqual(result.code, MAP.REFUSED_EXIT)
-        self.assertIn("Kind: incomplete", result.err)
 
 
 # --- ticket -----------------------------------------------------------------
 
 
-class TicketCreate(unittest.TestCase):
-    def test_it_creates_under_the_map_with_the_type_label(self):
-        result = call(TICKET, ["ticket", "--map", "SYM-8", "--title", "Read the skill",
-                               "--question", "which headings?", "--type", "research"])
-        self.assertEqual(result.code, 0)
-        kind, title, body, parent, labels, team = result.tracker.calls[0]
-        self.assertEqual((kind, title, parent, labels),
-                         ("create_item", "Read the skill", "SYM-8", ("wayfinder:research",)))
-        self.assertIn("which headings?", body)
-
-    def test_blockers_are_linked_one_call_each(self):
-        result = call(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                               "--question", "q", "--type", "task",
-                               "--blocked-by", "SYM-1,SYM-2"])
-        self.assertEqual(
-            [c for c in result.tracker.calls if c[0] == "add_blocker"],
-            [("add_blocker", "SYM-99", "SYM-1"), ("add_blocker", "SYM-99", "SYM-2")],
-        )
-
-    def test_an_unknown_type_is_refused(self):
-        refusal, fake = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                                            "--question", "q", "--type", "vibes"])
-        self.assertEqual(refusal["kind"], INJECTION.REFUSED)
-        self.assertIn("vibes", refusal["blocked"])
-        self.assertEqual(fake.calls, [])
-
-    def test_neither_form_complete_is_incomplete(self):
-        refusal, _ = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--title", "t"])
-        self.assertEqual(refusal["kind"], INJECTION.INCOMPLETE)
-        self.assertIn("--question", refusal["blocked"])
-        self.assertIn("--key", refusal["blocked"])
 
 
-class TicketPriority(unittest.TestCase):
-    """The success criterion: priority without `--user-requested` is
-    refused, in the one format, before the tracker is touched."""
-
-    def test_priority_without_user_requested_is_refused(self):
-        refusal, fake = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                                            "--question", "q", "--type", "task",
-                                            "--priority", "high"])
-        self.assertEqual(refusal["kind"], INJECTION.REFUSED)
-        self.assertIn("--user-requested", refusal["accepted"])
-        self.assertIn("--user-requested", refusal["example"])
-
-    def test_nothing_is_created_by_a_refused_call(self):
-        _, fake = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                                      "--question", "q", "--type", "task",
-                                      "--priority", "high"])
-        self.assertEqual(fake.calls, [])
-
-    def test_the_refusal_renders_in_the_one_format(self):
-        result = call(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                               "--question", "q", "--type", "task", "--priority", "high"])
-        self.assertEqual(result.code, MAP.REFUSED_EXIT)
-        self.assertEqual(
-            [line.split(":")[0] for line in result.err.strip().splitlines()
-             if line.split(":")[0] in ("Blocked", "Accepted", "Example", "Kind")],
-            ["Blocked", "Accepted", "Example", "Kind"],
-        )
-
-    def test_with_user_requested_it_reaches_the_tracker(self):
-        result = call(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                               "--question", "q", "--type", "task",
-                               "--priority", "high", "--user-requested"])
-        self.assertEqual(result.code, 0)
-        self.assertIn(("set_priority", "SYM-99", "high", True), result.tracker.calls)
-
-    def test_an_unknown_level_is_refused_before_the_tracker(self):
-        refusal, fake = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--title", "t",
-                                            "--question", "q", "--type", "task",
-                                            "--priority", "urgent", "--user-requested"])
-        self.assertEqual(refusal["kind"], INJECTION.REFUSED)
-        self.assertEqual(fake.calls, [])
 
 
-class TicketRewire(unittest.TestCase):
-    def test_it_links_without_creating(self):
-        result = call(TICKET, ["ticket", "--map", "SYM-8", "--key", "SYM-12",
-                               "--blocked-by", "SYM-11"])
-        self.assertEqual(result.code, 0)
-        self.assertEqual(result.tracker.calls, [("add_blocker", "SYM-12", "SYM-11")])
-
-    def test_both_forms_at_once_is_refused(self):
-        refusal, fake = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--key", "SYM-12",
-                                            "--title", "t"])
-        self.assertEqual(refusal["kind"], INJECTION.REFUSED)
-        self.assertIn("--title", refusal["blocked"])
-        self.assertEqual(fake.calls, [])
-
-    def test_a_key_with_nothing_to_change_is_incomplete(self):
-        refusal, _ = refusal_of(TICKET, ["ticket", "--map", "SYM-8", "--key", "SYM-12"])
-        self.assertEqual(refusal["kind"], INJECTION.INCOMPLETE)
 
 
 if __name__ == "__main__":

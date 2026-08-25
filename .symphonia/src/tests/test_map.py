@@ -1,7 +1,10 @@
-"""Tests for `map` — the dispatcher, the stateless guided mode, and the
-seam that hands a verb its tracker factory. The registry is injected as a
-dict of stand-in modules; the real `verbs/` package is touched only by the
-one test that asserts which verbs are registered. Run either way:
+"""Tests for `map` — the dispatcher and the stateless guided mode. The
+registry is injected as a dict of stand-in modules; the real `verbs/`
+package is touched only by the one test that asserts which verbs are
+registered.
+
+The seam that hands a verb its tracker factory used to be tested here too;
+it went with the faked-tracker tests. Run either way:
 
     cd .symphonia/src && python3 -m unittest tests.test_map
     python3 .symphonia/src/tests/test_map.py
@@ -10,7 +13,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -24,15 +26,6 @@ import injection as INJECTION
 import map as MAP
 
 
-class FakeTracker:
-    """Stands in for `LinearTracker`, recording what a verb asked of it."""
-
-    def __init__(self):
-        self.calls: list[tuple] = []
-
-    def list_children(self, id):
-        self.calls.append(("list_children", id))
-        return []
 
 
 def verb_module(name, required=("map",), run=None):
@@ -58,11 +51,6 @@ def call(argv, registry=None, tracker=None):
     return SimpleNamespace(code=code, out=out.getvalue(), err=err.getvalue())
 
 
-def _restore_module(name, module):
-    if module is None:
-        sys.modules.pop(name, None)
-    else:
-        sys.modules[name] = module
 
 
 def fields(text):
@@ -220,50 +208,6 @@ class JsonOutput(unittest.TestCase):
 # --- the tracker seam -------------------------------------------------------
 
 
-class TrackerInjection(unittest.TestCase):
-    def test_a_verb_receives_the_factory_and_reaches_the_tracker(self):
-        seen = {}
-
-        def run(params, *, tracker):
-            seen["tracker"] = tracker()
-            seen["params"] = params
-            return "ok"
-
-        fake = FakeTracker()
-        registry = {"frontier": verb_module("frontier", run=run)}
-        result = call(["frontier", "--map", "SYM-8"], registry, tracker=lambda: fake)
-        self.assertEqual(result.code, 0)
-        self.assertEqual(result.out.strip(), "ok")
-        self.assertIs(seen["tracker"], fake)
-        self.assertEqual(seen["params"], {"map": "SYM-8"})
-
-    def test_the_factory_is_not_called_when_the_verb_does_not_ask(self):
-        # No LINEAR_API_KEY in the environment, and the real factory: a
-        # verb that never calls it must still succeed.
-        for name in ("LINEAR_API_KEY", "SYMPHONIA_ENV"):
-            if name in os.environ:
-                self.addCleanup(os.environ.__setitem__, name, os.environ[name])
-                del os.environ[name]
-        registry = {"graph": verb_module("graph", run=lambda params, *, tracker: "drawn")}
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = MAP.main(["graph", "--map", "SYM-8"], registry=registry)
-        self.assertEqual((code, out.getvalue().strip()), (0, "drawn"))
-
-    def test_the_real_factory_builds_at_most_one_tracker(self):
-        built = []
-
-        def build():
-            built.append(FakeTracker())
-            return built[-1]
-
-        real = sys.modules.get("linear")
-        self.addCleanup(_restore_module, "linear", real)
-        sys.modules["linear"] = SimpleNamespace(LinearTracker=build)
-
-        factory = MAP._tracker_factory()
-        self.assertIs(factory(), factory())
-        self.assertEqual(len(built), 1)
 
 
 # --- parsing ----------------------------------------------------------------

@@ -1,7 +1,9 @@
-"""Tests for `linear` — the pure body-patcher and the twelve tracker
-operations, driven through a fake `LinearClient` that returns canned
-answers and records every call. No network, no `LINEAR_API_KEY`. Run
-either way:
+"""Tests for `linear` — the pure body-patcher, and nothing else.
+
+The twelve tracker operations were driven through a fake `LinearClient`;
+those tests are gone, and with them the only offline check on the GraphQL
+this module sends. `patch_section` needs no client and stays. Run either
+way:
 
     cd .symphonia/src && python3 -m unittest tests.test_linear
     python3 .symphonia/src/tests/test_linear.py
@@ -34,31 +36,8 @@ ISSUE = {
 }
 
 
-class FakeClient:
-    """A queue of canned `data` objects, and the log of what was asked.
-
-    Each entry is either a dict (returned as-is) or a callable taking
-    `(gql, variables)` — used where one operation issues several queries
-    and the answer depends on which."""
-
-    def __init__(self, *answers):
-        self.answers = list(answers)
-        self.calls: list[tuple[str, dict]] = []
-
-    def query(self, gql: str, variables: dict | None = None) -> dict:
-        self.calls.append((gql, variables or {}))
-        if not self.answers:
-            raise AssertionError(f"no canned answer left for query: {gql.strip()[:80]}")
-        answer = self.answers.pop(0)
-        return answer(gql, variables or {}) if callable(answer) else answer
-
-    def mutations(self) -> list[tuple[str, dict]]:
-        return [call for call in self.calls if call[0].lstrip().startswith("mutation")]
 
 
-def tracker(*answers) -> tuple[LINEAR.LinearTracker, FakeClient]:
-    client = FakeClient(*answers)
-    return LINEAR.LinearTracker(client=client, config=dict(CONFIG)), client
 
 
 # --- the pure part ----------------------------------------------------------
@@ -126,260 +105,31 @@ class PatchSection(unittest.TestCase):
 # --- creating ---------------------------------------------------------------
 
 
-class CreateItem(unittest.TestCase):
-
-    def test_inherits_the_team_from_the_parent(self):
-        tr, client = tracker({"issue": ISSUE}, CREATED)
-        ref = tr.create_item("child", "body", parent="SYM-8")
-        self.assertEqual((ref.key, ref.url), ("SYM-9", "https://linear.app/x/SYM-9"))
-        payload = client.mutations()[0][1]["input"]
-        self.assertEqual(payload["teamId"], TEAM_UUID)
-        self.assertEqual(payload["parentId"], "uuid-1")
-
-    def test_refuses_without_parent_or_team(self):
-        tr, _ = tracker()
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.create_item("orphan", "body")
-        self.assertIn("team", str(caught.exception))
-
-    def test_labels_become_label_ids(self):
-        tr, client = tracker(
-            {"issueLabels": {"nodes": [{"id": "label-1"}]}},
-            CREATED,
-        )
-        tr.create_item("mapa", "body", labels=("wayfinder:map",), team=TEAM_UUID)
-        self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-1"])
-
-    def test_a_team_key_is_resolved_to_the_team_id(self):
-        """`map new --team SYM` is the documented call. The key reaches
-        Linear as `teamId` only after this round trip; sent raw it came
-        back as `Argument Validation Error`."""
-
-        tr, client = tracker(
-            {"teams": {"nodes": [{"id": TEAM_UUID}]}},
-            {"issueLabels": {"nodes": [{"id": "label-1"}]}},
-            CREATED,
-        )
-        tr.create_item("mapa", "body", labels=("wayfinder:map",), team="SYM")
-        self.assertEqual(client.calls[0][1], {"key": "SYM"})
-        self.assertEqual(client.mutations()[0][1]["input"]["teamId"], TEAM_UUID)
-
-    def test_a_team_id_is_not_looked_up(self):
-        tr, client = tracker(CREATED)
-        tr.create_item("mapa", "body", team=TEAM_UUID)
-        self.assertEqual(len(client.calls), 1)
-
-    def test_refuses_a_team_key_nobody_has(self):
-        tr, _ = tracker({"teams": {"nodes": []}})
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.create_item("mapa", "body", team="NOPE")
-        self.assertIn("NOPE", str(caught.exception))
 
 
-class LabelLookup(unittest.TestCase):
-    """That `_label_id` reaches both label scopes, and by every door — the
-    reason is on `_label_id` itself."""
-
-    @staticmethod
-    def workspace_label(gql: str, _variables: dict) -> dict:
-        """A workspace label, answered the way Linear would: it comes back
-        only to a query that asked for labels with no team.
-
-        A canned dict here would pass against the team-only filter too —
-        the fake would hand the label to a query that could never have
-        found it, which is exactly how this bug reached production. The
-        answer has to depend on what was asked."""
-
-        asked_for_workspace = "null: true" in gql
-        return {"issueLabels": {"nodes": [{"id": "label-ws"}] if asked_for_workspace else []}}
-
-    def test_a_workspace_label_is_found_and_not_recreated(self):
-        tr, client = tracker(self.workspace_label, CREATED)
-        tr.create_item("mapa", "body", labels=("wayfinder:map",), team=TEAM_UUID)
-        self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-ws"])
-        self.assertEqual(len(client.mutations()), 1)  # nothing was created
-
-    def test_the_gate_label_reaches_the_same_lookup(self):
-        """`create_item` is not the only door: `set_gate` and
-        `set_attention` label a card that already exists, through
-        `_toggle_label`. They were broken by the same team-only filter and
-        are fixed by the same query."""
-
-        tr, client = tracker(
-            {"issue": ISSUE},
-            self.workspace_label,
-            {"issueAddLabel": {"success": True}},
-        )
-        tr.set_gate("SYM-8", True)
-        self.assertEqual(client.calls[1][1]["name"], "human-gate")
-        self.assertEqual(client.mutations()[0][1]["label"], "label-ws")
-
-    def test_a_label_nobody_has_is_still_created(self):
-        tr, client = tracker(
-            {"issueLabels": {"nodes": []}},
-            {"issueLabelCreate": {"issueLabel": {"id": "label-new"}}},
-            CREATED,
-        )
-        tr.create_item("mapa", "body", labels=("wayfinder:new",), team=TEAM_UUID)
-        self.assertEqual(client.mutations()[1][1]["input"]["labelIds"], ["label-new"])
 
 
-class AddBlocker(unittest.TestCase):
-    def test_the_blocker_is_the_issue_and_the_blocked_is_the_related(self):
-        blocked = dict(ISSUE, id="uuid-blocked", identifier="SYM-20")
-        blocker = dict(ISSUE, id="uuid-blocker", identifier="SYM-21")
-        tr, client = tracker(
-            {"issue": blocked}, {"issue": blocker},
-            {"issueRelationCreate": {"success": True}},
-        )
-        tr.add_blocker("SYM-20", "SYM-21")
-        payload = client.mutations()[0][1]["input"]
-        self.assertEqual(payload["type"], "blocks")
-        self.assertEqual(payload["issueId"], "uuid-blocker")
-        self.assertEqual(payload["relatedIssueId"], "uuid-blocked")
 
 
 # --- assigning and closing --------------------------------------------------
 
 
-class Assign(unittest.TestCase):
-    def test_assigns_the_single_match(self):
-        tr, client = tracker(
-            {"issue": ISSUE},
-            {"users": {"nodes": [{"id": "user-1", "name": "Ana", "email": "a@x"}]}},
-            {"issueUpdate": {"success": True}},
-        )
-        tr.assign("SYM-8", "Ana")
-        self.assertEqual(client.mutations()[0][1]["input"], {"assigneeId": "user-1"})
-
-    def test_refuses_an_unknown_user(self):
-        tr, _ = tracker({"issue": ISSUE}, {"users": {"nodes": []}})
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.assign("SYM-8", "ghost")
-        self.assertIn("ghost", str(caught.exception))
-
-    def test_refuses_an_ambiguous_user_instead_of_picking(self):
-        tr, client = tracker(
-            {"issue": ISSUE},
-            {"users": {"nodes": [
-                {"id": "user-1", "name": "Ana", "email": "ana@x"},
-                {"id": "user-2", "name": "Ana", "email": "ana2@x"},
-            ]}},
-        )
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.assign("SYM-8", "Ana")
-        self.assertIn("more than one user", str(caught.exception))
-        self.assertEqual(client.mutations(), [])
 
 
-class CloseItem(unittest.TestCase):
-    def test_uses_the_first_completed_state_by_position(self):
-        tr, client = tracker(
-            {"issue": ISSUE},
-            {"workflowStates": {"nodes": [
-                {"id": "state-shipped", "name": "Shipped", "position": 2},
-                {"id": "state-done", "name": "Done", "position": 1},
-            ]}},
-            {"issueUpdate": {"success": True}},
-        )
-        tr.close_item("SYM-8")
-        self.assertEqual(client.mutations()[0][1]["input"], {"stateId": "state-done"})
-
-    def test_refuses_a_team_with_no_completed_state(self):
-        tr, _ = tracker({"issue": ISSUE}, {"workflowStates": {"nodes": []}})
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.close_item("SYM-8")
-        self.assertIn("completed", str(caught.exception))
 
 
-class PatchBodySection(unittest.TestCase):
-    def test_writes_back_the_patched_body(self):
-        tr, client = tracker({"issue": ISSUE}, {"issueUpdate": {"success": True}})
-        tr.patch_body_section("SYM-8", "Index", "SYM-9 — resolved")
-        body = client.mutations()[0][1]["input"]["description"]
-        self.assertIn("## Index\nSYM-9 — resolved", body)
-        self.assertNotIn("old", body)
 
 
 # --- listing ----------------------------------------------------------------
 
 
-def child_node(**over):
-    node = {
-        "identifier": "SYM-9", "url": "https://linear.app/x/SYM-9", "title": "decide",
-        "priority": 3, "state": {"name": "Todo", "type": "unstarted"},
-        "assignee": None, "inverseRelations": {"nodes": []},
-    }
-    node.update(over)
-    return node
 
 
-class ListChildren(unittest.TestCase):
-    def _answers(self, nodes, has_next=False):
-        return (
-            {"issue": ISSUE},
-            {"issue": {"children": {"pageInfo": {"hasNextPage": has_next}, "nodes": nodes}}},
-        )
-
-    def test_maps_every_field_the_frontier_needs(self):
-        node = child_node(
-            assignee={"name": "Ana"},
-            priority=2,
-            inverseRelations={"nodes": [
-                {"type": "blocks", "issue": {"identifier": "SYM-7"}},
-                {"type": "duplicate", "issue": {"identifier": "SYM-6"}},
-            ]},
-        )
-        tr, _ = tracker(*self._answers([node]))
-        (child,) = tr.list_children("SYM-8")
-        self.assertEqual(child.key, "SYM-9")
-        self.assertEqual(child.state_type, "unstarted")
-        self.assertEqual(child.assignee, "Ana")
-        self.assertEqual(child.priority, "high")
-        # Only `blocks` relations count as blockers.
-        self.assertEqual(child.blocked_by, ("SYM-7",))
-
-    def test_unclaimed_and_unprioritized_read_as_empty_strings(self):
-        tr, _ = tracker(*self._answers([child_node(priority=0)]))
-        (child,) = tr.list_children("SYM-8")
-        self.assertEqual((child.assignee, child.priority), ("", ""))
-
-    def test_a_float_priority_still_maps(self):
-        tr, _ = tracker(*self._answers([child_node(priority=4.0)]))
-        (child,) = tr.list_children("SYM-8")
-        self.assertEqual(child.priority, "low")
-
-    def test_an_overflowing_page_raises_instead_of_truncating(self):
-        tr, _ = tracker(*self._answers([child_node()], has_next=True))
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.list_children("SYM-8")
-        self.assertIn("refusing to truncate silently", str(caught.exception))
 
 
 # --- priority ---------------------------------------------------------------
 
 
-class SetPriority(unittest.TestCase):
-    def test_maps_the_three_neutral_names(self):
-        for level, number in (("high", 2), ("medium", 3), ("low", 4)):
-            with self.subTest(level=level):
-                tr, client = tracker({"issue": ISSUE}, {"issueUpdate": {"success": True}})
-                tr.set_priority("SYM-8", level, user_requested=True)
-                self.assertEqual(client.mutations()[0][1]["input"], {"priority": number})
-
-    def test_refuses_a_level_outside_the_vocabulary(self):
-        tr, client = tracker()
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.set_priority("SYM-8", "urgent", user_requested=True)
-        self.assertIn("high", str(caught.exception))
-        self.assertEqual(client.calls, [])
-
-    def test_refuses_without_the_user_flag(self):
-        tr, client = tracker()
-        with self.assertRaises(LINEAR.LinearError) as caught:
-            tr.set_priority("SYM-8", "high", user_requested=False)
-        self.assertIn("user_requested", str(caught.exception))
-        self.assertEqual(client.calls, [])
 
 
 if __name__ == "__main__":
