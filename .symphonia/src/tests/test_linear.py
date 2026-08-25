@@ -19,9 +19,18 @@ import linear as LINEAR
 
 CONFIG = {"attention_label": "needs-attention", "gate_label": "human-gate"}
 
+TEAM_UUID = "11111111-2222-3333-4444-555555555555"
+"""A team id shaped the way Linear really returns one. The tests below
+that pass a team by hand use this and not a readable stand-in: `--team`
+now tells a UUID from a team key by its shape, so a fixture like
+`"team-1"` would exercise the key path while claiming to be an id."""
+
+CREATED = {"issueCreate": {"issue": {
+    "id": "uuid-2", "identifier": "SYM-9", "url": "https://linear.app/x/SYM-9"}}}
+
 ISSUE = {
     "id": "uuid-1", "identifier": "SYM-8", "url": "https://linear.app/x/SYM-8",
-    "title": "the map", "description": "## Index\nold\n", "team": {"id": "team-1"},
+    "title": "the map", "description": "## Index\nold\n", "team": {"id": TEAM_UUID},
 }
 
 
@@ -118,15 +127,13 @@ class PatchSection(unittest.TestCase):
 
 
 class CreateItem(unittest.TestCase):
-    CREATED = {"issueCreate": {"issue": {
-        "id": "uuid-2", "identifier": "SYM-9", "url": "https://linear.app/x/SYM-9"}}}
 
     def test_inherits_the_team_from_the_parent(self):
-        tr, client = tracker({"issue": ISSUE}, self.CREATED)
+        tr, client = tracker({"issue": ISSUE}, CREATED)
         ref = tr.create_item("child", "body", parent="SYM-8")
         self.assertEqual((ref.key, ref.url), ("SYM-9", "https://linear.app/x/SYM-9"))
         payload = client.mutations()[0][1]["input"]
-        self.assertEqual(payload["teamId"], "team-1")
+        self.assertEqual(payload["teamId"], TEAM_UUID)
         self.assertEqual(payload["parentId"], "uuid-1")
 
     def test_refuses_without_parent_or_team(self):
@@ -137,10 +144,84 @@ class CreateItem(unittest.TestCase):
 
     def test_labels_become_label_ids(self):
         tr, client = tracker(
-            {"issueLabels": {"nodes": [{"id": "label-1"}]}}, self.CREATED,
+            {"issueLabels": {"nodes": [{"id": "label-1"}]}},
+            CREATED,
         )
-        tr.create_item("mapa", "body", labels=("wayfinder:map",), team="team-1")
+        tr.create_item("mapa", "body", labels=("wayfinder:map",), team=TEAM_UUID)
         self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-1"])
+
+    def test_a_team_key_is_resolved_to_the_team_id(self):
+        """`map new --team SYM` is the documented call. The key reaches
+        Linear as `teamId` only after this round trip; sent raw it came
+        back as `Argument Validation Error`."""
+
+        tr, client = tracker(
+            {"teams": {"nodes": [{"id": TEAM_UUID}]}},
+            {"issueLabels": {"nodes": [{"id": "label-1"}]}},
+            CREATED,
+        )
+        tr.create_item("mapa", "body", labels=("wayfinder:map",), team="SYM")
+        self.assertEqual(client.calls[0][1], {"key": "SYM"})
+        self.assertEqual(client.mutations()[0][1]["input"]["teamId"], TEAM_UUID)
+
+    def test_a_team_id_is_not_looked_up(self):
+        tr, client = tracker(CREATED)
+        tr.create_item("mapa", "body", team=TEAM_UUID)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_refuses_a_team_key_nobody_has(self):
+        tr, _ = tracker({"teams": {"nodes": []}})
+        with self.assertRaises(LINEAR.LinearError) as caught:
+            tr.create_item("mapa", "body", team="NOPE")
+        self.assertIn("NOPE", str(caught.exception))
+
+
+class LabelLookup(unittest.TestCase):
+    """That `_label_id` reaches both label scopes, and by every door — the
+    reason is on `_label_id` itself."""
+
+    @staticmethod
+    def workspace_label(gql: str, _variables: dict) -> dict:
+        """A workspace label, answered the way Linear would: it comes back
+        only to a query that asked for labels with no team.
+
+        A canned dict here would pass against the team-only filter too —
+        the fake would hand the label to a query that could never have
+        found it, which is exactly how this bug reached production. The
+        answer has to depend on what was asked."""
+
+        asked_for_workspace = "null: true" in gql
+        return {"issueLabels": {"nodes": [{"id": "label-ws"}] if asked_for_workspace else []}}
+
+    def test_a_workspace_label_is_found_and_not_recreated(self):
+        tr, client = tracker(self.workspace_label, CREATED)
+        tr.create_item("mapa", "body", labels=("wayfinder:map",), team=TEAM_UUID)
+        self.assertEqual(client.mutations()[0][1]["input"]["labelIds"], ["label-ws"])
+        self.assertEqual(len(client.mutations()), 1)  # nothing was created
+
+    def test_the_gate_label_reaches_the_same_lookup(self):
+        """`create_item` is not the only door: `set_gate` and
+        `set_attention` label a card that already exists, through
+        `_toggle_label`. They were broken by the same team-only filter and
+        are fixed by the same query."""
+
+        tr, client = tracker(
+            {"issue": ISSUE},
+            self.workspace_label,
+            {"issueAddLabel": {"success": True}},
+        )
+        tr.set_gate("SYM-8", True)
+        self.assertEqual(client.calls[1][1]["name"], "human-gate")
+        self.assertEqual(client.mutations()[0][1]["label"], "label-ws")
+
+    def test_a_label_nobody_has_is_still_created(self):
+        tr, client = tracker(
+            {"issueLabels": {"nodes": []}},
+            {"issueLabelCreate": {"issueLabel": {"id": "label-new"}}},
+            CREATED,
+        )
+        tr.create_item("mapa", "body", labels=("wayfinder:new",), team=TEAM_UUID)
+        self.assertEqual(client.mutations()[1][1]["input"]["labelIds"], ["label-new"])
 
 
 class AddBlocker(unittest.TestCase):

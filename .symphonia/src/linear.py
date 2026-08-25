@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -22,6 +23,15 @@ from pathlib import Path
 from env import SHARED_ENV, load
 
 API_URL = "https://api.linear.app/graphql"
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+"""The shape of a team id. `--team` takes either this or the team key, and
+only the key needs a round trip to resolve.
+
+Case-insensitive not because Linear returns anything but lowercase, but
+because this is the gate that decides id-or-key: a UUID pasted in upper
+case is still an id, and reading it as a team key would send it to a
+lookup that can only fail."""
 
 CONFIG = Path(__file__).resolve().parents[1] / "config.json"
 
@@ -179,6 +189,7 @@ class LinearTracker:
         self._c = client or LinearClient()
         self._cfg = config or json.loads(CONFIG.read_text())["linear"]
         self._label_ids: dict[tuple[str, str], str] = {}
+        self._team_ids: dict[str, str] = {}
 
     def _issue(self, id: str) -> dict:
         """Fetch one issue by UUID or key (`issue` accepts both)."""
@@ -192,11 +203,59 @@ class LinearTracker:
             raise LinearError(f"no such issue: {id}")
         return data["issue"]
 
+    def _team_id(self, team: str) -> str:
+        """A team's UUID, from either its UUID or its key (`SYM`).
+
+        Every mutation wants the UUID, but the key is what a person knows
+        and what `map new --team SYM` is documented with. Passing the key
+        straight through as `teamId` reached Linear as `Argument
+        Validation Error`, which names nothing a caller can act on.
+
+        The key is matched ignoring case: `--team sym` is the same team a
+        person means, and a refusal over capitalisation would name the
+        key back at them without naming the case as the cause."""
+
+        if _UUID.fullmatch(team):
+            return team
+        if team not in self._team_ids:
+            data = self._c.query(
+                "query($key: String!) { teams(filter: {key: {eqIgnoreCase: $key}}) "
+                "{ nodes { id } } }",
+                {"key": team},
+            )
+            nodes = data["teams"]["nodes"]
+            if not nodes:
+                raise LinearError(
+                    f"no team with the key {team!r}; pass the key shown on a card "
+                    f"(the SYM of SYM-123) or the team's UUID"
+                )
+            self._team_ids[team] = nodes[0]["id"]
+        return self._team_ids[team]
+
     def _label_id(self, team_id: str, name: str) -> str:
+        """The id of the label called `name` that this team can use.
+
+        A Linear label is either scoped to one team or shared across the
+        whole workspace, and both are usable on a card of this team — so
+        both are searched. Looking only at team-scoped labels made every
+        workspace label read as missing, and the create that followed came
+        back `duplicate label name`: the tool could not use a label it
+        could not see, and could not create it either.
+
+        `eqIgnoreCase` and not `eq`, because Linear rejects a duplicate
+        name without regard to case. An exact match would miss a
+        `Wayfinder:Map` written by hand and fall through to the same
+        refused create — the bug above, with a different spelling.
+
+        At most one label comes back: Linear refuses a team label that
+        shares a name with a workspace one, so the two scopes cannot both
+        hold it and there is nothing to break a tie between."""
+
         if (team_id, name) not in self._label_ids:
             data = self._c.query(
                 """query($team: ID!, $name: String!) {
-                  issueLabels(filter: {name: {eq: $name}, team: {id: {eq: $team}}}) {
+                  issueLabels(filter: {name: {eqIgnoreCase: $name}, or: [
+                    {team: {id: {eq: $team}}}, {team: {null: true}}]}) {
                     nodes { id } } }""",
                 {"team": team_id, "name": name},
             )
@@ -379,7 +438,8 @@ class LinearTracker:
         call refuses rather than guessing at a workspace default."""
 
         parent_node = self._issue(parent) if parent else None
-        team_id = team or (parent_node["team"]["id"] if parent_node else None)
+        team_id = (self._team_id(team) if team
+                   else (parent_node["team"]["id"] if parent_node else None))
         if not team_id:
             raise LinearError(
                 "create_item needs a team: pass team=, or parent= to inherit the parent's"
